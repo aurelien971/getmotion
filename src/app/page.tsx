@@ -8,6 +8,36 @@ fal.config({ proxyUrl: "/api/fal/proxy" });
 
 type Point = { x: number; y: number; label: 0 | 1 };
 type Result = { url: string; model: string; at: number };
+type CastSlot = { file: File; preview: string; who: string };
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Submit to Sume through our server routes and poll until done; returns the video URL.
+async function runSume(model: string, input: Record<string, unknown>, onStatus: (s: string) => void) {
+  const sub = await fetch("/api/sume/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model, ...input }),
+  }).then((r) => r.json());
+  const id = sub.request_id ?? sub.id ?? sub.job_id;
+  if (!id) throw new Error(`Sume: ${JSON.stringify(sub)}`);
+  let wait = (sub.next_poll_after_seconds ?? 5) * 1000;
+  for (;;) {
+    await sleep(wait);
+    const st = await fetch(`/api/sume/job/${id}?part=status`).then((r) => r.json());
+    const status = st.sume_status ?? st.status;
+    onStatus(String(status));
+    if (st.terminal || ["completed", "failed", "canceled"].includes(status)) {
+      if (status !== "completed") throw new Error(`Sume job ${status}: ${JSON.stringify(st)}`);
+      break;
+    }
+    wait = (st.next_poll_after_seconds ?? 5) * 1000;
+  }
+  const res = await fetch(`/api/sume/job/${id}?part=result`).then((r) => r.json());
+  const url = (res.result ?? res).artifacts?.find((a: { url: string }) => a.url)?.url;
+  if (!url) throw new Error(`Sume result: ${JSON.stringify(res)}`);
+  return url as string;
+}
 
 const HISTORY_KEY = "getmotion.history";
 
@@ -32,8 +62,7 @@ export default function Home() {
   const [maskUrl, setMaskUrl] = useState<string | null>(null);
   const [maskOk, setMaskOk] = useState(false);
 
-  const [refFile, setRefFile] = useState<File | null>(null);
-  const [refPreview, setRefPreview] = useState<string | null>(null);
+  const [cast, setCast] = useState<CastSlot[]>([]);
   const [prompt, setPrompt] = useState("");
   const [modelId, setModelId] = useState(MODELS[0].id);
 
@@ -136,26 +165,34 @@ export default function Home() {
     setError(null);
     try {
       const url = await ensureUploaded();
-      setBusy("Uploading face…");
-      const refUrl = await fal.storage.upload(refFile!);
+      setBusy("Uploading faces…");
+      const slots = cast.slice(0, model.maxCast);
+      const castUrls = await Promise.all(
+        slots.map(async (c) => ({ url: await fal.storage.upload(c.file), who: c.who })),
+      );
       setBusy(`Generating with ${model.name}… (minutes)`);
       const input = model.build({
         videoUrl: url,
         maskUrl,
-        refImageUrl: refUrl,
+        cast: castUrls,
         prompt,
         duration,
         side: side(),
       });
-      const res = await fal.subscribe(model.id, {
-        input,
-        logs: true,
-        onQueueUpdate: (u) => {
-          const last = "logs" in u && u.logs?.length ? u.logs[u.logs.length - 1].message : "";
-          setLog(`${u.status} ${last}`);
-        },
-      });
-      const out = (res.data as { video: { url: string } }).video.url;
+      let out: string;
+      if (model.provider === "sume") {
+        out = await runSume(model.id, input, setLog);
+      } else {
+        const res = await fal.subscribe(model.id, {
+          input,
+          logs: true,
+          onQueueUpdate: (u) => {
+            const last = "logs" in u && u.logs?.length ? u.logs[u.logs.length - 1].message : "";
+            setLog(`${u.status} ${last}`);
+          },
+        });
+        out = (res.data as { video: { url: string } }).video.url;
+      }
       const next = [{ url: out, model: model.name, at: Date.now() }, ...history];
       setHistory(next);
       try {
@@ -180,7 +217,10 @@ export default function Home() {
 
   const v = videoRef.current;
   const canGenerate =
-    !!videoFile && !!refFile && !busy && (!model.usesMask || (maskUrl && maskOk));
+    !!videoFile &&
+    !busy &&
+    (model.maxCast === 0 ? !!prompt.trim() : cast.length > 0) &&
+    (!model.usesMask || (maskUrl && maskOk));
 
   return (
     <main className="mx-auto max-w-5xl px-4 py-8 space-y-8">
@@ -280,22 +320,46 @@ export default function Home() {
       {/* 2. Face */}
       <section className="space-y-3">
         <h2 className="font-semibold">2. Who goes in</h2>
-        <input
-          type="file"
-          accept="image/*"
-          onChange={(e) => {
-            const f = e.target.files?.[0];
-            if (!f) return;
-            setRefFile(f);
-            setRefPreview(URL.createObjectURL(f));
-          }}
-        />
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        {refPreview && <img src={refPreview} alt="" className="h-32 rounded" />}
+        <p className="text-sm text-neutral-400">
+          One photo per person (H3 takes up to 4). Say who each one replaces by look + position,
+          e.g. &quot;the man in the striped shirt on the left&quot;.
+        </p>
+        <div className="space-y-2">
+          {cast.map((c, n) => (
+            <div key={c.preview} className="flex items-center gap-3">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={c.preview} alt="" className="h-16 w-16 object-cover rounded" />
+              <span className="text-xs text-neutral-500">#{n + 1} replaces</span>
+              <input
+                value={c.who}
+                onChange={(e) =>
+                  setCast((s) => s.map((x, i) => (i === n ? { ...x, who: e.target.value } : x)))
+                }
+                placeholder="the man in the striped shirt on the left"
+                className="flex-1 bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm"
+              />
+              <button className="btn" onClick={() => setCast((s) => s.filter((_, i) => i !== n))}>
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+        {cast.length < 4 && (
+          <input
+            type="file"
+            accept="image/*"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (!f) return;
+              setCast((s) => [...s, { file: f, preview: URL.createObjectURL(f), who: "" }]);
+              e.target.value = "";
+            }}
+          />
+        )}
         <textarea
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
-          placeholder="Twist (optional): wearing a gold crown, pouring rain…"
+          placeholder="Twist (optional; required for Regen): wearing a gold crown, pouring rain…"
           className="w-full bg-neutral-900 border border-neutral-700 rounded p-2 text-sm"
           rows={2}
         />
@@ -304,7 +368,7 @@ export default function Home() {
       {/* 3. Model */}
       <section className="space-y-3">
         <h2 className="font-semibold">3. Model</h2>
-        <div className="grid gap-2 sm:grid-cols-3">
+        <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-5">
           {MODELS.map((m) => (
             <button
               key={m.id}
@@ -314,6 +378,7 @@ export default function Home() {
               }`}
             >
               <div className="font-medium">{m.name}</div>
+              <div className="text-xs uppercase text-neutral-500">{m.provider}</div>
               <div>{m.note}</div>
               <div className="mt-1 text-xs">~${m.usdPerSec}/s</div>
             </button>

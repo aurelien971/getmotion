@@ -1,9 +1,11 @@
 export const SAM2_VIDEO = "fal-ai/sam2/video";
 
+export type Cast = { url: string; who: string };
+
 export type GenInput = {
   videoUrl: string;
   maskUrl: string | null;
-  refImageUrl: string;
+  cast: Cast[];
   prompt: string;
   duration: number;
   side: "left" | "center" | "right";
@@ -11,60 +13,110 @@ export type GenInput = {
 
 export type Model = {
   id: string;
+  provider: "fal" | "sume";
   name: string;
   note: string;
   usesMask: boolean;
-  usdPerSec: number; // rough, check fal pricing
+  maxCast: number; // 0 = prompt only, no face photos
+  usdPerSec: number; // rough, check provider pricing
   build: (i: GenInput) => Record<string, unknown>;
 };
+
+const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, Math.round(n)));
+
+// "Reference image 1 replaces the man in the striped shirt on the left. ..."
+function castPrompt(i: GenInput) {
+  const lines = i.cast.map((c, n) =>
+    `Reference image ${n + 1} replaces ${c.who.trim() || `the person on the ${i.side}`}.`,
+  );
+  return [...lines, "Keep everyone else unchanged.", i.prompt].join(" ").trim();
+}
 
 export const MODELS: Model[] = [
   {
     id: "fal-ai/wan-vace-14b",
+    provider: "fal",
     name: "Wan VACE — masked",
     note: "Uses your mask exactly. Cheap. Output at 16fps, max ~15s.",
     usesMask: true,
+    maxCast: 1,
     usdPerSec: 0.08,
     build: (i) => ({
       task: "inpainting",
       video_url: i.videoUrl,
       mask_video_url: i.maskUrl,
-      ref_image_urls: [i.refImageUrl],
+      ref_image_urls: [i.cast[0].url],
       prompt: i.prompt || "the person from the reference image",
       frames_per_second: 16,
-      num_frames: Math.min(241, Math.max(81, Math.ceil(i.duration * 16))),
+      num_frames: clamp(i.duration * 16, 81, 241),
       resolution: "480p",
     }),
   },
   {
     id: "fal-ai/wan/v2.2-14b/animate/replace",
+    provider: "fal",
     name: "Wan 2.2 Animate Replace",
-    note: "Cheapest. Finds the person itself (no mask). Best with one person.",
+    note: "Cheapest swap. Finds the person itself (no mask). Best with one person.",
     usesMask: false,
+    maxCast: 1,
     usdPerSec: 0.04,
     build: (i) => ({
       video_url: i.videoUrl,
-      image_url: i.refImageUrl,
+      image_url: i.cast[0].url,
       resolution: "480p",
       use_turbo: true,
     }),
   },
   {
     id: "fal-ai/minimax-h3-max-recast",
-    name: "MiniMax H3 Max Recast",
-    note: "Best quality, keeps audio. No mask: targets by position + prompt.",
+    provider: "fal",
+    name: "H3 Max Recast (fal)",
+    note: "Best quality, keeps audio. Targets people by your descriptions.",
     usesMask: false,
-    usdPerSec: 0.35,
+    maxCast: 4,
+    usdPerSec: 0.3,
     build: (i) => ({
       video_url: i.videoUrl,
-      reference_image_urls: [i.refImageUrl],
-      prompt:
-        `Replace the person on the ${i.side} of the frame with the person in the reference photo. Keep everyone else unchanged. ${i.prompt}`.trim(),
+      reference_image_urls: i.cast.map((c) => c.url),
+      prompt: castPrompt(i),
       resolution: "768P",
+    }),
+  },
+  {
+    id: "h3-max-recast",
+    provider: "sume",
+    name: "H3 Max Recast (Sume)",
+    note: "Same model via Sume. $0.30/s at 768p.",
+    usesMask: false,
+    maxCast: 4,
+    usdPerSec: 0.3,
+    build: (i) => ({
+      video_url: i.videoUrl,
+      reference_image_urls: i.cast.map((c) => c.url),
+      prompt: castPrompt(i),
+      duration: clamp(i.duration, 5, 30),
+      resolution: "768p",
+    }),
+  },
+  {
+    id: "hailuo-h3-regen",
+    provider: "sume",
+    name: "Hailuo H3 Regen (Sume)",
+    note: "Restyles the whole clip from your prompt. No face photo. $0.05/s.",
+    usesMask: false,
+    maxCast: 0,
+    usdPerSec: 0.05,
+    build: (i) => ({
+      video_url: i.videoUrl,
+      prompt: i.prompt,
+      duration: clamp(i.duration, 5, 16),
     }),
   },
 ];
 
-export const ALLOWED_ENDPOINTS = [SAM2_VIDEO, ...MODELS.map((m) => m.id)].flatMap(
-  (id) => [id, `${id}/**`],
-);
+export const SUME_MODELS = MODELS.filter((m) => m.provider === "sume").map((m) => m.id);
+
+export const ALLOWED_ENDPOINTS = [
+  SAM2_VIDEO,
+  ...MODELS.filter((m) => m.provider === "fal").map((m) => m.id),
+].flatMap((id) => [id, `${id}/**`]);
