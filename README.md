@@ -1,6 +1,6 @@
 # getmotion
 
-Private recast engine: upload a clip, click a person, SAM 2 tracks a mask through every frame, swap them with a photo via fal.ai.
+Private recast engine (Next 16): upload a clip, click a person, SAM 2 tracks a mask through every frame, swap them with a photo via fal.ai.
 
 ```bash
 cp .env.example .env.local   # add FAL_KEY

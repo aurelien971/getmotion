@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
-// Private engine: HTTP basic auth on everything when APP_PASSWORD is set.
-export function middleware(req: NextRequest) {
+// Private engine: HTTP basic auth on everything when APP_PASSWORD is set (Next 16 proxy).
+export function proxy(req: NextRequest) {
   const password = process.env.APP_PASSWORD;
   if (!password) return NextResponse.next();
 
