@@ -94,6 +94,7 @@ export default function Home() {
   const [stitch, setStitch] = useState<StitchItem[]>([]);
   const [frames, setFrames] = useState<Frame[]>([]);
   const [cutStage, setCutStage] = useState<string | null>(null);
+  const [zoomed, setZoomed] = useState<Frame | null>(null);
 
   // Dev only: ?clip=/dev-long.mp4 loads a clip from /public for quick checks.
   useEffect(() => {
@@ -726,8 +727,10 @@ export default function Home() {
               <div className="grid gap-3 grid-cols-2 sm:grid-cols-3 xl:grid-cols-4">
                 {frames.map((f) => (
                   <figure key={f.id} className="space-y-1.5">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={f.url} alt="" className="w-full aspect-video object-cover rounded-xl bg-black ring-1 ring-hair" />
+                    <button className="block w-full cursor-zoom-in" onClick={() => setZoomed(f)} aria-label="Zoom into frame">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={f.url} alt="" className="w-full aspect-video object-cover rounded-xl bg-black ring-1 ring-hair" />
+                    </button>
                     <figcaption className="text-[12px] text-muted flex justify-between items-center gap-2">
                       <span className="tabular-nums">f{f.frame} · {f.time.toFixed(2)}s</span>
                       <span className="flex gap-1.5">
@@ -939,6 +942,67 @@ export default function Home() {
         </aside>
         )}
       </main>
+
+      {zoomed && <Lightbox frame={zoomed} onClose={() => setZoomed(null)} onSave={() => saveFrame(zoomed)} />}
+    </div>
+  );
+}
+
+// Full-screen frame viewer: scroll to zoom, drag to pan, double-click for 1:1, Esc to close.
+function Lightbox({ frame, onClose, onSave }: { frame: Frame; onClose: () => void; onSave: () => void }) {
+  const [scale, setScale] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const drag = useRef<{ x: number; y: number; px: number; py: number } | null>(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-black/92 backdrop-blur-xl flex flex-col"
+      onWheel={(e) => {
+        e.preventDefault();
+        setScale((z) => Math.min(8, Math.max(1, z * (e.deltaY < 0 ? 1.12 : 0.89))));
+      }}
+    >
+      <div className="flex items-center justify-between px-6 h-16 shrink-0">
+        <span className="text-[13px] tabular-nums text-muted">
+          f{frame.frame} · {frame.time.toFixed(3)}s · {Math.round(scale * 100)}%
+        </span>
+        <div className="flex gap-2">
+          <button className="btn" onClick={() => { setScale(1); setPan({ x: 0, y: 0 }); }}>Fit</button>
+          <button className="btn" onClick={onSave}>Save PNG</button>
+          <button className="btn btn-icon" aria-label="Close" onClick={onClose}>×</button>
+        </div>
+      </div>
+      <div
+        className={`flex-1 overflow-hidden flex items-center justify-center ${scale > 1 ? "cursor-grab active:cursor-grabbing" : "cursor-zoom-in"}`}
+        onPointerDown={(e) => {
+          drag.current = { x: e.clientX, y: e.clientY, px: pan.x, py: pan.y };
+          (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+        }}
+        onPointerMove={(e) => {
+          if (!drag.current) return;
+          setPan({ x: drag.current.px + (e.clientX - drag.current.x), y: drag.current.py + (e.clientY - drag.current.y) });
+        }}
+        onPointerUp={() => (drag.current = null)}
+        onDoubleClick={() => {
+          if (scale > 1) { setScale(1); setPan({ x: 0, y: 0 }); } else setScale(3);
+        }}
+        onClick={(e) => e.target === e.currentTarget && scale === 1 && onClose()}
+      >
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={frame.url}
+          alt=""
+          draggable={false}
+          className="max-w-[92vw] max-h-[82vh] select-none"
+          style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})`, transition: "transform 60ms linear", imageRendering: scale > 2 ? "pixelated" : "auto" }}
+        />
+      </div>
     </div>
   );
 }
