@@ -63,6 +63,7 @@ export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const maskRef = useRef<HTMLVideoElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const lastTime = useRef(0);
 
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null); // fal CDN
@@ -258,13 +259,14 @@ export default function Home() {
     v.play().catch(finish);
   }
 
+  // Play from wherever the cursor is. Only if it sits at the very end of the window
+  // (or the clip) does it wrap to the start.
   function togglePlay() {
     const v = videoRef.current;
     if (!v) return;
     if (v.paused) {
-      if (mode === "trim" && (v.currentTime < range[0] || v.currentTime >= range[1] - 0.05)) {
-        v.currentTime = range[0];
-      }
+      const end = mode === "trim" ? range[1] : duration;
+      if (v.currentTime >= end - 0.05) v.currentTime = mode === "trim" ? range[0] : 0;
       v.muted = false;
       v.play();
     } else v.pause();
@@ -387,14 +389,17 @@ export default function Home() {
     }
   }
 
-  // Keep the mask overlay in step with the clip; stop at the window's end while trimming.
+  // Keep the mask overlay in step with the clip. While trimming, playback that runs
+  // past the window's end stops there (a seek beyond it is left alone).
   function sync() {
     const v = videoRef.current;
     const m = maskRef.current;
     if (!v) return;
-    if (mode === "trim" && !v.paused && v.currentTime >= range[1]) {
+    const prev = lastTime.current;
+    lastTime.current = v.currentTime;
+    if (mode === "trim" && !v.paused && prev < range[1] && v.currentTime >= range[1] && v.currentTime - prev < 0.5) {
       v.pause();
-      v.currentTime = range[0];
+      v.currentTime = range[1];
     }
     setTime(v.currentTime);
     setPlaying(!v.paused);
@@ -404,11 +409,13 @@ export default function Home() {
     else m.play().catch(() => {});
   }
 
+  // Move the cursor; playing stays playing, paused stays paused.
   function seek(t: number) {
     const v = videoRef.current;
     if (!v) return;
-    v.pause();
-    v.currentTime = Math.max(0, Math.min(duration, t));
+    const target = Math.max(0, Math.min(duration, t));
+    lastTime.current = target;
+    v.currentTime = target;
   }
 
   const needsFaces = model.maxCast > 0;
@@ -593,10 +600,10 @@ export default function Home() {
 
               <div className="flex flex-wrap items-center gap-2">
                 <div className="seg glass">
-                  <button onClick={() => seek(time - 1 / fps)} aria-label="Previous frame">
+                  <button onClick={() => { videoRef.current?.pause(); seek(time - 1 / fps); }} aria-label="Previous frame">
                     ‹
                   </button>
-                  <button onClick={() => seek(time + 1 / fps)} aria-label="Next frame">
+                  <button onClick={() => { videoRef.current?.pause(); seek(time + 1 / fps); }} aria-label="Next frame">
                     ›
                   </button>
                 </div>
