@@ -390,7 +390,6 @@ export default function Chapters() {
   const present = intervals(p.boundaries, p.duration, true);
   const absent = notPresent(p.boundaries, p.duration);
   const presentLen = total(present);
-  const unassigned = p.shots.filter((s) => !s.groupId);
   const groupedLen = total(p.shots.filter((s) => s.groupId));
   const partsDone = p.parts.filter((x) => x.status === "done").length;
   const reach: Record<Step, boolean> = {
