@@ -159,6 +159,8 @@ export type Part = {
   clipLength: number; // real + filler
   status: PartStatus;
   progress?: number;
+  live?: string; // provider status while rendering
+  submittedAt?: number;
   endpoint?: string;
   requestId?: string;
   resultUrl?: string;

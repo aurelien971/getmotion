@@ -1217,6 +1217,8 @@ export default function Chapters() {
       patchPart(part.id, {
         status: "rendering",
         error: undefined,
+        submittedAt: Date.now(),
+        live: "Submitted",
         endpoint: job.endpoint,
         requestId: job.requestId,
         signature: signature(part, g, photos),
@@ -1230,9 +1232,9 @@ export default function Chapters() {
 
   async function waitPart(partId: string, job: PendingJob, resubmits = 0) {
     try {
-      const url = await waitFor(job, () => patchPart(partId, { error: undefined }));
+      const url = await waitFor(job, (st) => patchPart(partId, { error: undefined, live: st }));
       removeJob(job.requestId);
-      patchPart(partId, { status: "done", resultUrl: url, renderedAt: Date.now(), calibrated: false, measuredOffsets: undefined });
+      patchPart(partId, { status: "done", resultUrl: url, renderedAt: Date.now(), calibrated: false, measuredOffsets: undefined, live: undefined });
     } catch (e) {
       removeJob(job.requestId);
       // The provider dropped it mid-render (not charged): submit again, up to 3 times.
@@ -1242,6 +1244,9 @@ export default function Chapters() {
         await new Promise((r) => setTimeout(r, 5000 * (resubmits + 1)));
         const next = await startPart(part);
         if (next) return waitPart(partId, next, resubmits + 1);
+        // startPart stopped before submitting; never leave the part spinning.
+        const cur = partsRef.current.find((x) => x.id === partId);
+        if (cur?.status === "rendering") patchPart(partId, { status: "failed", error: cur.error ?? describe(e) });
         return;
       }
       patchPart(partId, { status: "failed", error: describe(e) });
@@ -3686,6 +3691,23 @@ function FaceTile({
   );
 }
 
+// What the provider says about a running render, and how long it has been.
+function LiveStatus({ part }: { part: Part }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const secs = part.submittedAt ? Math.max(0, Math.round((now - part.submittedAt) / 1000)) : null;
+  return (
+    <span className="text-faint text-[11px] tabular-nums" title={part.requestId ? `fal request ${part.requestId}` : ""}>
+      {part.live ? part.live.replace(/_/g, " ").toLowerCase() : "waiting for status"}
+      {secs !== null ? ` · ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}` : ""}
+      {part.requestId ? ` · ${part.requestId.slice(0, 8)}` : ""}
+    </span>
+  );
+}
+
 function PartRow({
   onCheck,
   onInspect,
@@ -3759,6 +3781,7 @@ function PartRow({
         />
         {label[part.status]}
         {part.progress !== undefined && busy && <span className="text-faint tabular-nums">{Math.round(part.progress * 100)}%</span>}
+        {part.status === "rendering" && <LiveStatus part={part} />}
       </span>
       {part.error && <span className="text-[12px] text-[#fca5a5] break-all flex-1 min-w-48">{part.error}</span>}
       <span className="flex-1" />
