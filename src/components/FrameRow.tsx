@@ -7,6 +7,8 @@ import { useEffect, useState } from "react";
 export function FrameRow({ src, fps, cut, before = 6, after = 6 }: { src: string; fps: number; cut: number; before?: number; after?: number }) {
   const frames = Array.from({ length: before + after }, (_, i) => cut - before + i).filter((f) => f >= 0);
   const [thumbs, setThumbs] = useState<Record<number, string>>({});
+  // Where the cut really is in these frames (biggest jump between neighbours), if clear.
+  const [real, setReal] = useState<number | null>(null);
   const key = `${src}|${cut}|${fps}`;
 
   useEffect(() => {
@@ -23,6 +25,7 @@ export function FrameRow({ src, fps, cut, before = 6, after = 6 }: { src: string
       const w = Math.round((v.videoWidth / v.videoHeight) * h);
       c.width = w;
       c.height = h;
+      const luma: number[][] = [];
       for (const f of frames) {
         if (stop) return;
         await new Promise<void>((r) => {
@@ -31,8 +34,17 @@ export function FrameRow({ src, fps, cut, before = 6, after = 6 }: { src: string
         });
         c.getContext("2d")!.drawImage(v, 0, 0, w, h);
         const url = c.toDataURL("image/jpeg", 0.7);
+        const px = c.getContext("2d")!.getImageData(0, 0, w, h).data;
+        const y: number[] = [];
+        for (let i = 0; i < px.length; i += 16) y.push(px[i] * 0.299 + px[i + 1] * 0.587 + px[i + 2] * 0.114);
+        luma.push(y);
         if (!stop) setThumbs((t) => ({ ...t, [f]: url }));
       }
+      const d = luma.slice(1).map((y, i) => y.reduce((s, v, k) => s + Math.abs(v - luma[i][k]), 0) / y.length);
+      const sorted = [...d].sort((x, z) => x - z);
+      const median = sorted[Math.floor(sorted.length / 2)] ?? 0;
+      const best = d.reduce((bi, v, i) => (v > d[bi] ? i : bi), 0);
+      if (!stop && d.length && d[best] > 10 && d[best] > median * 3) setReal(frames[best + 1]);
     })();
     return () => {
       stop = true;
@@ -40,13 +52,17 @@ export function FrameRow({ src, fps, cut, before = 6, after = 6 }: { src: string
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key]);
+  useEffect(() => {
+    const t = setTimeout(() => setReal(null), 0);
+    return () => clearTimeout(t);
+  }, [key]);
 
   return (
     <div className="overflow-x-auto [scrollbar-width:none]">
       <div className="flex gap-1 w-max items-stretch">
         {frames.map((f) => (
           <div key={f} className="flex items-stretch gap-1">
-            {f === cut && <div className="w-0.5 rounded bg-[#fcd34d]" title="Detected cut" />}
+            {f === (real ?? cut) && <div className="w-0.5 rounded bg-[#fcd34d]" title={real !== null ? "Cut, measured on these frames" : "Detected cut"} />}
             <div className="relative w-24 aspect-video rounded-md overflow-hidden bg-white/[0.04] ring-1 ring-hair">
               {thumbs[f] && (
                 // eslint-disable-next-line @next/next/no-img-element

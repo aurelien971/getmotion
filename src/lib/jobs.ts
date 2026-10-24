@@ -77,7 +77,7 @@ export async function waitForFal(
 
 // The provider behind fal is sometimes briefly down (502/503/504, "downstream service
 // unavailable"). Nothing is charged for those, so retry a few times before failing.
-const transient = (e: unknown) => {
+export const transientError = (e: unknown) => {
   const o = e as { status?: number; body?: unknown };
   return [502, 503, 504].includes(o?.status ?? 0) || /downstream_service_unavailable|timeout/i.test(JSON.stringify(o?.body ?? "") + String(e));
 };
@@ -94,7 +94,7 @@ export async function submitFal(
       request_id = (await fal.queue.submit(endpoint, { input })).request_id;
       break;
     } catch (e) {
-      if (!transient(e) || attempt >= 4) throw e;
+      if (!transientError(e) || attempt >= 4) throw e;
       onRetry?.(attempt);
       await sleep(4000 * attempt);
     }

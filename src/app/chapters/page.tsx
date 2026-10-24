@@ -12,7 +12,7 @@ import { FrameStrip } from "@/components/FrameStrip";
 import { RangePicker } from "@/components/RangePicker";
 import { ReelPlayer } from "@/components/ReelPlayer";
 import { SpotTrack } from "@/components/SpotTrack";
-import { submitFal, submitSume, waitFor, removeJob, type PendingJob } from "@/lib/jobs";
+import { submitFal, submitSume, waitFor, removeJob, transientError, type PendingJob } from "@/lib/jobs";
 import { MODELS } from "@/lib/models";
 import {
   buildParts,
@@ -25,6 +25,7 @@ import {
   findIssues,
   partKey,
   keptRange,
+  edgeJunk,
   pieceLive,
   takesFor,
   type Issue,
@@ -58,7 +59,7 @@ import {
   wardrobePrompt,
 } from "@/lib/project";
 import { kv } from "@/lib/store";
-import { alignSpans, measureOffset, openReader, refineEdge } from "@/lib/sync";
+import { alignSpans, lineUpRender, measureOffset, openReader, refineEdge } from "@/lib/sync";
 import { assembleTimeline, buildClip, detectCuts, fileHasAudio, fpsExpr, probeVideo, warmUp } from "@/lib/trim";
 import { transcodeInBrowser } from "@/lib/transcode";
 
@@ -81,7 +82,8 @@ function describe(e: unknown): string {
   if (e && typeof e === "object") {
     const o = e as { message?: string; status?: number; body?: { detail?: unknown } };
     const d = o.body?.detail;
-    const t = typeof d === "string" ? d : d ? JSON.stringify(d) : o.message;
+    const first = Array.isArray(d) ? (d[0] as { msg?: string; type?: string }) : null;
+    const t = typeof d === "string" ? d : first?.msg ? `${first.msg}${first.type ? ` (${first.type})` : ""}` : d ? JSON.stringify(d).slice(0, 300) : o.message;
     return `${o.status ? `HTTP ${o.status}: ` : ""}${t ?? String(e)}`;
   }
   return String(e);
@@ -230,7 +232,7 @@ export default function Chapters() {
 
   useEffect(() => {
     if (process.env.NODE_ENV === "development") {
-      (window as unknown as { __engine: unknown }).__engine = { buildClip, assembleTimeline, detectCuts, measureOffset, fpsExpr, measureOffsets, findIssues, alignSpans };
+      (window as unknown as { __engine: unknown }).__engine = { buildClip, assembleTimeline, detectCuts, measureOffset, fpsExpr, measureOffsets, findIssues, alignSpans, lineUpRender };
     }
   }, []);
 
@@ -1042,6 +1044,11 @@ export default function Chapters() {
 
   // Build the clip, upload it with the faces, submit. Returns the job so the caller
   // decides whether to wait; the job id is saved before any waiting happens.
+  const partsRef = useRef(p.parts);
+  useEffect(() => {
+    partsRef.current = p.parts;
+  }, [p.parts]);
+
   async function startPart(part: Part): Promise<PendingJob | null> {
     const g = p.groups.find((x) => x.id === part.groupId)!;
     const model = RENDER_MODELS.find((m) => m.id === g.modelId) ?? RENDER_MODELS[0];
@@ -1104,12 +1111,22 @@ export default function Chapters() {
     }
   }
 
-  async function waitPart(partId: string, job: PendingJob) {
+  async function waitPart(partId: string, job: PendingJob, resubmits = 0) {
     try {
       const url = await waitFor(job, () => patchPart(partId, { error: undefined }));
       removeJob(job.requestId);
       patchPart(partId, { status: "done", resultUrl: url, renderedAt: Date.now(), calibrated: false, measuredOffsets: undefined });
     } catch (e) {
+      removeJob(job.requestId);
+      // The provider dropped it mid-render (not charged): submit again, up to 3 times.
+      const part = partsRef.current.find((x) => x.id === partId);
+      if (transientError(e) && resubmits < 3 && part) {
+        patchPart(partId, { error: `Provider dropped the render, resubmitting (${resubmits + 1}/3)…` });
+        await new Promise((r) => setTimeout(r, 5000 * (resubmits + 1)));
+        const next = await startPart(part);
+        if (next) return waitPart(partId, next, resubmits + 1);
+        return;
+      }
       patchPart(partId, { status: "failed", error: describe(e) });
     }
   }
@@ -1181,26 +1198,39 @@ export default function Chapters() {
   const calibrating = useRef(false);
   useEffect(() => {
     if (!loaded || calibrating.current) return;
-    const next = p.parts.find((x) => x.status === "done" && x.resultUrl && !x.calibrated);
+    const next = p.parts.find((x) => x.status === "done" && x.resultUrl && (!x.calibrated || (!x.linedUp && srcUrl)));
     if (!next) return;
     calibrating.current = true;
     const fps = p.fps;
     (async () => {
       try {
-        const blob = await fetch(next.resultUrl!).then((r) => r.blob());
-        const cuts = await detectCuts(blob, next.clipLength);
-        const offsets = measureOffsets(next, cuts, fps);
+        // Frame by frame against the original; falls back to the render's own cuts.
+        let offsets: number[];
+        let edges: { head: number; tail: number }[] | undefined;
+        if (srcUrl) {
+          ({ offsets, edges } = await lineUpRender(srcUrl, next.resultUrl!, fps, next.pieces));
+        } else {
+          const blob = await fetch(next.resultUrl!).then((r) => r.blob());
+          offsets = measureOffsets(next, await detectCuts(blob, next.clipLength), fps);
+        }
         const moved = offsets.filter((o, i) => Math.abs(o - next.pieces[i].offset) > 0.5 / fps).length;
-        patchPart(next.id, { measuredOffsets: offsets, calibrated: true });
-        if (moved) flash(`Lined up ${moved} piece${moved === 1 ? "" : "s"} in a render with its real cuts`);
+        const junk = (edges ?? []).reduce((n, e) => n + e.head + e.tail, 0);
+        patchPart(next.id, { measuredOffsets: offsets, edges, calibrated: true, linedUp: !!srcUrl });
+        if (moved || junk)
+          flash(
+            [moved ? `lined up ${moved} piece${moved === 1 ? "" : "s"}` : "", junk ? `holding over ${junk} junk frame${junk === 1 ? "" : "s"} at cuts` : ""]
+              .filter(Boolean)
+              .join(" · ")
+              .replace(/^./, (c) => c.toUpperCase()),
+          );
       } catch {
-        patchPart(next.id, { calibrated: true });
+        patchPart(next.id, { calibrated: true, linedUp: true });
       } finally {
         calibrating.current = false;
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loaded, p.parts]);
+  }, [loaded, p.parts, srcUrl]);
 
   // Parts always follow the current shots and span: any trim in Scenes or span drag
   // rebuilds the not-yet-rendered parts, wherever you navigate from.
@@ -1280,7 +1310,7 @@ export default function Chapters() {
       ];
       const drift = stretch.slice(1).map((k, i) => Math.abs(k - 1) * done[i].clipLength * p.fps);
       const files: Blob[] = [p.prepared.blob, ...results];
-      type Rep = { start: number; end: number; file: number; offset: number };
+      type Rep = { start: number; end: number; file: number; offset: number; head: number; tail: number };
       let reps: Rep[] = [];
       done.forEach((d, i) =>
         d.pieces.forEach((pc, j) => {
@@ -1292,11 +1322,11 @@ export default function Chapters() {
           reps = reps.flatMap((r) => {
             if (pc.end <= r.start || pc.start >= r.end) return [r];
             const out: Rep[] = [];
-            if (pc.start > r.start) out.push({ ...r, end: pc.start });
-            if (pc.end < r.end) out.push({ ...r, start: pc.end, offset: r.offset + (pc.end - r.start) });
+            if (pc.start > r.start) out.push({ ...r, end: pc.start, tail: 0 });
+            if (pc.end < r.end) out.push({ ...r, start: pc.end, offset: r.offset + (pc.end - r.start), head: 0 });
             return out;
           });
-          reps.push({ start: pc.start, end: pc.end, file: i + 1, offset: at });
+          reps.push({ start: pc.start, end: pc.end, file: i + 1, offset: at, ...edgeJunk(d, j, p.fps) });
         }),
       );
       reps.sort((a, b) => a.start - b.start);
@@ -1307,7 +1337,16 @@ export default function Chapters() {
         const a = Math.max(r.start, span.start);
         const b = Math.min(r.end, span.end);
         if (a - t > 0.5 / p.fps) pieces.push({ file: 0, start: t, end: a });
-        pieces.push({ file: r.file, start: r.offset + (a - r.start), end: r.offset + (b - r.start) });
+        // Junk frames at the render's cuts: skip them and hold the nearest good frame.
+        const head = a === r.start ? Math.min(r.head, Math.round((b - a) * p.fps) - 1) : 0;
+        const tail = b === r.end ? Math.min(r.tail, Math.round((b - a) * p.fps) - 1 - head) : 0;
+        pieces.push({
+          file: r.file,
+          start: r.offset + (a - r.start) + head / p.fps,
+          end: r.offset + (b - r.start) - tail / p.fps,
+          ...(head > 0 ? { holdStart: head } : {}),
+          ...(tail > 0 ? { hold: tail } : {}),
+        });
         t = b;
       }
       if (span.end - t > 0.5 / p.fps) pieces.push({ file: 0, start: t, end: span.end });
@@ -1410,6 +1449,49 @@ export default function Chapters() {
       setError(`Import failed: ${describe(e)}`);
     }
   }
+
+  const renderName = (pt: Part) => {
+    const g = p.groups.find((x) => x.id === pt.groupId);
+    const a = Math.min(...pt.pieces.map((x) => x.start));
+    const when = new Date(pt.renderedAt ?? Date.now()).toISOString().slice(0, 16).replace(/[:T]/g, "-");
+    return `${(g?.name ?? "look").replace(/[^a-z0-9]+/gi, "-").toLowerCase()}_${fmt(a).replace(/[:.]/g, "-")}_${when}.mp4`;
+  };
+  async function downloadRender(pt: Part) {
+    if (!pt.resultUrl) return;
+    const blob = await fetch(pt.resultUrl).then((r) => r.blob());
+    save({ blob, name: renderName(pt), type: "video/mp4" });
+  }
+  async function downloadAllRenders() {
+    const done = p.parts.filter((x) => x.status === "done" && x.resultUrl);
+    if (!done.length) return;
+    setTask("zip", { label: "Zipping renders", pct: 0 });
+    try {
+      const { default: JSZip } = await import("jszip");
+      const zip = new JSZip();
+      for (let i = 0; i < done.length; i++) {
+        zip.file(renderName(done[i]), (await fetch(done[i].resultUrl!).then((r) => r.blob())) as Blob);
+        setTask("zip", { label: "Zipping renders", pct: (i + 1) / done.length });
+      }
+      const blob = await zip.generateAsync({ type: "blob" });
+      save({ blob, name: `${p.name}-renders.zip`, type: "application/zip" });
+    } catch (e) {
+      setError(`Zip failed: ${describe(e)}`);
+    } finally {
+      setTask("zip", null);
+    }
+  }
+  async function compositeSoFar() {
+    setRangeMode("range");
+    await assemble();
+  }
+  // Once a composite built from the Renders panel is ready, download it.
+  const wantComposite = useRef(false);
+  useEffect(() => {
+    if (wantComposite.current && p.output && !tasks.assemble) {
+      wantComposite.current = false;
+      save(p.output);
+    }
+  }, [p.output, tasks.assemble]);
 
   function save(file: StoredFile) {
     const a = document.createElement("a");
@@ -1544,6 +1626,14 @@ export default function Chapters() {
             onAnalyze={analyzeWardrobe}
             onRender={renderParts}
             onCheck={checkParts}
+            onDownloadRender={(pt) => void downloadRender(pt)}
+            onDownloadAll={() => void downloadAllRenders()}
+            onComposite={() => {
+              wantComposite.current = true;
+              void compositeSoFar();
+            }}
+            compositeBusy={!!tasks.assemble}
+            zipBusy={!!tasks.zip}
             onInspect={(pt) => void inspectPart(pt)}
             onUseTake={useTake}
             onRedoShot={redoShot}
@@ -2445,6 +2535,11 @@ function RenderStep(props: {
   onAnalyze: (g: Group) => void;
   onRender: (partIds: string[]) => void;
   onCheck: (partIds: string[]) => void;
+  onDownloadRender: (part: Part) => void;
+  onDownloadAll: () => void;
+  onComposite: () => void;
+  compositeBusy: boolean;
+  zipBusy: boolean;
   onInspect: (part: Part) => void;
   onUseTake: (shot: { start: number; end: number }, partId: string, j: number) => void;
   onRedoShot: (shot: { start: number; end: number }) => void;
@@ -2530,7 +2625,7 @@ function RenderStep(props: {
                 x.pieces
                   .map((pc, j) => {
                     const k = keptRange(x, j);
-                    return { start: k.start, end: k.end, offset: (x.measuredOffsets?.[j] ?? pc.offset) + (k.start - pc.start), url: x.resultUrl!, j };
+                    return { start: k.start, end: k.end, offset: (x.measuredOffsets?.[j] ?? pc.offset) + (k.start - pc.start), url: x.resultUrl!, j, ...edgeJunk(x, j, p.fps) };
                   })
                   .filter((r) => pieceLive(x, r.j)),
               )
@@ -2600,6 +2695,16 @@ function RenderStep(props: {
         onUse={props.onUseTake}
         onRedo={props.onRedoShot}
         onTrim={(partId, j) => props.onTrimPiece(partId, j)}
+      />
+
+      <RendersPanel
+        p={p}
+        range={range}
+        onDownload={props.onDownloadRender}
+        onDownloadAll={props.onDownloadAll}
+        onComposite={props.onComposite}
+        compositeBusy={props.compositeBusy}
+        zipBusy={props.zipBusy}
       />
 
       <section className="glass rounded-3xl p-5 space-y-3">
@@ -2921,6 +3026,89 @@ function WardrobePanel({
         {group.promptEdited ? "Rebuild prompt (replaces your edits)" : "Rebuild prompt from checklist"}
       </button>
     </div>
+  );
+}
+
+function RendersPanel({
+  p,
+  range,
+  onDownload,
+  onDownloadAll,
+  onComposite,
+  compositeBusy,
+  zipBusy,
+}: {
+  p: Project;
+  range: { start: number; end: number };
+  onDownload: (pt: Part) => void;
+  onDownloadAll: () => void;
+  onComposite: () => void;
+  compositeBusy: boolean;
+  zipBusy: boolean;
+}) {
+  const [open, setOpen] = useState(true);
+  const done = p.parts.filter((x) => x.status === "done" && x.resultUrl).sort((a, b) => (b.renderedAt ?? 0) - (a.renderedAt ?? 0));
+  const status = (pt: Part) => {
+    const live = pt.pieces.filter((_, j) => pieceLive(pt, j)).length;
+    if (live === pt.pieces.length) return "in use";
+    if (live === 0) return pt.rejected?.length === pt.pieces.length ? "redo" : "alternative";
+    return `${live}/${pt.pieces.length} pieces in use`;
+  };
+  return (
+    <section className="glass rounded-3xl p-5 space-y-4">
+      <div className="flex flex-wrap items-center gap-3">
+        <button className="flex-1 min-w-60 text-left" onClick={() => setOpen((o) => !o)}>
+          <h2 className="text-[17px] tracking-tight">
+            Renders <span className="text-muted text-[13px]">· {done.length}</span>{" "}
+            <span className={`inline-block text-muted transition-transform ${open ? "rotate-90" : ""}`}>›</span>
+          </h2>
+          <p className="text-muted text-[13px]">Everything rendered so far, every take. Nothing here is ever deleted.</p>
+        </button>
+        <button className="btn" disabled={!done.length || zipBusy} onClick={onDownloadAll}>
+          {zipBusy ? "Zipping…" : "Download all (.zip)"}
+        </button>
+        <button
+          className="btn btn-on"
+          disabled={!done.length || compositeBusy}
+          onClick={onComposite}
+          title="Renders where they exist, the original everywhere else, original audio, for the current span"
+        >
+          {compositeBusy ? "Building composite…" : `Composite so far · ${fmt(range.start)}–${fmt(range.end)}`}
+        </button>
+      </div>
+      {open && (
+        done.length === 0 ? (
+          <p className="text-faint text-[12px]">No renders yet.</p>
+        ) : (
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {done.map((pt) => {
+              const g = p.groups.find((x) => x.id === pt.groupId);
+              const a = Math.min(...pt.pieces.map((x) => x.start));
+              const b = Math.max(...pt.pieces.map((x) => x.end));
+              const st = status(pt);
+              return (
+                <div key={pt.id} className="rounded-2xl ring-1 ring-hair p-2.5 space-y-2">
+                  <video src={pt.resultUrl} controls playsInline preload="metadata" className="w-full aspect-video rounded-lg bg-black" />
+                  <div className="flex items-start gap-2">
+                    <span className="mt-1.5 w-2 h-2 rounded-full shrink-0" style={{ background: g?.color }} />
+                    <span className="flex-1 min-w-0">
+                      <span className="block text-[12px] truncate">{g?.name ?? "Look"}</span>
+                      <span className="block text-[11px] text-muted tabular-nums">
+                        {fmt(a)}–{fmt(b)} · {pt.pieces.length} piece{pt.pieces.length === 1 ? "" : "s"} · {fmtShort(pt.duration)}
+                      </span>
+                      <span className="block text-[11px] text-faint">
+                        {new Date(pt.renderedAt ?? 0).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })} · {st}
+                      </span>
+                    </span>
+                    <button className="btn h-8 px-3 text-[12px]" onClick={() => onDownload(pt)}>Download</button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )
+      )}
+    </section>
   );
 }
 

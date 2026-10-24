@@ -157,6 +157,8 @@ export type Part = {
   // Where each piece actually starts inside the render, found from the render's own
   // scene cuts. Corrects clips that carried a stray frame. Undefined = not measured.
   measuredOffsets?: number[];
+  edges?: { head: number; tail: number }[]; // junk render frames at each piece's start / end, held over
+  linedUp?: boolean; // measured frame by frame against the original
   calibrated?: boolean;
   issues?: Issue[]; // stray footage found by the pre-flight check
   checkedKey?: string; // pieces the last clean check was for
@@ -196,6 +198,18 @@ export function takesFor(p: Project, r: Interval): Take[] {
 
 // The source range a piece actually contributes (its trim, if reviewed).
 export const keptRange = (pt: Part, j: number) => pt.trims?.[j] ?? { start: pt.pieces[j].start, end: pt.pieces[j].end };
+
+// Junk frames still inside the kept range of a piece (a trim may already cut them off).
+export function edgeJunk(pt: Part, j: number, fps: number) {
+  const e = pt.edges?.[j];
+  if (!e) return { head: 0, tail: 0 };
+  const k = keptRange(pt, j);
+  const pc = pt.pieces[j];
+  return {
+    head: Math.max(0, e.head - Math.round((k.start - pc.start) * fps)),
+    tail: Math.max(0, e.tail - Math.round((pc.end - k.end) * fps)),
+  };
+}
 
 // Footage from another scene inside a piece, found as an unplanned cut in the built clip.
 export type Issue = { shotId: string; at: number; kind: "start" | "end" | "mid"; frames: number };

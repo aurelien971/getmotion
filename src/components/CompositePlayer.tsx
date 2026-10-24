@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { SoundButton, useSound } from "@/lib/sound";
 
-export type RenderPiece = { start: number; end: number; url: string; offset: number };
+export type RenderPiece = { start: number; end: number; url: string; offset: number; head?: number; tail?: number }; // head/tail: junk frames held over
 export type Chapter = { start: number; end: number; color: string; name: string };
 
 const fmt = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, "0")}`;
@@ -27,7 +27,10 @@ export function CompositePlayer({
 }) {
   const [sound, setSound] = useSound();
   const base = useRef<HTMLVideoElement>(null);
-  const over = useRef<HTMLVideoElement>(null);
+  // One preloaded player per render, so switching renders never shows a blank frame.
+  const pool = useRef(new Map<string, HTMLVideoElement>());
+  const [shown, setShown] = useState<string | null>(null);
+  const urls = [...new Set(renders.map((r) => r.url))];
   const [withRenders, setWithRenders] = useState(true);
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(span.start);
@@ -38,25 +41,34 @@ export function CompositePlayer({
     0,
   );
 
-  // Keep the overlay on the render that covers the current source time.
+  // Keep the overlay on the render that covers the current source time. A render
+  // only takes over once its frame is decoded; until then the last picture stays.
   const syncOverlay = (t: number) => {
-    const o = over.current;
-    const r = withRenders ? renders.find((x) => t >= x.start - 0.5 / fps && t < x.end - 0.5 / fps) : undefined;
+    const b = base.current;
+    const f = 1 / fps;
+    const r = withRenders ? renders.find((x) => t >= x.start - 0.5 * f && t < x.end - 0.5 * f) : undefined;
     setActive(r ?? null);
-    if (!o) return;
-    if (!r) {
+    const want = (x: RenderPiece, at: number) =>
+      Math.max(x.offset + (x.head ?? 0) * f + 0.5 * f, Math.min(x.offset + (x.end - x.start) - ((x.tail ?? 0) + 0.5) * f, x.offset + (at - x.start)));
+    // Park the next render on its first frame so it is ready when we get there.
+    const next = withRenders ? renders.find((x) => x !== r && x.start > t && x.start - t < 2) : undefined;
+    pool.current.forEach((o, url) => {
+      if (r && url === r.url) return;
       if (!o.paused) o.pause();
+      if (next && url === next.url && Math.abs(o.currentTime - want(next, next.start)) > 0.03) o.currentTime = want(next, next.start);
+    });
+    if (!r) {
+      setShown(null);
       return;
     }
-    if (o.dataset.url !== r.url) {
-      o.dataset.url = r.url;
-      o.src = r.url;
-    }
-    const want = r.offset + (t - r.start);
-    if (Math.abs(o.currentTime - want) > 0.06) o.currentTime = want;
-    const b = base.current!;
-    if (!b.paused && o.paused) o.play().catch(() => {});
-    if (b.paused && !o.paused) o.pause();
+    const o = pool.current.get(r.url);
+    if (!o) return;
+    const w = want(r, t);
+    const playing = !!b && !b.paused;
+    if (Math.abs(o.currentTime - w) > (playing ? 0.08 : 0.02)) o.currentTime = w;
+    if (playing && o.paused) o.play().catch(() => {});
+    if (!playing && !o.paused) o.pause();
+    if (o.readyState >= 2 && !o.seeking) setShown(r.url);
   };
 
   useEffect(() => {
@@ -105,7 +117,7 @@ export function CompositePlayer({
       syncOverlay(b.currentTime);
     } else {
       b.pause();
-      over.current?.pause();
+      pool.current.forEach((o) => o.pause());
       setPlaying(false);
     }
   };
@@ -140,16 +152,26 @@ export function CompositePlayer({
           }}
           onPause={(e) => {
             setPlaying(false);
-            over.current?.pause();
+            pool.current.forEach((o) => o.pause());
             syncOverlay(e.currentTarget.currentTime);
           }}
         />
-        <video
-          ref={over}
-          muted
-          playsInline
-          className={`absolute inset-0 w-full h-full object-contain bg-black pointer-events-none ${active ? "" : "invisible"}`}
-        />
+        {urls.map((url) => (
+          <video
+            key={url}
+            ref={(el) => {
+              if (el) pool.current.set(url, el);
+              else pool.current.delete(url);
+            }}
+            src={url}
+            muted
+            playsInline
+            preload="auto"
+            onSeeked={() => base.current && syncOverlay(base.current.currentTime)}
+            onLoadedData={() => base.current && syncOverlay(base.current.currentTime)}
+            className={`absolute inset-0 w-full h-full object-contain bg-black pointer-events-none ${active && shown === url ? "" : "invisible"}`}
+          />
+        ))}
         <span className="absolute left-3 top-3 flex gap-1.5">
           <span className="text-[11px] bg-black/60 rounded-full px-2 py-0.5">{active ? "Rendered" : "Original"}</span>
           {(() => {

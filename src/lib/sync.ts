@@ -159,3 +159,80 @@ export async function alignSpans(
     b.close();
   }
 }
+
+// Line a finished render up with the plan, frame by frame. At every hard cut inside
+// the render, each frame near the cut is compared with the original's outgoing and
+// incoming shot. The incoming piece starts where its frames really begin; frames that
+// match neither side (the model's blended / junk transition frames) are reported as
+// `tail` of the outgoing piece and `head` of the incoming one, so they can be held over.
+export async function lineUpRender(
+  original: string,
+  render: string,
+  fps: number,
+  pieces: { start: number; end: number; offset: number }[],
+): Promise<{ offsets: number[]; edges: { head: number; tail: number }[] }> {
+  const a = await openReader(original, fps);
+  const b = await openReader(render, fps);
+  const sf = (t: number) => Math.round(t * fps + 1e-3); // time -> frame index
+  try {
+    const offsets: number[] = [];
+    const edges = pieces.map(() => ({ head: 0, tail: 0 }));
+    for (let i = 0; i < pieces.length; i++) {
+      const pc = pieces[i];
+      if (i === 0) {
+        offsets.push(pc.offset);
+        continue;
+      }
+      const prev = pieces[i - 1];
+      const prevLen = sf(prev.end) - sf(prev.start);
+      const follow = sf(offsets[i - 1]) + prevLen; // planned first render frame of this piece
+      if (Math.abs(prev.end - pc.start) < 1e-3) {
+        offsets.push(follow / fps);
+        continue;
+      }
+      const lastA = await a.frame(sf(prev.end) - 1);
+      const inB = [0, 1, 2, 3].map((s) => sf(pc.start) + s);
+      const refB: Uint8ClampedArray[] = [];
+      for (const f of inB) refB.push(await a.frame(f)); // one seek at a time
+      const lo = Math.max(1, follow - 3);
+      const hi = follow + 4;
+      const rows: { k: number; dA: number; dB: number; s: number }[] = [];
+      for (let k = lo; k <= hi; k++) {
+        const r = await b.frame(k);
+        let dB = Infinity;
+        let s = 0;
+        refB.forEach((x, j) => {
+          const d = diff(r, x);
+          if (d < dB) {
+            dB = d;
+            s = j;
+          }
+        });
+        rows.push({ k, dA: diff(r, lastA), dB, s });
+      }
+      const isB = (x: (typeof rows)[number]) => x.dB < 0.7 * x.dA;
+      const isA = (x: (typeof rows)[number]) => x.dA < 0.7 * x.dB;
+      const ci = rows.findIndex((x, j) => isB(x) && (j === rows.length - 1 || isB(rows[j + 1])));
+      if (ci < 0) {
+        offsets.push(follow / fps);
+        continue;
+      }
+      const c = rows[ci];
+      offsets.push((c.k - c.s) / fps);
+      edges[i].head = c.s;
+      // Outgoing piece: its planned frames after the last real frame of its own shot.
+      let lastAk = -1;
+      for (let j = ci - 1; j >= 0; j--)
+        if (isA(rows[j])) {
+          lastAk = rows[j].k;
+          break;
+        }
+      const end = follow - 1;
+      edges[i - 1].tail = lastAk < 0 ? 0 : Math.min(3, Math.max(0, end - lastAk));
+    }
+    return { offsets, edges };
+  } finally {
+    a.close();
+    b.close();
+  }
+}
