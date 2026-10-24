@@ -119,12 +119,12 @@ export function wardrobePrompt(description: string, w: Wardrobe | undefined, ref
     const who = o.label.replace(/^(a|an|the) /i, "");
     lines.push(
       ow
-        ? `Also replace one other person (${who}) with the man in reference image ${n}: his face and identity${
+        ? `Also replace one other person (${who}) with the person in reference image ${n}: their face and identity${
             oOutfit.length ? `, wearing a ${list(oOutfit)}` : ""
           }${oKeep.length ? `; keep ${list(oKeep)} from the original` : ""}${
             !oOutfit.length ? "; keep that person's clothing" : ""
           }, and keep that person's position and movements.`
-        : `Also replace one other person (${who}) with the man in reference image ${n}, keeping that person's clothing, position and movements.`,
+        : `Also replace one other person (${who}) with the person in reference image ${n}, keeping that person's clothing, position and movements.`,
     );
   });
   lines.push(
