@@ -623,7 +623,7 @@ export default function Chapters() {
   const patchPart = (id: string, patch: Partial<Part>) =>
     update((x) => ({ ...x, parts: x.parts.map((pt) => (pt.id === id ? { ...pt, ...patch } : pt)) }));
 
-  async function addFaces(files: File[]) {
+  async function addFaces(files: File[], asDefault = true): Promise<string[]> {
     const added: { id: string; file: StoredFile; label: string }[] = [];
     for (const f of files) {
       const j = await toJpeg(f, f.name || "face.png").catch(() => null);
@@ -633,13 +633,14 @@ export default function Chapters() {
       }
       added.push({ id: uid(), file: j, label: (f.name || "face").replace(/\.[^.]+$/, "") });
     }
-    if (!added.length) return;
+    if (!added.length) return [];
     update((x) => {
       const library = [...(x.library ?? []), ...added];
       // The first face ever added becomes the default for the whole video.
-      const defaultRefs = x.defaultRefs?.length ? x.defaultRefs : [added[0].id];
+      const defaultRefs = x.defaultRefs?.length || !asDefault ? (x.defaultRefs ?? []) : [added[0].id];
       return { ...x, library, defaultRefs };
     });
+    return added.map((a) => a.id);
   }
   const toggleDefault = (id: string) =>
     update((x) => {
@@ -662,6 +663,48 @@ export default function Chapters() {
         return { ...g, refIds: cur.includes(id) ? cur.filter((y) => y !== id) : [...cur, id] };
       }),
     }));
+
+  const patchOthers = (gid: string, f: (o: NonNullable<Wardrobe["others"]>) => NonNullable<Wardrobe["others"]>) =>
+    update((x) => ({
+      ...x,
+      groups: x.groups.map((g) => {
+        if (g.id !== gid || !g.wardrobe) return g;
+        const w = { ...g.wardrobe, others: f(g.wardrobe.others ?? []) };
+        return { ...g, wardrobe: w, ...(g.promptEdited ? {} : { prompt: wardrobePrompt(g.description, w, refsOf(x, g).length) }) };
+      }),
+    }));
+
+  // Picking a face for another person also reads their wardrobe against that photo.
+  async function setOtherFace(g: Group, i: number, faceId: string | undefined) {
+    patchOthers(g.id, (os) => os.map((o, k) => (k === i ? { ...o, faceId, wardrobe: faceId ? o.wardrobe : undefined } : o)));
+    if (!faceId) return;
+    const person = g.wardrobe?.others?.[i];
+    const face = p.library?.find((f) => f.id === faceId)?.file;
+    if (!person || !face) return;
+    const key = `other-${g.id}-${i}`;
+    setTask(key, { label: `Reading the outfit for ${person.label.split(",")[0]}`, pct: null });
+    try {
+      const target = person.thumb ?? p.shots.find((s) => s.groupId === g.id && s.thumb)?.thumb;
+      const res = await fetch("/api/wardrobe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          targets: target ? [{ name: "person", dataUrl: target }] : [],
+          refs: [{ name: face.name, dataUrl: await blobToDataUrl((await toJpeg(face.blob, face.name, 1280)).blob) }],
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? res.statusText);
+      const wears = (person.wears?.length ? person.wears : (json.target as string[])) ?? [];
+      const reference = (json.reference as string[]).some((x) => /^face$/i.test(x)) ? (json.reference as string[]) : ["Face", ...(json.reference as string[])];
+      const ticks = defaultTicks(wears, reference);
+      patchOthers(g.id, (os) => os.map((o, k) => (k === i ? { ...o, wardrobe: ticks } : o)));
+    } catch (e) {
+      setError(`Outfit for the other person: ${describe(e)}`);
+    } finally {
+      setTask(key, null);
+    }
+  }
 
   async function analyzeWardrobe(g: Group) {
     setTask(`wardrobe-${g.id}`, { label: `Reading the wardrobe for ${g.name}`, pct: null });
@@ -691,10 +734,20 @@ export default function Chapters() {
         eyewear: !!json.eyewear,
         performance: typeof json.performance === "string" ? json.performance : undefined,
         refKey: refKey(photos),
-        others: (Array.isArray(json.others) ? (json.others as string[]) : []).map((label) => ({
-          label,
-          faceId: prev?.others?.find((o) => o.label === label)?.faceId,
-        })),
+        others: await Promise.all(
+          (Array.isArray(json.others) ? json.others : []).map(
+            async (o: string | { label: string; shot?: number; box?: number[]; wears?: string[] }) => {
+              const label = typeof o === "string" ? o : o.label;
+              const old = prev?.others?.find((x) => x.label === label);
+              let thumb = old?.thumb;
+              if (!thumb && typeof o !== "string" && o.box?.length === 4) {
+                const src = shots[o.shot ?? 0]?.thumb ?? shots[0]?.thumb;
+                if (src) thumb = await cropDataUrl(src, o.box).catch(() => undefined);
+              }
+              return { label, faceId: old?.faceId, thumb, wears: typeof o === "string" ? old?.wears : o.wears, wardrobe: old?.wardrobe };
+            },
+          ),
+        ),
       };
       update((x) => ({
         ...x,
@@ -967,6 +1020,8 @@ export default function Chapters() {
   const tried = useRef(new Set<string>());
   useEffect(() => {
     if (!loaded || p.step !== "render") return;
+    // Dev only: ?noauto keeps test sessions from spending API calls.
+    if (process.env.NODE_ENV === "development" && new URLSearchParams(window.location.search).has("noauto")) return;
     if (Object.keys(tasks).some((k) => k.startsWith("wardrobe-"))) return;
     const next = p.groups.find((g) => {
       const photos = refsOf(p, g);
@@ -1313,6 +1368,7 @@ export default function Chapters() {
             tasks={tasks}
             onPatch={patchGroup}
             onAddFaces={addFaces}
+            onOtherFace={(g, i, id) => void setOtherFace(g, i, id)}
             onToggleDefault={toggleDefault}
             onRemoveFace={removeFace}
             onToggleGroupFace={toggleGroupFace}
@@ -1434,6 +1490,28 @@ export default function Chapters() {
       )}
     </div>
   );
+}
+
+// Crop a region (fractions of the image) out of a data-URL image, with some padding.
+async function cropDataUrl(src: string, box: number[], size = 240): Promise<string> {
+  const img = document.createElement("img");
+  await new Promise<void>((res, rej) => {
+    img.onload = () => res();
+    img.onerror = () => rej(new Error("Could not read the shot"));
+    img.src = src;
+  });
+  const [x, y, w, h] = box.map((v) => Math.max(0, Math.min(1, v)));
+  const pad = 0.15;
+  const sx = Math.max(0, (x - w * pad) * img.width);
+  const sy = Math.max(0, (y - h * pad) * img.height);
+  const sw = Math.min(img.width - sx, w * (1 + 2 * pad) * img.width);
+  const sh = Math.min(img.height - sy, h * (1 + 2 * pad) * img.height);
+  const c = document.createElement("canvas");
+  const k = size / Math.max(sw, sh);
+  c.width = Math.max(1, Math.round(sw * k));
+  c.height = Math.max(1, Math.round(sh * k));
+  c.getContext("2d")!.drawImage(img, sx, sy, sw, sh, 0, 0, c.width, c.height);
+  return c.toDataURL("image/jpeg", 0.85);
 }
 
 // Starting prompt for a look, built from its description and wardrobe. Editable; Claude can rewrite it.
@@ -2101,7 +2179,8 @@ function RenderStep(props: {
   src: string;
   tasks: Record<string, Task>;
   onPatch: (id: string, patch: Partial<Group>) => void;
-  onAddFaces: (files: File[]) => void;
+  onAddFaces: (files: File[], asDefault?: boolean) => Promise<string[]>;
+  onOtherFace: (g: Group, i: number, faceId: string | undefined) => void;
   onToggleDefault: (id: string) => void;
   onRemoveFace: (id: string) => void;
   onToggleGroupFace: (gid: string, id: string) => void;
@@ -2146,7 +2225,7 @@ function RenderStep(props: {
         const t = it.types.find((x) => x.startsWith("image/"));
         if (t) files.push(new File([await it.getType(t)], `pasted-${Date.now()}.${t.split("/")[1]}`, { type: t }));
       }
-      if (files.length) props.onAddFaces(files);
+      if (files.length) void props.onAddFaces(files);
       else props.onError("No image on the clipboard.");
     } catch {
       props.onError("Clipboard blocked. Use Upload instead.");
@@ -2263,7 +2342,7 @@ function RenderStep(props: {
               multiple
               className="hidden"
               onChange={(e) => {
-                props.onAddFaces(Array.from(e.target.files ?? []));
+                void props.onAddFaces(Array.from(e.target.files ?? []));
                 e.target.value = "";
               }}
             />
@@ -2356,7 +2435,6 @@ function RenderStep(props: {
                 </div>
                 <WardrobePanel
                   group={g}
-                  library={lib}
                   hasFaces={refsOf(p, g).length > 0}
                   busy={!!props.tasks[`wardrobe-${g.id}`]}
                   onAnalyze={() => props.onAnalyze(g)}
@@ -2411,6 +2489,20 @@ function RenderStep(props: {
               </div>
             </div>
 
+            {g.wardrobe && (
+              <PeoplePanel
+                group={g}
+                library={p.library ?? []}
+                busy={(i) => !!props.tasks[`other-${g.id}-${i}`]}
+                onFace={(i, id) => props.onOtherFace(g, i, id)}
+                onUploadFace={async (i, files) => {
+                  const ids = await props.onAddFaces(files, false);
+                  if (ids[0]) props.onOtherFace(g, i, ids[0]);
+                }}
+                onChange={(others) => props.onPatch(g.id, { wardrobe: { ...g.wardrobe!, others } })}
+              />
+            )}
+
             <ol className="space-y-2">
               {parts.map((pt, i) => (
                 <PartRow
@@ -2446,7 +2538,6 @@ function RenderStep(props: {
 
 function WardrobePanel({
   group,
-  library,
   hasFaces,
   busy,
   onAnalyze,
@@ -2454,7 +2545,6 @@ function WardrobePanel({
   onBuild,
 }: {
   group: Group;
-  library: { id: string; label: string }[];
   hasFaces: boolean;
   busy: boolean;
   onAnalyze: () => void;
@@ -2518,43 +2608,6 @@ function WardrobePanel({
         <p key={c} className="text-[11px] text-[#fcd34d]">{c}</p>
       ))}
       {w && (
-        <div className="rounded-xl ring-1 ring-hair p-2.5 space-y-1.5">
-          <span className="block text-[11px] text-muted">Other people in this look</span>
-          {(w.others ?? []).length === 0 && <span className="block text-[12px] text-faint">Nobody else detected.</span>}
-          {(w.others ?? []).map((o, i) => (
-            <div key={`${o.label}-${i}`} className="flex items-center gap-2 group">
-              <span className="text-[12px] flex-1 min-w-0">{o.label}</span>
-              <select
-                value={o.faceId ?? ""}
-                onChange={(e) =>
-                  onChange({
-                    ...w,
-                    others: (w.others ?? []).map((x, k) => (k === i ? { ...x, faceId: e.target.value || undefined } : x)),
-                  })
-                }
-                className="field py-1 px-2 text-[12px] w-36"
-              >
-                <option value="">Keep as is</option>
-                {library.map((f) => (
-                  <option key={f.id} value={f.id}>Replace with {f.label}</option>
-                ))}
-              </select>
-              <button
-                className="text-faint opacity-0 group-hover:opacity-100 text-[12px]"
-                onClick={() => onChange({ ...w, others: (w.others ?? []).filter((_, k) => k !== i) })}
-                aria-label="Remove person"
-              >
-                ×
-              </button>
-            </div>
-          ))}
-          <OtherAdd onAdd={(label) => onChange({ ...w, others: [...(w.others ?? []), { label }] })} />
-          {(w.others ?? []).some((o) => o.faceId) && (
-            <span className="block text-[11px] text-faint">Upload their face in Faces above; it is sent after his photos.</span>
-          )}
-        </div>
-      )}
-      {w && (
         <p className="text-faint text-[11px]">
           {w.alone ? "Alone in this look · " : ""}
           {w.faceHidden ? "face hidden in some frames · " : ""}
@@ -2565,6 +2618,137 @@ function WardrobePanel({
         {group.promptEdited ? "Rebuild prompt (replaces your edits)" : "Rebuild prompt from checklist"}
       </button>
     </div>
+  );
+}
+
+function PeoplePanel({
+  group,
+  library,
+  busy,
+  onFace,
+  onUploadFace,
+  onChange,
+}: {
+  group: Group;
+  library: { id: string; file: StoredFile; label: string }[];
+  busy: (i: number) => boolean;
+  onFace: (i: number, faceId: string | undefined) => void;
+  onUploadFace: (i: number, files: File[]) => void;
+  onChange: (others: NonNullable<Wardrobe["others"]>) => void;
+}) {
+  const others = group.wardrobe?.others ?? [];
+  const setShot = async (i: number, f: File) => {
+    const j = await toJpeg(f, f.name || "person.png", 480).catch(() => null);
+    if (!j) return;
+    const url = await blobToDataUrl(j.blob);
+    onChange(others.map((o, k) => (k === i ? { ...o, thumb: url } : o)));
+  };
+  const pasteShot = async (i: number) => {
+    try {
+      for (const it of await navigator.clipboard.read()) {
+        const t = it.types.find((x) => x.startsWith("image/"));
+        if (t) return setShot(i, new File([await it.getType(t)], "person.png", { type: t }));
+      }
+    } catch {}
+  };
+  return (
+    <section className="space-y-3">
+      <div className="flex items-baseline justify-between">
+        <h4 className="text-[14px]">Other people in this look</h4>
+        <span className="text-faint text-[11px]">Pick a face to replace someone; no face = they stay as they are.</span>
+      </div>
+      {others.length === 0 && <p className="text-faint text-[12px]">Nobody else detected in this look.</p>}
+      <div className="grid md:grid-cols-2 gap-3">
+        {others.map((o, i) => (
+          <div key={`${o.label}-${i}`} className="rounded-2xl ring-1 ring-hair p-3 space-y-3">
+            <div className="flex gap-3">
+              <div className="w-24 shrink-0 space-y-1.5">
+                <div className="w-24 h-24 rounded-xl overflow-hidden bg-white/[0.04] ring-1 ring-hair grid place-items-center">
+                  {o.thumb ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={o.thumb} alt="" className="w-full h-full object-cover" />
+                  ) : (
+                    <span className="text-faint text-[11px] text-center px-2">No picture</span>
+                  )}
+                </div>
+                <div className="grid grid-cols-2 gap-1">
+                  <button className="btn h-6 px-0 text-[10px] w-full" onClick={() => pasteShot(i)} title="Paste a screenshot of this person">Paste</button>
+                  <label className="btn h-6 px-0 text-[10px] w-full cursor-pointer" title="Pick a screenshot of this person">
+                    File
+                    <input type="file" accept="image/*" className="hidden" onChange={(e) => e.target.files?.[0] && setShot(i, e.target.files[0])} />
+                  </label>
+                </div>
+              </div>
+              <div className="flex-1 min-w-0 space-y-2">
+                <textarea
+                  value={o.label}
+                  onChange={(e) => onChange(others.map((x, k) => (k === i ? { ...x, label: e.target.value } : x)))}
+                  rows={2}
+                  className="w-full bg-transparent text-[12px] leading-snug resize-none outline-none"
+                />
+                <div className="space-y-1">
+                  <span className="text-[11px] text-muted">Replace with</span>
+                  <div className="flex flex-wrap gap-1.5 items-center">
+                    <button
+                      className={`btn h-8 px-2.5 text-[11px] ${!o.faceId ? "btn-on" : ""}`}
+                      onClick={() => onFace(i, undefined)}
+                    >
+                      Keep as is
+                    </button>
+                    {library.map((f) => (
+                      <FaceTile key={f.id} small file={f.file} label={f.label} on={o.faceId === f.id} onToggle={() => onFace(i, o.faceId === f.id ? undefined : f.id)} />
+                    ))}
+                    <label className="btn h-8 px-2.5 text-[11px] cursor-pointer">
+                      Upload face
+                      <input
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={(e) => {
+                          onUploadFace(i, Array.from(e.target.files ?? []));
+                          e.target.value = "";
+                        }}
+                      />
+                    </label>
+                  </div>
+                </div>
+              </div>
+              <button
+                className="text-faint hover:text-ink text-[12px] self-start"
+                onClick={() => onChange(others.filter((_, k) => k !== i))}
+                aria-label="Remove person"
+              >
+                ×
+              </button>
+            </div>
+            {o.faceId && (
+              busy(i) ? (
+                <p className="text-faint text-[11px]">Reading their outfit…</p>
+              ) : o.wardrobe ? (
+                <div className="grid grid-cols-2 gap-2">
+                  <ItemList
+                    title="Take from the photo"
+                    items={o.wardrobe.reference}
+                    locked={(x) => /^face$/i.test(x.label)}
+                    onToggle={(k, on) => onChange(others.map((x, n) => (n === i && x.wardrobe ? { ...x, wardrobe: { ...x.wardrobe, reference: x.wardrobe.reference.map((r, m) => (m === k ? { ...r, on } : r)) } } : x)))}
+                    onRemove={(k) => onChange(others.map((x, n) => (n === i && x.wardrobe ? { ...x, wardrobe: { ...x.wardrobe, reference: x.wardrobe.reference.filter((_, m) => m !== k) } } : x)))}
+                    onAdd={(l) => onChange(others.map((x, n) => (n === i && x.wardrobe ? { ...x, wardrobe: { ...x.wardrobe, reference: [...x.wardrobe.reference, { label: l, on: true }] } } : x)))}
+                  />
+                  <ItemList
+                    title="Keep from them"
+                    items={o.wardrobe.target}
+                    onToggle={(k, on) => onChange(others.map((x, n) => (n === i && x.wardrobe ? { ...x, wardrobe: { ...x.wardrobe, target: x.wardrobe.target.map((r, m) => (m === k ? { ...r, on } : r)) } } : x)))}
+                    onRemove={(k) => onChange(others.map((x, n) => (n === i && x.wardrobe ? { ...x, wardrobe: { ...x.wardrobe, target: x.wardrobe.target.filter((_, m) => m !== k) } } : x)))}
+                    onAdd={(l) => onChange(others.map((x, n) => (n === i && x.wardrobe ? { ...x, wardrobe: { ...x.wardrobe, target: [...x.wardrobe.target, { label: l, on: true }] } } : x)))}
+                  />
+                </div>
+              ) : null
+            )}
+          </div>
+        ))}
+      </div>
+      <OtherAdd onAdd={(label) => onChange([...others, { label }])} />
+    </section>
   );
 }
 

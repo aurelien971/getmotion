@@ -42,7 +42,13 @@ export type Wardrobe = {
   others?: OtherPerson[]; // other people in this look; faceId set = replace them too
 };
 
-export type OtherPerson = { label: string; faceId?: string };
+export type OtherPerson = {
+  label: string;
+  faceId?: string; // set = replace this person with that library photo
+  thumb?: string; // cropped picture of them (data URL)
+  wears?: string[]; // their visible clothing, from the look analysis
+  wardrobe?: { target: WardrobeItem[]; reference: WardrobeItem[] }; // keep / take for their swap
+};
 
 const TOPS = /hoodie|tee|t-shirt|shirt|sweatshirt|jacket|coat|suit|top|jersey|vest|sweater|blazer/i;
 
@@ -104,11 +110,23 @@ export function wardrobePrompt(description: string, w: Wardrobe | undefined, ref
       w?.faceHidden ? ", including the frames where he looks down or turns away" : ""
     }${w?.performance ? ` (${w.performance})` : ""}.`,
   );
-  swaps.forEach((o, k) =>
+  swaps.forEach((o, k) => {
+    const n = refCount + k + 1;
+    const ow = o.wardrobe;
+    const oTake = (ow?.reference ?? []).filter((x) => x.on && !/^face$/i.test(x.label)).map((x) => x.label.toLowerCase());
+    const oOutfit = oTake.filter((x) => !HAIR_OR_FACE.test(x));
+    const oKeep = (ow?.target ?? []).filter((x) => x.on && !HAIR_OR_FACE.test(x.label)).map((x) => x.label.toLowerCase());
+    const who = o.label.replace(/^(a|an|the) /i, "");
     lines.push(
-      `Also replace one other person (${o.label.replace(/^(a|an|the) /i, "")}) with the man in reference image ${refCount + k + 1}, keeping that person's clothing, position and movements.`,
-    ),
-  );
+      ow
+        ? `Also replace one other person (${who}) with the man in reference image ${n}: his face and identity${
+            oOutfit.length ? `, wearing a ${list(oOutfit)}` : ""
+          }${oKeep.length ? `; keep ${list(oKeep)} from the original` : ""}${
+            !oOutfit.length ? "; keep that person's clothing" : ""
+          }, and keep that person's position and movements.`
+        : `Also replace one other person (${who}) with the man in reference image ${n}, keeping that person's clothing, position and movements.`,
+    );
+  });
   lines.push(
     alone
       ? "Keep the background, camera motion, framing, lighting and color grade unchanged."
