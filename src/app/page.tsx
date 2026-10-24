@@ -1,6 +1,7 @@
 "use client";
 
 import { fal } from "@fal-ai/client";
+import Image from "next/image";
 import { useEffect, useRef, useState } from "react";
 import { MODELS, SAM2_VIDEO } from "@/lib/models";
 
@@ -265,7 +266,9 @@ export default function Home() {
   return (
     <div className="min-h-dvh flex flex-col">
       <header className="flex items-center justify-between px-5 h-14 border-b border-line">
-        <h1 className="text-[17px]">getmotion</h1>
+        <h1 className="flex items-center">
+          <Image src="/logo.png" alt="getmotion.art" width={2000} height={667} priority className="h-5 w-auto" />
+        </h1>
         <p className="text-muted text-sm">
           {busy ? (
             <span className="inline-flex items-center gap-2">
