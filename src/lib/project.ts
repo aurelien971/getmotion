@@ -143,7 +143,11 @@ export type Part = {
   issues?: Issue[]; // stray footage found by the pre-flight check
   checkedKey?: string; // pieces the last clean check was for
   rejected?: number[]; // piece indices marked Redo after review
+  trims?: Record<number, { start: number; end: number }>; // kept source range of a piece after review
 };
+
+// The source range a piece actually contributes (its trim, if reviewed).
+export const keptRange = (pt: Part, j: number) => pt.trims?.[j] ?? { start: pt.pieces[j].start, end: pt.pieces[j].end };
 
 // Footage from another scene inside a piece, found as an unplanned cut in the built clip.
 export type Issue = { shotId: string; at: number; kind: "start" | "end" | "mid"; frames: number };
@@ -368,7 +372,9 @@ export function covered(p: Project, groupId?: string): Interval[] {
     .filter((x) => x.status === "done" || x.status === "rendering" || x.status === "building" || x.status === "uploading")
     // A render whose shot edges changed no longer counts: its footage gets a fresh part.
     .filter((x) => !(x.status === "done" && renderOutdated(p, x)))
-    .flatMap((x) => x.pieces.filter((_, j) => !x.rejected?.includes(j)).map((pc) => ({ start: pc.start, end: pc.end })));
+    .flatMap((x) =>
+      x.pieces.flatMap((_, j) => (x.rejected?.includes(j) ? [] : [keptRange(x, j)])),
+    );
   return merge(xs);
 }
 
@@ -526,7 +532,11 @@ export function moveEdge(
 export function renderOutdated(p: Project, part: Part): boolean {
   const shots = p.shots.filter((s) => s.groupId === part.groupId);
   const tol = 0.5 / p.fps;
-  return part.pieces.some((pc) => !shots.some((s) => pc.start >= s.start - tol && pc.end <= s.end + tol));
+  return part.pieces.some((_, j) => {
+    if (part.rejected?.includes(j)) return false;
+    const r = keptRange(part, j);
+    return !shots.some((s) => r.start >= s.start - tol && r.end <= s.end + tol);
+  });
 }
 
 // Photos for the other people this look replaces, in prompt order (after the target's).

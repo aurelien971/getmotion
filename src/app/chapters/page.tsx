@@ -22,6 +22,7 @@ import {
   measureOffsets,
   findIssues,
   partKey,
+  keptRange,
   type Issue,
   pending as pendingFor,
   emptyProject,
@@ -596,6 +597,7 @@ export default function Chapters() {
 
   const [sel, setSel] = useState<string>("unassigned");
   const [trimming, setTrimming] = useState<string | null>(null);
+  const [trimmingRender, setTrimmingRender] = useState<{ partId: string; j: number } | null>(null);
 
   // ---- render ---------------------------------------------------------------
   const plan = (x: Project): Part[] => {
@@ -743,6 +745,57 @@ export default function Chapters() {
     } finally {
       setTask(`prompt-${g.id}`, null);
     }
+  }
+
+  // Keep only the frames picked in a rendered piece. Cut-off frames that sit across a
+  // hard cut in the original are another scene's: the shot edge moves so they belong
+  // there. The rest stay in this look and go into its next render.
+  async function trimRenderPiece(partId: string, j: number, a: number, b: number) {
+    const part = p.parts.find((x) => x.id === partId);
+    if (!part || !srcUrl) return;
+    const pc = part.pieces[j];
+    const off = part.measuredOffsets?.[j] ?? pc.offset;
+    const fps = p.fps;
+    const snap = (t: number) => Math.round(t * fps) / fps;
+    const newStart = Math.max(pc.start, snap(pc.start + (a - off)));
+    const newEnd = Math.min(pc.end, snap(pc.start + (b - off)));
+    if (newEnd - newStart < 1 / fps) return;
+    const tol = 0.6 / fps;
+    const shot = p.shots.find((x) => x.id === pc.shotId);
+    let st = { boundaries: p.boundaries, cuts: p.cuts ?? [] };
+    let foreign = 0;
+    const reader = await openReader(srcUrl, fps);
+    try {
+      const total = Math.floor(p.duration * fps);
+      if (shot && newStart > pc.start + tol && Math.abs(shot.start - pc.start) < tol) {
+        const f = await refineEdge(reader, fps, newStart, total, 1);
+        if (f === Math.round(newStart * fps)) {
+          foreign += Math.round((newStart - pc.start) * fps);
+          st = moveEdge(st.boundaries, st.cuts, shot.start, newStart, tol);
+        }
+      }
+      if (shot && newEnd < pc.end - tol && Math.abs(shot.end - pc.end) < tol) {
+        const f = await refineEdge(reader, fps, newEnd, total, 1);
+        if (f === Math.round(newEnd * fps)) {
+          foreign += Math.round((pc.end - newEnd) * fps);
+          st = moveEdge(st.boundaries, st.cuts, shot.end, newEnd, tol);
+        }
+      }
+    } finally {
+      reader.close();
+    }
+    const cutOff = Math.round((pc.end - pc.start - (newEnd - newStart)) * fps);
+    const next = {
+      ...p,
+      ...st,
+      parts: p.parts.map((x) => (x.id === partId ? { ...x, trims: { ...(x.trims ?? {}), [j]: { start: newStart, end: newEnd } } } : x)),
+    };
+    const shots = buildShots(next);
+    update(() => ({ ...next, shots }));
+    await refreshThumbs(shots);
+    flash(
+      `Trimmed ${cutOff} frame${cutOff === 1 ? "" : "s"}: ${foreign} back to the neighbouring scene, ${cutOff - foreign} into this look's next render`,
+    );
   }
 
   // Build the clip, upload it with the faces, submit. Returns the job so the caller
@@ -955,11 +1008,16 @@ export default function Chapters() {
   // Parts always follow the current shots and span: any trim in Scenes or span drag
   // rebuilds the not-yet-rendered parts, wherever you navigate from.
   const shotsKey = p.shots.map((s) => `${s.id}:${s.start.toFixed(4)}-${s.end.toFixed(4)}:${s.groupId}`).join("|");
+  // What's already covered: finished/running renders with their trims and redos.
+  const coverKey = p.parts
+    .filter((x) => x.status !== "idle" && x.status !== "failed")
+    .map((x) => `${x.id}:${x.status}:${JSON.stringify(x.trims ?? {})}:${(x.rejected ?? []).join(",")}`)
+    .join("|");
   useEffect(() => {
     if (!loaded || !p.groups.length) return;
     queueMicrotask(() => update((x) => ({ ...x, parts: plan(x) })));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loaded, shotsKey, p.range?.start, p.range?.end, p.groups.length]);
+  }, [loaded, shotsKey, coverKey, p.range?.start, p.range?.end, p.groups.length]);
 
   // Resume renders that were in flight when the page closed.
   const resumed = useRef(false);
@@ -1029,7 +1087,9 @@ export default function Chapters() {
       done.forEach((d, i) =>
         d.pieces.forEach((pc, j) => {
           if (d.rejected?.includes(j)) return;
-          const at = d.measuredOffsets?.[j] ?? pc.offset;
+          const kept = keptRange(d, j);
+          const at = (d.measuredOffsets?.[j] ?? pc.offset) + (kept.start - pc.start);
+          pc = { ...pc, start: kept.start, end: kept.end };
           // Newer renders replace older ones where they overlap.
           reps = reps.flatMap((r) => {
             if (pc.end <= r.start || pc.start >= r.end) return [r];
@@ -1260,6 +1320,7 @@ export default function Chapters() {
             onAnalyze={analyzeWardrobe}
             onRender={renderParts}
             onCheck={checkParts}
+            onTrimPiece={(id, j) => setTrimmingRender({ partId: id, j })}
             onFix={fixIssues}
             onReject={(id, j, rejected) =>
               update((x) => ({
@@ -1315,6 +1376,31 @@ export default function Chapters() {
             onSave={(a, b) => {
               setTrimming(null);
               void moveEdges(s.id, a, b);
+            }}
+          />
+        );
+      })()}
+
+      {trimmingRender && (() => {
+        const pt = p.parts.find((x) => x.id === trimmingRender.partId);
+        if (!pt?.resultUrl) return null;
+        const j = trimmingRender.j;
+        const pc = pt.pieces[j];
+        const off = pt.measuredOffsets?.[j] ?? pc.offset;
+        const k = keptRange(pt, j);
+        const g = p.groups.find((x) => x.id === pt.groupId);
+        return (
+          <EdgeEditor
+            src={pt.resultUrl}
+            fps={24}
+            duration={pt.clipLength + 0.2}
+            start={off + (k.start - pc.start)}
+            end={off + (k.end - pc.start)}
+            title={`render · ${g?.name ?? ""} · piece ${j + 1} · ${fmt(pc.start)}`}
+            onClose={() => setTrimmingRender(null)}
+            onSave={(a, b) => {
+              setTrimmingRender(null);
+              void trimRenderPiece(pt.id, j, a, b);
             }}
           />
         );
@@ -2023,6 +2109,7 @@ function RenderStep(props: {
   onAnalyze: (g: Group) => void;
   onRender: (partIds: string[]) => void;
   onCheck: (partIds: string[]) => void;
+  onTrimPiece: (partId: string, piece: number) => void;
   onFix: (part: Part) => void;
   onReject: (partId: string, piece: number, rejected: boolean) => void;
   onNext: () => void;
@@ -2099,7 +2186,10 @@ function RenderStep(props: {
               .sort((a, b) => (a.renderedAt ?? 0) - (b.renderedAt ?? 0))
               .flatMap((x) =>
                 x.pieces
-                  .map((pc, j) => ({ start: pc.start, end: pc.end, offset: x.measuredOffsets?.[j] ?? pc.offset, url: x.resultUrl!, j }))
+                  .map((pc, j) => {
+                    const k = keptRange(x, j);
+                    return { start: k.start, end: k.end, offset: (x.measuredOffsets?.[j] ?? pc.offset) + (k.start - pc.start), url: x.resultUrl!, j };
+                  })
                   .filter((r) => !x.rejected?.includes(r.j)),
               )
               .reverse()}
@@ -2328,6 +2418,7 @@ function RenderStep(props: {
                   onCheck={() => props.onCheck([pt.id])}
                   onFix={() => props.onFix(pt)}
                   onReject={(j, r) => props.onReject(pt.id, j, r)}
+                  onTrim={(j) => props.onTrimPiece(pt.id, j)}
                   src={props.src}
                   fps={p.fps}
                   part={pt}
@@ -2607,6 +2698,7 @@ function PartRow({
   onCheck,
   onFix,
   onReject,
+  onTrim,
   src,
   fps,
   part,
@@ -2620,6 +2712,7 @@ function PartRow({
   onCheck: () => void;
   onFix: () => void;
   onReject: (piece: number, rejected: boolean) => void;
+  onTrim: (piece: number) => void;
   src: string;
   fps: number;
   part: Part;
@@ -2703,15 +2796,20 @@ function PartRow({
           </span>
           <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
             {part.pieces.map((pc, j) => {
-              const off = part.measuredOffsets?.[j] ?? pc.offset;
+              const k = part.trims?.[j] ?? { start: pc.start, end: pc.end };
+              const off = (part.measuredOffsets?.[j] ?? pc.offset) + (k.start - pc.start);
+              const trimmed = !!part.trims?.[j];
               const rej = part.rejected?.includes(j);
               return (
                 <div key={j} className={`space-y-1.5 ${rej ? "opacity-50" : ""}`}>
-                  <ReelPlayer src={part.resultUrl!} fps={fps} spans={[{ start: off, end: off + (pc.end - pc.start) }]} className="aspect-video" />
+                  <ReelPlayer src={part.resultUrl!} fps={24} spans={[{ start: off, end: off + (k.end - k.start) }]} className="aspect-video" />
                   <div className="flex items-center gap-2">
                     <span className="text-[11px] text-muted tabular-nums flex-1">
-                      {j + 1} · {fmt(pc.start)} · {Math.round((pc.end - pc.start) * fps)}f
+                      {j + 1} · {fmt(k.start)} · {Math.round((k.end - k.start) * fps)}f{trimmed ? " · trimmed" : ""}
                     </span>
+                    <button className="btn h-7 px-2.5 text-[11px]" disabled={rej} onClick={() => onTrim(j)} title="Pick the first and last good frame">
+                      Trim
+                    </button>
                     <div className="seg glass">
                       <button className={!rej ? "on" : ""} onClick={() => onReject(j, false)}>Keep</button>
                       <button className={rej ? "on" : ""} onClick={() => onReject(j, true)}>Redo</button>
