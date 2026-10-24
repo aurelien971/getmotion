@@ -80,7 +80,7 @@ export const MODELS: Model[] = [
     usesMask: false,
     keepsAudio: true,
     maxCast: 4,
-    usdPerSec: 0.3,
+    usdPerSec: 0.1, // measured: $1.44 for a 15 s clip at 768P
     build: (i) => ({
       video_url: i.videoUrl,
       reference_image_urls: i.cast.map((c) => c.url),
