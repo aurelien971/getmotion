@@ -13,12 +13,16 @@ export type Shot = {
   thumb?: string; // data URL, ~480px wide
 };
 
+export type LibFace = { id: string; file: StoredFile; label: string };
+
 export type Group = {
   id: string;
   name: string;
   description: string;
   color: string;
-  refs: StoredFile[];
+  refs: StoredFile[]; // legacy, migrated into the library on load
+  refIds?: string[]; // faces from the library for this look; empty = the project default
+  promptEdited?: boolean; // typed by hand: never overwritten automatically
   notes: string;
   prompt: string;
   modelId: string;
@@ -27,7 +31,15 @@ export type Group = {
 
 export type WardrobeItem = { label: string; on: boolean };
 // target: what he wears in this look (on = keep it); reference: what the photo has (on = take it).
-export type Wardrobe = { target: WardrobeItem[]; reference: WardrobeItem[] };
+export type Wardrobe = {
+  target: WardrobeItem[];
+  reference: WardrobeItem[];
+  alone?: boolean; // he's the only person in every shot of this look
+  faceHidden?: boolean; // some frames hide his face (looking down, brim, turned away)
+  eyewear?: boolean; // sunglasses/glasses in this look
+  performance?: string; // what he does: "raps to camera with hand gestures"
+  refKey?: string; // which photos this analysis was made with
+};
 
 const TOPS = /hoodie|tee|t-shirt|shirt|sweatshirt|jacket|coat|suit|top|jersey|vest|sweater|blazer/i;
 
@@ -39,24 +51,58 @@ export function wardrobeClashes(w: Wardrobe): string[] {
     : [];
 }
 
-export function wardrobePrompt(description: string, w: Wardrobe): string {
-  const take = w.reference.filter((x) => x.on).map((x) => x.label.toLowerCase());
-  const keep = w.target.filter((x) => x.on).map((x) => x.label.toLowerCase());
-  const drop = w.target.filter((x) => !x.on).map((x) => x.label.toLowerCase());
-  const outfit = take.filter((x) => x !== "face");
-  return [
-    `The man to replace appears in every single shot of this clip. ${description}`.trim(),
-    "He is the same person in every shot, even when he wears sunglasses or a hat, turns sideways, or is small in the frame.",
-    `Give him, from reference image 1: ${["his face and identity", ...outfit].join(", ")}.`,
-    keep.length ? `Keep from the original exactly as they are: ${keep.join(", ")}.` : "",
-    drop.length && outfit.length
-      ? `His ${drop.join(", ")} ${drop.length === 1 ? "is" : "are"} replaced by the reference outfit; none of it stays visible.`
-      : "",
-    drop.length && !outfit.length ? `Remove his ${drop.join(", ")}.` : "",
-    "Add nothing else. Everyone else, the background and the camera stay unchanged. Preserve lip-sync, expressions, gestures and motion.",
-  ]
-    .filter(Boolean)
-    .join(" ");
+const KEEP_BY_DEFAULT = /sunglass|glasses|shades|chain|necklace|pendant|earring|stud|watch|ring|bracelet|grill/i;
+const HAIR_OR_FACE = /^face$|hair|beard|stubble|mustache|moustache/i;
+
+// Default ticks: with an outfit in the photo, keep his jewelry and eyewear and
+// replace his clothes; with a face-only photo, keep everything he wears.
+export function defaultTicks(target: string[], reference: string[]): Wardrobe {
+  const outfit = reference.some((r) => !HAIR_OR_FACE.test(r));
+  return {
+    target: target.map((label) => ({ label, on: !outfit || KEEP_BY_DEFAULT.test(label) })),
+    reference: reference.map((label) => ({ label, on: true })),
+  };
+}
+
+export function wardrobePrompt(description: string, w: Wardrobe | undefined, refCount: number): string {
+  const take = (w?.reference ?? []).filter((x) => x.on && !/^face$/i.test(x.label)).map((x) => x.label.toLowerCase());
+  const hair = take.filter((x) => HAIR_OR_FACE.test(x));
+  const outfit = take.filter((x) => !HAIR_OR_FACE.test(x));
+  const keep = (w?.target ?? []).filter((x) => x.on).map((x) => x.label.toLowerCase());
+  const drop = (w?.target ?? []).filter((x) => !x.on).map((x) => x.label.toLowerCase());
+  const who = refCount > 1 ? `the man in reference images 1 to ${refCount} (all the same person)` : "the man in reference image 1";
+  const list = (xs: string[], and = "and") => (xs.length < 2 ? xs.join("") : `${xs.slice(0, -1).join(", ")} ${and} ${xs[xs.length - 1]}`);
+
+  const lines: string[] = [];
+  if (w?.alone) lines.push("He is the only person in every shot of this clip.");
+  else
+    lines.push(
+      `The man to replace appears in every single shot of this clip. ${description}`.trim(),
+      ...(w?.eyewear || w?.faceHidden
+        ? ["He is the same person in every shot, even when sunglasses, a hat or a turned head hide part of his face."]
+        : []),
+    );
+  lines.push(
+    `Replace him with ${who}: ${list(["his face, identity", ...hair])}${outfit.length ? `, wearing a ${list(outfit)}` : ""}.`,
+  );
+  if (keep.length) lines.push(`Keep ${list(keep)} exactly as in the original${outfit.length ? ", over the new outfit" : ""}.`);
+  if (drop.length)
+    lines.push(
+      outfit.length
+        ? `No ${list(drop, "or")}: none of the original outfit stays visible.`
+        : `Remove ${list(drop)}.`,
+    );
+  lines.push(
+    `Match the original performance exactly: perfect lip-sync to the vocals, the same mouth shapes, facial expressions, hand gestures, arm movements and head turns${
+      w?.faceHidden ? ", including the frames where he looks down or turns away" : ""
+    }${w?.performance ? ` (${w.performance})` : ""}.`,
+  );
+  lines.push(
+    w?.alone
+      ? "Keep the background, camera motion, framing, lighting and color grade unchanged."
+      : "Everyone else, the background, camera motion, framing, lighting and color grade stay unchanged.",
+  );
+  return lines.join(" ");
 }
 
 export type PartPiece = { shotId: string; start: number; end: number; offset: number };
@@ -103,6 +149,8 @@ export type Project = {
   step: Step;
   output?: StoredFile;
   range?: Interval; // the span being rendered now; all renders are kept across spans
+  library?: LibFace[]; // every reference photo for this project
+  defaultRefs?: string[]; // library ids used by looks that don't pick their own
 };
 
 export const emptyProject = (): Project => ({
@@ -355,13 +403,20 @@ export function partsInRange(p: Project, groupId?: string): Part[] {
   );
 }
 
-export function signature(part: Part, group: Group) {
+export function signature(part: Part, group: Group, refs: StoredFile[]) {
   return [
     part.pieces.map((x) => `${x.start.toFixed(3)}-${x.end.toFixed(3)}`).join("|"),
     group.prompt,
     group.modelId,
-    group.refs.map((r) => `${r.name}:${r.blob.size}`).join(","),
+    refKey(refs),
   ].join("#");
+}
+
+export const refKey = (refs: StoredFile[]) => refs.map((r) => `${r.name}:${r.blob.size}`).join(",");
+
+export function refsOf(p: Project, g: Group): StoredFile[] {
+  const ids = g.refIds?.length ? g.refIds : (p.defaultRefs ?? []);
+  return ids.map((id) => p.library?.find((f) => f.id === id)?.file).filter((f): f is StoredFile => !!f);
 }
 
 // ---- formatting -----------------------------------------------------------

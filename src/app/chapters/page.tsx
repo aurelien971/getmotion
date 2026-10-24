@@ -39,6 +39,9 @@ import {
   type Step,
   type StoredFile,
   type Wardrobe,
+  defaultTicks,
+  refKey,
+  refsOf,
   wardrobeClashes,
   wardrobePrompt,
 } from "@/lib/project";
@@ -171,7 +174,20 @@ export default function Chapters() {
         const source = await kv.get<StoredFile>("chapters.source");
         const prepared = await kv.get<StoredFile>("chapters.prepared");
         const output = await kv.get<StoredFile>("chapters.output");
-        if (meta) setP({ ...emptyProject(), ...meta, source, prepared, output });
+        if (meta) {
+          // Move per-look photos (older projects) into the shared face library.
+          const library = [...(meta.library ?? [])];
+          const groups = (meta.groups ?? []).map((g) => {
+            if (!g.refs?.length) return g;
+            const ids = g.refs.map((file) => {
+              const id = uid();
+              library.push({ id, file, label: file.name.replace(/\.[^.]+$/, "") });
+              return id;
+            });
+            return { ...g, refs: [], refIds: [...(g.refIds ?? []), ...ids] };
+          });
+          setP({ ...emptyProject(), ...meta, groups, library, source, prepared, output });
+        }
       } catch {}
       setLoaded(true);
     })();
@@ -592,13 +608,54 @@ export default function Chapters() {
   const patchPart = (id: string, patch: Partial<Part>) =>
     update((x) => ({ ...x, parts: x.parts.map((pt) => (pt.id === id ? { ...pt, ...patch } : pt)) }));
 
+  async function addFaces(files: File[]) {
+    const added: { id: string; file: StoredFile; label: string }[] = [];
+    for (const f of files) {
+      const j = await toJpeg(f, f.name || "face.png").catch(() => null);
+      if (!j) {
+        setError(`Can't read ${f.name}. Use a JPEG or PNG.`);
+        continue;
+      }
+      added.push({ id: uid(), file: j, label: (f.name || "face").replace(/\.[^.]+$/, "") });
+    }
+    if (!added.length) return;
+    update((x) => {
+      const library = [...(x.library ?? []), ...added];
+      // The first face ever added becomes the default for the whole video.
+      const defaultRefs = x.defaultRefs?.length ? x.defaultRefs : [added[0].id];
+      return { ...x, library, defaultRefs };
+    });
+  }
+  const toggleDefault = (id: string) =>
+    update((x) => {
+      const d = x.defaultRefs ?? [];
+      return { ...x, defaultRefs: d.includes(id) ? d.filter((y) => y !== id) : [...d, id] };
+    });
+  const removeFace = (id: string) =>
+    update((x) => ({
+      ...x,
+      library: (x.library ?? []).filter((f) => f.id !== id),
+      defaultRefs: (x.defaultRefs ?? []).filter((y) => y !== id),
+      groups: x.groups.map((g) => ({ ...g, refIds: g.refIds?.filter((y) => y !== id) })),
+    }));
+  const toggleGroupFace = (gid: string, id: string) =>
+    update((x) => ({
+      ...x,
+      groups: x.groups.map((g) => {
+        if (g.id !== gid) return g;
+        const cur = g.refIds?.length ? g.refIds : [];
+        return { ...g, refIds: cur.includes(id) ? cur.filter((y) => y !== id) : [...cur, id] };
+      }),
+    }));
+
   async function analyzeWardrobe(g: Group) {
     setTask(`wardrobe-${g.id}`, { label: `Reading the wardrobe for ${g.name}`, pct: null });
     try {
       const range = p.range ?? { start: 0, end: p.duration };
       const shots = p.shots.filter((s) => s.groupId === g.id && s.thumb && s.end > range.start && s.start < range.end).slice(0, 8);
+      const photos = refsOf(p, g);
       const refs = await Promise.all(
-        g.refs.map(async (r) => ({ name: r.name, dataUrl: await blobToDataUrl((await toJpeg(r.blob, r.name, 1280)).blob) })),
+        photos.map(async (r) => ({ name: r.name, dataUrl: await blobToDataUrl((await toJpeg(r.blob, r.name, 1280)).blob) })),
       );
       const res = await fetch("/api/wardrobe", {
         method: "POST",
@@ -609,15 +666,25 @@ export default function Chapters() {
       if (!res.ok) throw new Error(json.error ?? res.statusText);
       const prev = g.wardrobe;
       const was = (list: { label: string; on: boolean }[] | undefined, label: string) => list?.find((x) => x.label === label)?.on;
+      const reference = (json.reference as string[]).some((x) => /^face$/i.test(x)) ? (json.reference as string[]) : ["Face", ...(json.reference as string[])];
+      const ticks = defaultTicks(json.target as string[], reference);
       const w: Wardrobe = {
-        target: (json.target as string[]).map((label) => ({ label, on: was(prev?.target, label) ?? false })),
-        reference: (json.reference as string[]).map((label) => ({
-          label,
-          on: /^face$/i.test(label) ? true : (was(prev?.reference, label) ?? true),
-        })),
+        target: ticks.target.map((x) => ({ ...x, on: was(prev?.target, x.label) ?? x.on })),
+        reference: ticks.reference.map((x) => ({ ...x, on: /^face$/i.test(x.label) ? true : (was(prev?.reference, x.label) ?? x.on) })),
+        alone: !!json.alone,
+        faceHidden: !!json.faceHidden,
+        eyewear: !!json.eyewear,
+        performance: typeof json.performance === "string" ? json.performance : undefined,
+        refKey: refKey(photos),
       };
-      if (!w.reference.some((x) => /^face$/i.test(x.label))) w.reference.unshift({ label: "Face", on: true });
-      patchGroup(g.id, { wardrobe: w });
+      update((x) => ({
+        ...x,
+        groups: x.groups.map((gg) =>
+          gg.id === g.id
+            ? { ...gg, wardrobe: w, ...(gg.promptEdited ? {} : { prompt: wardrobePrompt(gg.description, w, photos.length) }) }
+            : gg,
+        ),
+      }));
     } catch (e) {
       setError(`Wardrobe for ${g.name}: ${describe(e)}`);
     } finally {
@@ -630,7 +697,7 @@ export default function Chapters() {
     try {
       const shots = p.shots.filter((s) => s.groupId === g.id && s.thumb).slice(0, 8);
       const faces = await Promise.all(
-        g.refs.map(async (r) => ({ name: r.name, dataUrl: await blobToDataUrl((await toJpeg(r.blob, r.name, 1280)).blob) })),
+        refsOf(p, g).map(async (r) => ({ name: r.name, dataUrl: await blobToDataUrl((await toJpeg(r.blob, r.name, 1280)).blob) })),
       );
       const res = await fetch("/api/direct", {
         method: "POST",
@@ -653,7 +720,7 @@ export default function Chapters() {
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? res.statusText);
-      patchGroup(g.id, { prompt: json.prompt ?? "" });
+      patchGroup(g.id, { prompt: json.prompt ?? "", promptEdited: true });
     } catch (e) {
       setError(`Prompt for ${g.name}: ${describe(e)}`);
     } finally {
@@ -670,8 +737,9 @@ export default function Chapters() {
       setError("The video is still being prepared. Try again in a moment.");
       return null;
     }
-    if (!g.refs.length) {
-      setError(`Add a face to "${g.name}" first.`);
+    const photos = refsOf(p, g);
+    if (!photos.length) {
+      setError(`Pick a face for "${g.name}" first.`);
       return null;
     }
     try {
@@ -690,7 +758,7 @@ export default function Chapters() {
       patchPart(part.id, { status: "uploading", progress: undefined });
       const videoUrl = await fal.storage.upload(clip);
       const cast = await Promise.all(
-        g.refs.map(async (r) => ({ url: await fal.storage.upload(new File([r.blob], r.name, { type: r.type })), who: "" })),
+        photos.map(async (r) => ({ url: await fal.storage.upload(new File([r.blob], r.name, { type: r.type })), who: "" })),
       );
       const input = model.build({
         videoUrl,
@@ -709,7 +777,7 @@ export default function Chapters() {
         status: "rendering",
         endpoint: job.endpoint,
         requestId: job.requestId,
-        signature: signature(part, g),
+        signature: signature(part, g, photos),
       });
       return job;
     } catch (e) {
@@ -744,9 +812,30 @@ export default function Chapters() {
   useEffect(() => {
     if (!loaded || p.step !== "render" || !p.groups.some((g) => !g.prompt.trim())) return;
     queueMicrotask(() =>
-      update((x) => ({ ...x, groups: x.groups.map((g) => (g.prompt.trim() ? g : { ...g, prompt: defaultPrompt(g) })) })),
+      update((x) => ({
+        ...x,
+        groups: x.groups.map((g) => (g.prompt.trim() ? g : { ...g, prompt: defaultPrompt(g, refsOf(x, g).length) })),
+      })),
     );
   }, [loaded, p.step, p.groups, update]);
+
+  // On the Render step, every look in the span with a face gets its wardrobe read
+  // (once per set of photos), which also rebuilds its prompt unless it was typed by hand.
+  const tried = useRef(new Set<string>());
+  useEffect(() => {
+    if (!loaded || p.step !== "render") return;
+    if (Object.keys(tasks).some((k) => k.startsWith("wardrobe-"))) return;
+    const next = p.groups.find((g) => {
+      const photos = refsOf(p, g);
+      if (!photos.length || partsInRange(p, g.id).length === 0) return false;
+      const key = `${g.id}:${refKey(photos)}`;
+      return g.wardrobe?.refKey !== refKey(photos) && !tried.current.has(key);
+    });
+    if (!next) return;
+    tried.current.add(`${next.id}:${refKey(refsOf(p, next))}`);
+    queueMicrotask(() => void analyzeWardrobe(next));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded, p.step, p.groups, p.library, p.defaultRefs, p.range, tasks]);
 
   // Resume renders that were in flight when the page closed.
   const resumed = useRef(false);
@@ -1033,14 +1122,10 @@ export default function Chapters() {
             src={srcUrl}
             tasks={tasks}
             onPatch={patchGroup}
-            onAddRef={async (gid, f) => {
-              const j = await toJpeg(f, f.name || "face.png").catch(() => null);
-              if (!j) return setError(`Can't read ${f.name}. Use a JPEG or PNG.`);
-              update((x) => ({ ...x, groups: x.groups.map((g) => (g.id === gid ? { ...g, refs: [...g.refs, j].slice(0, 4) } : g)) }));
-            }}
-            onRemoveRef={(gid, i) =>
-              update((x) => ({ ...x, groups: x.groups.map((g) => (g.id === gid ? { ...g, refs: g.refs.filter((_, k) => k !== i) } : g)) }))
-            }
+            onAddFaces={addFaces}
+            onToggleDefault={toggleDefault}
+            onRemoveFace={removeFace}
+            onToggleGroupFace={toggleGroupFace}
             onWrite={writeGroupPrompt}
             onAnalyze={analyzeWardrobe}
             onRender={renderParts}
@@ -1123,15 +1208,9 @@ export default function Chapters() {
   );
 }
 
-// Starting prompt for a look, built from its description. Editable; Claude can rewrite it.
-function defaultPrompt(g: Group) {
-  return [
-    `The man to replace appears in every single shot of this clip. ${g.description}`.trim(),
-    "He is the same person in every shot, even when he wears sunglasses or a hat, turns sideways, or is small in the frame.",
-    "Replace his face and head with the man in reference image 1 in all of them.",
-    "Keep his clothing, headwear, sunglasses and jewelry exactly as they are; add nothing, remove nothing.",
-    "Everyone else, the background and the camera stay unchanged. Preserve lip-sync, expressions, gestures and motion.",
-  ].join(" ");
+// Starting prompt for a look, built from its description and wardrobe. Editable; Claude can rewrite it.
+function defaultPrompt(g: Group, refCount = 1) {
+  return wardrobePrompt(g.description, g.wardrobe, Math.max(1, refCount));
 }
 
 function blobToDataUrl(b: Blob) {
@@ -1794,8 +1873,10 @@ function RenderStep(props: {
   src: string;
   tasks: Record<string, Task>;
   onPatch: (id: string, patch: Partial<Group>) => void;
-  onAddRef: (gid: string, f: File) => void;
-  onRemoveRef: (gid: string, i: number) => void;
+  onAddFaces: (files: File[]) => void;
+  onToggleDefault: (id: string) => void;
+  onRemoveFace: (id: string) => void;
+  onToggleGroupFace: (gid: string, id: string) => void;
   onWrite: (g: Group) => void;
   onAnalyze: (g: Group) => void;
   onRender: (partIds: string[]) => void;
@@ -1820,20 +1901,25 @@ function RenderStep(props: {
   const renderedIn = total(clipTo(renderedAll, range));
   const activeGroups = p.groups.filter((g) => partsInRange(p, g.id).length > 0);
   const idleGroups = p.groups.filter((g) => !activeGroups.includes(g));
-  const missingFaces = activeGroups.filter((g) => !g.refs.length && partsInRange(p, g.id).some((x) => x.status === "idle" || x.status === "failed"));
+  const missingFaces = activeGroups.filter((g) => !refsOf(p, g).length && partsInRange(p, g.id).some((x) => x.status === "idle" || x.status === "failed"));
   const snapPoints = [...(p.cuts ?? []), ...p.boundaries.map((b) => b.t)];
 
-  const paste = async (gid: string) => {
+  const paste = async () => {
     try {
       const items = await navigator.clipboard.read();
+      const files: File[] = [];
       for (const it of items) {
         const t = it.types.find((x) => x.startsWith("image/"));
-        if (t) props.onAddRef(gid, new File([await it.getType(t)], `pasted.${t.split("/")[1]}`, { type: t }));
+        if (t) files.push(new File([await it.getType(t)], `pasted-${Date.now()}.${t.split("/")[1]}`, { type: t }));
       }
+      if (files.length) props.onAddFaces(files);
+      else props.onError("No image on the clipboard.");
     } catch {
-      props.onError("Clipboard blocked. Use Add a face instead.");
+      props.onError("Clipboard blocked. Use Upload instead.");
     }
   };
+  const lib = p.library ?? [];
+  const defaults = p.defaultRefs ?? [];
 
   return (
     <div className="max-w-6xl mx-auto p-6 space-y-6">
@@ -1906,6 +1992,48 @@ function RenderStep(props: {
         )}
       </section>
 
+      <section className="glass rounded-3xl p-5 space-y-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex-1 min-w-60">
+            <h2 className="text-[17px] tracking-tight">Faces</h2>
+            <p className="text-muted text-[13px]">
+              All your reference photos. Ticked ones are the default for the whole video; each look can pick its own below.
+            </p>
+          </div>
+          <button className="btn" onClick={paste}>Paste</button>
+          <label className="btn cursor-pointer">
+            Upload
+            <input
+              type="file"
+              accept="image/*"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                props.onAddFaces(Array.from(e.target.files ?? []));
+                e.target.value = "";
+              }}
+            />
+          </label>
+        </div>
+        {lib.length === 0 ? (
+          <p className="text-faint text-[12px]">No photos yet. Upload or paste one: a face shot, an outfit shot, or both.</p>
+        ) : (
+          <div className="flex flex-wrap gap-3">
+            {lib.map((f) => (
+              <FaceTile
+                key={f.id}
+                file={f.file}
+                label={f.label}
+                on={defaults.includes(f.id)}
+                onToggle={() => props.onToggleDefault(f.id)}
+                onRemove={() => props.onRemoveFace(f.id)}
+                caption={defaults.includes(f.id) ? "Default" : "Not default"}
+              />
+            ))}
+          </div>
+        )}
+      </section>
+
       {activeGroups.map((g) => {
         const parts = partsInRange(p, g.id);
         const shots = p.shots.filter((s) => s.groupId === g.id && s.end > range.start && s.start < range.end);
@@ -1939,36 +2067,53 @@ function RenderStep(props: {
             <div className="grid md:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)] gap-5">
               <div className="space-y-4">
                 <div className="space-y-2">
-                  <span className="text-[13px]">Who goes in</span>
-                  <div className="flex flex-wrap gap-2 items-center">
-                    {g.refs.map((r, i) => (
-                      <RefThumb key={i} file={r} onRemove={() => props.onRemoveRef(g.id, i)} />
-                    ))}
-                    <button className="btn" onClick={() => paste(g.id)}>Paste</button>
-                    <label className="btn cursor-pointer">
-                      Add a face
-                      <input
-                        type="file"
-                        accept="image/*"
-                        multiple
-                        className="hidden"
-                        onChange={(e) => {
-                          Array.from(e.target.files ?? []).forEach((f) => props.onAddRef(g.id, f));
-                          e.target.value = "";
-                        }}
-                      />
-                    </label>
+                  <div className="flex items-baseline justify-between">
+                    <span className="text-[13px]">Who goes in</span>
+                    <span className="text-faint text-[11px]">
+                      {g.refIds?.length ? "Picked for this look" : defaults.length ? "Using the default" : "Pick at least one"}
+                    </span>
                   </div>
-                  <p className="text-faint text-[11px]">
-                    Tip: for a sunglasses or hat look, add a second photo of him wearing that.
-                  </p>
+                  {lib.length === 0 ? (
+                    <p className="text-faint text-[11px]">Add photos in Faces above.</p>
+                  ) : (
+                    <div className="flex flex-wrap gap-2">
+                      {lib.map((f) => {
+                        const own = g.refIds?.length ? g.refIds.includes(f.id) : false;
+                        const viaDefault = !g.refIds?.length && defaults.includes(f.id);
+                        return (
+                          <FaceTile
+                            key={f.id}
+                            small
+                            file={f.file}
+                            label={f.label}
+                            on={own || viaDefault}
+                            dim={viaDefault}
+                            onToggle={() => props.onToggleGroupFace(g.id, f.id)}
+                          />
+                        );
+                      })}
+                      {!!g.refIds?.length && (
+                        <button className="btn h-8 px-3 text-[11px]" onClick={() => props.onPatch(g.id, { refIds: [] })}>
+                          Use default
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
                 <WardrobePanel
                   group={g}
+                  hasFaces={refsOf(p, g).length > 0}
                   busy={!!props.tasks[`wardrobe-${g.id}`]}
                   onAnalyze={() => props.onAnalyze(g)}
-                  onChange={(w) => props.onPatch(g.id, { wardrobe: w })}
-                  onBuild={() => g.wardrobe && props.onPatch(g.id, { prompt: wardrobePrompt(g.description, g.wardrobe) })}
+                  onChange={(w) =>
+                    props.onPatch(g.id, {
+                      wardrobe: w,
+                      ...(g.promptEdited ? {} : { prompt: wardrobePrompt(g.description, w, refsOf(p, g).length) }),
+                    })
+                  }
+                  onBuild={() =>
+                    props.onPatch(g.id, { prompt: wardrobePrompt(g.description, g.wardrobe, refsOf(p, g).length), promptEdited: false })
+                  }
                 />
                 <div className="space-y-2">
                   <span className="text-[13px]">Model</span>
@@ -1997,13 +2142,13 @@ function RenderStep(props: {
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <span className="text-[13px]">Prompt</span>
-                  <button className="btn h-7 px-3 text-[12px]" disabled={writing || !g.refs.length} onClick={() => props.onWrite(g)}>
+                  <button className="btn h-7 px-3 text-[12px]" disabled={writing || !refsOf(p, g).length} onClick={() => props.onWrite(g)}>
                     {writing ? "Writing…" : g.prompt ? "Rewrite with Claude" : "Write with Claude"}
                   </button>
                 </div>
                 <textarea
                   value={g.prompt}
-                  onChange={(e) => props.onPatch(g.id, { prompt: e.target.value })}
+                  onChange={(e) => props.onPatch(g.id, { prompt: e.target.value, promptEdited: true })}
                   placeholder="Empty uses a safe default: replace him in every shot, keep wardrobe and sunglasses."
                   className="field text-[13px] leading-relaxed"
                   rows={8}
@@ -2019,9 +2164,9 @@ function RenderStep(props: {
                   fps={p.fps}
                   part={pt}
                   index={i}
-                  stale={!!pt.signature && pt.status === "done" && pt.signature !== signature(pt, g)}
+                  stale={!!pt.signature && pt.status === "done" && pt.signature !== signature(pt, g, refsOf(p, g))}
                   cost={costOf(pt)}
-                  canRender={g.refs.length > 0}
+                  canRender={refsOf(p, g).length > 0}
                   onRender={() => props.onRender([pt.id])}
                 />
               ))}
@@ -2041,12 +2186,14 @@ function RenderStep(props: {
 
 function WardrobePanel({
   group,
+  hasFaces,
   busy,
   onAnalyze,
   onChange,
   onBuild,
 }: {
   group: Group;
+  hasFaces: boolean;
   busy: boolean;
   onAnalyze: () => void;
   onChange: (w: Wardrobe) => void;
@@ -2070,8 +2217,8 @@ function WardrobePanel({
         <span className="text-[13px]">Wardrobe</span>
         <button
           className="btn h-7 px-3 text-[12px]"
-          disabled={busy || !group.refs.length}
-          title={group.refs.length ? "Claude lists what he wears here and what your photo has" : "Add a face first"}
+          disabled={busy || !hasFaces}
+          title={hasFaces ? "Claude lists what he wears here and what your photo has" : "Pick a face first"}
           onClick={onAnalyze}
         >
           {busy ? "Reading…" : w ? "Analyze again" : "Analyze"}
@@ -2109,10 +2256,15 @@ function WardrobePanel({
         <p key={c} className="text-[11px] text-[#fcd34d]">{c}</p>
       ))}
       {w && (
-        <button className="btn w-full" onClick={onBuild}>
-          Build prompt from checklist
-        </button>
+        <p className="text-faint text-[11px]">
+          {w.alone ? "Alone in this look · " : ""}
+          {w.faceHidden ? "face hidden in some frames · " : ""}
+          {w.performance ?? ""}
+        </p>
       )}
+      <button className="btn w-full" onClick={onBuild}>
+        {group.promptEdited ? "Rebuild prompt (replaces your edits)" : "Rebuild prompt from checklist"}
+      </button>
     </div>
   );
 }
@@ -2174,20 +2326,52 @@ function ItemList({
   );
 }
 
-function RefThumb({ file, onRemove }: { file: StoredFile; onRemove: () => void }) {
+function FaceTile({
+  file,
+  label,
+  on,
+  dim,
+  small,
+  caption,
+  onToggle,
+  onRemove,
+}: {
+  file: StoredFile;
+  label: string;
+  on: boolean;
+  dim?: boolean;
+  small?: boolean;
+  caption?: string;
+  onToggle: () => void;
+  onRemove?: () => void;
+}) {
   const url = useMemo(() => URL.createObjectURL(file.blob), [file.blob]);
   return (
-    <span className="relative group">
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img src={url} alt="" className="h-12 w-12 rounded-full object-cover ring-1 ring-hair" />
+    <div className={`relative group ${small ? "w-14" : "w-24"} space-y-1`}>
       <button
-        onClick={onRemove}
-        className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-white text-black text-[11px] opacity-0 group-hover:opacity-100"
-        aria-label="Remove face"
+        onClick={onToggle}
+        className={`relative block w-full aspect-square rounded-xl overflow-hidden transition ${
+          on ? (dim ? "ring-2 ring-white/40" : "ring-2 ring-white") : "ring-1 ring-hair opacity-50 hover:opacity-100"
+        }`}
+        title={label}
       >
-        ×
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img src={url} alt="" className="w-full h-full object-cover" />
+        {on && (
+          <span className="absolute top-1 right-1 w-4 h-4 rounded-full bg-white text-black text-[10px] grid place-items-center">✓</span>
+        )}
       </button>
-    </span>
+      {!small && <span className="block text-[11px] truncate text-muted">{caption ?? label}</span>}
+      {onRemove && (
+        <button
+          onClick={onRemove}
+          className="absolute -top-1.5 -left-1.5 w-5 h-5 rounded-full bg-white text-black text-[11px] opacity-0 group-hover:opacity-100"
+          aria-label="Remove photo"
+        >
+          ×
+        </button>
+      )}
+    </div>
   );
 }
 

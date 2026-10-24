@@ -16,8 +16,14 @@ REFERENCE IMAGES show the reference man. List the face first as "Face", then hai
 visible piece of clothing and accessory, same level of detail ("navy two-piece suit",
 "white dress shirt", "red silk tie", "American flag lapel pin").
 
+Also judge the target shots:
+- "alone": true if he is the only person in every target shot.
+- "faceHidden": true if in some frames his face is hard to see (looking down, cap brim, turned away, motion blur).
+- "eyewear": true if he wears sunglasses or glasses in any target shot.
+- "performance": a few words on what he does, e.g. "raps to camera with hand gestures, leans in".
+
 Reply with JSON only:
-{"target":["..."],"reference":["Face","..."]}`;
+{"target":["..."],"reference":["Face","..."],"alone":true,"faceHidden":false,"eyewear":false,"performance":"..."}`;
 
 function toImage(img: Img): Anthropic.ImageBlockParam | null {
   const m = /^data:(image\/(?:png|jpeg|webp));base64,(.+)$/.exec(img.dataUrl);
