@@ -355,7 +355,9 @@ export async function buildClip(
   });
 }
 
-export type TimelinePiece = { file: number; start: number; end: number }; // file 0 = source
+// file 0 = source. hold / holdStart repeat the piece's last / first frame that many
+// times (used to close 1-2 frame holes left by trimmed renders).
+export type TimelinePiece = { file: number; start: number; end: number; hold?: number; holdStart?: number };
 
 
 // Lay pieces end to end, conform every piece to w x h, and put the source's own
@@ -391,7 +393,13 @@ export async function assembleTimeline(
       const retime = Math.abs(k - 1) > 1e-4 ? `(PTS-STARTPTS)/${k.toFixed(6)}` : "PTS-STARTPTS";
       // Trim each piece to its exact frame count after retiming.
       const frames = Math.round((p.end - p.start) * evalFps(fps));
-      graph += `[${i}:v]setpts=${retime},${vf},trim=end_frame=${frames},setpts=PTS-STARTPTS[v${i}];`;
+      const pad = [
+        p.holdStart ? `tpad=start_mode=clone:start=${p.holdStart}` : "",
+        p.hold ? `tpad=stop_mode=clone:stop=${p.hold}` : "",
+      ]
+        .filter(Boolean)
+        .join(",");
+      graph += `[${i}:v]setpts=${retime},${vf},trim=end_frame=${frames},setpts=PTS-STARTPTS${pad ? "," + pad : ""}[v${i}];`;
     });
     graph += pieces.map((_, i) => `[v${i}]`).join("") + `concat=n=${pieces.length}:v=1:a=0[v]`;
     const total = pieces.reduce((t, p) => t + p.end - p.start, 0);

@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { SoundButton, useSound } from "@/lib/sound";
 
 export type RenderPiece = { start: number; end: number; url: string; offset: number };
+export type Chapter = { start: number; end: number; color: string; name: string };
 
 const fmt = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, "0")}`;
 
@@ -13,14 +15,17 @@ export function CompositePlayer({
   fps,
   span,
   renders,
+  chapters = [],
   className = "",
 }: {
   src: string;
   fps: number;
   span: { start: number; end: number };
   renders: RenderPiece[];
+  chapters?: Chapter[];
   className?: string;
 }) {
+  const [sound, setSound] = useSound();
   const base = useRef<HTMLVideoElement>(null);
   const over = useRef<HTMLVideoElement>(null);
   const [withRenders, setWithRenders] = useState(true);
@@ -120,6 +125,7 @@ export function CompositePlayer({
           ref={base}
           src={src}
           playsInline
+          muted={!sound}
           className="w-full h-full object-contain cursor-pointer"
           onClick={toggle}
           onTimeUpdate={(e) => {
@@ -144,8 +150,19 @@ export function CompositePlayer({
           playsInline
           className={`absolute inset-0 w-full h-full object-contain bg-black pointer-events-none ${active ? "" : "invisible"}`}
         />
-        <span className="absolute left-3 top-3 text-[11px] bg-black/60 rounded-full px-2 py-0.5">
-          {active ? "Rendered" : "Original"}
+        <span className="absolute left-3 top-3 flex gap-1.5">
+          <span className="text-[11px] bg-black/60 rounded-full px-2 py-0.5">{active ? "Rendered" : "Original"}</span>
+          {(() => {
+            const ch = chapters.find((c) => time >= c.start && time < c.end);
+            return ch ? (
+              <span className="text-[11px] bg-black/60 rounded-full px-2 py-0.5 inline-flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full" style={{ background: ch.color }} />
+                {ch.name}
+              </span>
+            ) : (
+              <span className="text-[11px] bg-black/60 rounded-full px-2 py-0.5 text-muted">Not him</span>
+            );
+          })()}
         </span>
         <div className="absolute right-3 top-3 seg glass">
           <button className={!withRenders ? "on" : ""} onClick={() => setWithRenders(false)}>Original</button>
@@ -159,13 +176,21 @@ export function CompositePlayer({
           {playing ? "❚❚" : "▶"}
         </button>
         <div
-          className="relative flex-1 h-5 cursor-pointer"
+          className="relative flex-1 h-6 cursor-pointer"
           onPointerDown={(e) => {
             const r = e.currentTarget.getBoundingClientRect();
             seek(span.start + ((e.clientX - r.left) / r.width) * len);
           }}
         >
           <div className="absolute inset-x-0 top-2 h-1 rounded-full bg-white/10" />
+          {chapters.map((c, i) => (
+            <div
+              key={`c${i}`}
+              className="absolute bottom-0 h-1 rounded-full"
+              style={{ left: pct(Math.max(c.start, span.start)), width: pct(span.start + Math.max(0, Math.min(c.end, span.end) - Math.max(c.start, span.start))), background: c.color }}
+              title={c.name}
+            />
+          ))}
           {renders.map((r, i) => (
             <div
               key={i}
@@ -178,6 +203,7 @@ export function CompositePlayer({
         <span className="text-[12px] text-muted tabular-nums">
           {fmt(time)} · {Math.round((coveredLen / (len || 1)) * 100)}% rendered
         </span>
+        <SoundButton on={sound} onChange={setSound} />
       </div>
     </div>
   );

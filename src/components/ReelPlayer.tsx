@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { SoundButton, useSound } from "@/lib/sound";
 
 type Span = { start: number; end: number };
 
@@ -26,6 +27,7 @@ export function ReelPlayer({
   const [playing, setPlaying] = useState(false);
   const [local, setLocal] = useState(0);
   const idxRef = useRef(0);
+  const [sound, setSound] = useSound();
   const total = spans.reduce((s, x) => s + x.end - x.start, 0);
   const key = spans.map((s) => `${s.start}-${s.end}`).join("|");
   const half = 0.5 / fps;
@@ -116,7 +118,7 @@ export function ReelPlayer({
   return (
     <div className="space-y-2">
       <div className={`relative rounded-2xl overflow-hidden bg-black ring-1 ring-hair ${className}`}>
-        <video ref={v} src={src} playsInline className="w-full h-full object-contain cursor-pointer" onClick={toggle} />
+        <video ref={v} src={src} playsInline muted={!sound} className="w-full h-full object-contain cursor-pointer" onClick={toggle} />
         <span className="absolute left-3 top-3 text-[11px] tabular-nums bg-black/60 rounded-full px-2 py-0.5">
           Shot {idx + 1} / {spans.length}
         </span>
@@ -139,6 +141,7 @@ export function ReelPlayer({
         <span className="text-[12px] text-muted tabular-nums">
           {local.toFixed(1)}s / {total.toFixed(1)}s
         </span>
+        <SoundButton on={sound} onChange={setSound} />
       </div>
     </div>
   );

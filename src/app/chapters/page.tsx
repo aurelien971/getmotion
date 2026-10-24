@@ -1169,6 +1169,7 @@ export default function Chapters() {
 
   // ---- assemble -------------------------------------------------------------
   const [rangeMode, setRangeMode] = useState<"range" | "all" | "span">("range");
+  const [fillGaps, setFillGaps] = useState(true);
   async function assemble() {
     if (!p.prepared) return;
     setError(null);
@@ -1231,7 +1232,7 @@ export default function Chapters() {
         }),
       );
       reps.sort((a, b) => a.start - b.start);
-      const pieces: { file: number; start: number; end: number }[] = [];
+      const pieces: { file: number; start: number; end: number; hold?: number; holdStart?: number }[] = [];
       let t = span.start;
       for (const r of reps) {
         if (r.end <= span.start || r.start >= span.end) continue;
@@ -1242,6 +1243,24 @@ export default function Chapters() {
         t = b;
       }
       if (span.end - t > 0.5 / p.fps) pieces.push({ file: 0, start: t, end: span.end });
+      // Close 1-2 frame holes between renders (left by trimming a glitch frame) by
+      // holding the neighbouring rendered frame instead of flashing the original.
+      let filled = 0;
+      if (fillGaps) {
+        for (let i = 0; i < pieces.length; i++) {
+          const pc = pieces[i] as { file: number; start: number; end: number; hold?: number; holdStart?: number };
+          const n = Math.round((pc.end - pc.start) * p.fps);
+          if (pc.file !== 0 || n < 1 || n > 2) continue;
+          const prev = pieces[i - 1] as typeof pc | undefined;
+          const next = pieces[i + 1] as typeof pc | undefined;
+          if (prev && prev.file !== 0) prev.hold = (prev.hold ?? 0) + n;
+          else if (next && next.file !== 0) next.holdStart = (next.holdStart ?? 0) + n;
+          else continue;
+          pieces.splice(i, 1);
+          i--;
+          filled++;
+        }
+      }
       const size = await new Promise<{ w: number; h: number }>((res) => {
         if (!done[0]) return res({ w: Math.round((p.width / p.height) * Math.min(720, p.height)), h: Math.min(720, p.height) });
         const v = document.createElement("video");
@@ -1266,7 +1285,14 @@ export default function Chapters() {
       );
       update((x) => ({ ...x, output: { blob: out, name: `${x.name}-${fmt(span.start)}-${fmt(span.end)}.mp4`.replace(/:/g, "."), type: "video/mp4" } }));
       const worst = Math.max(0, ...drift);
-      flash(worst >= 1 ? `Assembled · corrected a render that was ${Math.round(worst)} frames off` : "Assembled · every render matched its clip");
+      flash(
+        [
+          worst >= 1 ? `corrected a render that was ${Math.round(worst)} frames off` : "every render matched its clip",
+          filled ? `filled ${filled} tiny gap${filled === 1 ? "" : "s"}` : "",
+        ]
+          .filter(Boolean)
+          .reduce((a, b) => `${a} · ${b}`, "Assembled"),
+      );
     } catch (e) {
       setError(`Assembly failed: ${describe(e)}`);
     } finally {
@@ -1492,6 +1518,8 @@ export default function Chapters() {
             present={present}
             rangeMode={rangeMode}
             setRangeMode={setRangeMode}
+            fillGaps={fillGaps}
+            setFillGaps={setFillGaps}
             busy={!!tasks.assemble}
             onAssemble={assemble}
             outUrl={outUrl}
@@ -2369,6 +2397,12 @@ function RenderStep(props: {
                   .filter((r) => pieceLive(x, r.j)),
               )
               .reverse()}
+            chapters={p.shots
+              .filter((s) => s.groupId)
+              .map((s) => {
+                const g = p.groups.find((x) => x.id === s.groupId)!;
+                return { start: s.start, end: s.end, color: g.color, name: g.name };
+              })}
             className="h-[34vh] max-w-full aspect-video mx-auto"
           />
         </div>
@@ -2805,7 +2839,10 @@ function ReviewPanel({
       </div>
 
       <ol className="max-h-[60vh] overflow-y-auto space-y-1.5 pr-1">
-        {rows.map((x, idx) => {
+        {rows.filter((x) => x.state !== "missing").length === 0 && (
+          <li className="text-faint text-[12px] px-1">Nothing rendered in this span yet.</li>
+        )}
+        {rows.map((x, idx) => x.state === "missing" ? null : (() => {
           const g = p.groups.find((gg) => gg.id === x.shot.groupId);
           const isOpen = open === x.shot.id;
           return (
@@ -2882,7 +2919,7 @@ function ReviewPanel({
               )}
             </li>
           );
-        })}
+        })())}
       </ol>
     </section>
   );
@@ -3318,6 +3355,8 @@ function AssembleStep(props: {
   present: { start: number; end: number }[];
   rangeMode: "range" | "all" | "span";
   setRangeMode: (m: "range" | "all" | "span") => void;
+  fillGaps: boolean;
+  setFillGaps: (v: boolean) => void;
   busy: boolean;
   onAssemble: () => void;
   outUrl: string | null;
@@ -3400,6 +3439,10 @@ function AssembleStep(props: {
                 First to last appearance · {fmt(span.start)} – {fmt(span.end)}
               </label>
             )}
+            <label className="flex items-center gap-2 text-[13px] cursor-pointer">
+              <input type="checkbox" checked={props.fillGaps} onChange={(e) => props.setFillGaps(e.target.checked)} className="accent-white" />
+              Fill 1–2 frame gaps between renders
+            </label>
             <p className="text-faint text-[11px]">Original audio throughout. Output at the render resolution.</p>
           </div>
 
