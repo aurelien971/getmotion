@@ -79,6 +79,20 @@ const READABLE = new Set(["h264", "vp8", "vp9"]);
 
 type Task = { label: string; pct: number | null };
 
+// Retry a step when the connection drops (browser "Failed to fetch"); label the step if it still fails.
+async function netRetry<T>(step: string, fn: () => Promise<T>, tries = 4): Promise<T> {
+  for (let i = 1; ; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const net = e instanceof TypeError || /failed to fetch|load failed|network/i.test(String(e));
+      if (!net) throw e;
+      if (i >= tries) throw new Error(`${step}: connection failed ${tries} times (${String((e as Error).message ?? e)})`);
+      await new Promise((r) => setTimeout(r, 2000 * i));
+    }
+  }
+}
+
 function describe(e: unknown): string {
   if (e && typeof e === "object") {
     const o = e as { message?: string; status?: number; body?: { detail?: unknown } };
@@ -1163,13 +1177,16 @@ export default function Chapters() {
       patchPart(part.id, { status: "building", progress: 0, error: undefined });
       const clip = await buildPartClip(part);
       patchPart(part.id, { status: "uploading", progress: undefined });
-      const videoUrl = await fal.storage.upload(clip);
+      const videoUrl = await netRetry("Uploading the clip", () => fal.storage.upload(clip));
       const extra = otherRefsOf(p, g);
       if (photos.length + extra.length > 4) {
         throw new Error(`H3 takes at most 4 photos; this look uses ${photos.length} for him and ${extra.length} for others.`);
       }
       const cast = await Promise.all(
-        [...photos, ...extra].map(async (r) => ({ url: await fal.storage.upload(new File([r.blob], r.name, { type: r.type })), who: "" })),
+        [...photos, ...extra].map(async (r) => ({
+          url: await netRetry("Uploading photos", () => fal.storage.upload(new File([r.blob], r.name, { type: r.type }))),
+          who: "",
+        })),
       );
       const input = model.build({
         videoUrl,
@@ -1188,7 +1205,10 @@ export default function Chapters() {
           ? await submitSume(model.id, model.name, input)
           : await submitFal(model.id, model.name, input, (n) =>
               patchPart(part.id, { error: `Provider busy, retrying (${n}/3)…` }),
-            );
+            ).catch((e) => {
+              // Never resubmit blindly here: the job may have reached fal. Check its Requests page.
+              throw e instanceof TypeError ? new Error("Submitting: connection lost. Check fal's Requests page before rendering again.") : e;
+            });
       patchPart(part.id, {
         status: "rendering",
         error: undefined,
