@@ -126,7 +126,32 @@ export type Part = {
   error?: string;
   renderedAt?: number;
   signature?: string; // pieces + prompt + refs; a change marks the result stale
+  // Where each piece actually starts inside the render, found from the render's own
+  // scene cuts. Corrects clips that carried a stray frame. Undefined = not measured.
+  measuredOffsets?: number[];
+  calibrated?: boolean;
 };
+
+// Line pieces up with the cuts found in the render. A piece that follows a hard cut
+// starts on the detected cut nearest its planned offset (within ±4 frames); a piece
+// continuing the same shot follows the previous piece directly.
+export function measureOffsets(part: Part, cuts: number[], fps: number): number[] {
+  const out: number[] = [];
+  const win = 4 / fps;
+  part.pieces.forEach((pc, i) => {
+    if (i === 0) return out.push(0);
+    const prev = part.pieces[i - 1];
+    const follow = out[i - 1] + (prev.end - prev.start);
+    const contiguous = Math.abs(prev.end - pc.start) < 1e-3;
+    if (contiguous) return out.push(follow);
+    // A stray frame from another scene makes two cuts (into it and out of it); the
+    // piece starts after the last one, so take the latest cut in the window.
+    const near = cuts.filter((c) => Math.abs(c - follow) <= win);
+    out.push(near.length ? Math.max(...near) : follow);
+  });
+  return out;
+}
+
 
 export type Step = "source" | "spot" | "scenes" | "render" | "assemble";
 

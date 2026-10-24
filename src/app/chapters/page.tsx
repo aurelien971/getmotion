@@ -19,6 +19,7 @@ import {
   covered,
   partsInRange,
   renderOutdated,
+  measureOffsets,
   pending as pendingFor,
   emptyProject,
   fmt,
@@ -220,7 +221,7 @@ export default function Chapters() {
 
   useEffect(() => {
     if (process.env.NODE_ENV === "development") {
-      (window as unknown as { __engine: unknown }).__engine = { buildClip, assembleTimeline, detectCuts, measureOffset, fpsExpr };
+      (window as unknown as { __engine: unknown }).__engine = { buildClip, assembleTimeline, detectCuts, measureOffset, fpsExpr, measureOffsets };
     }
   }, []);
 
@@ -803,7 +804,7 @@ export default function Chapters() {
     try {
       const url = await waitFor(job, () => patchPart(partId, { error: undefined }));
       removeJob(job.requestId);
-      patchPart(partId, { status: "done", resultUrl: url, renderedAt: Date.now() });
+      patchPart(partId, { status: "done", resultUrl: url, renderedAt: Date.now(), calibrated: false, measuredOffsets: undefined });
     } catch (e) {
       patchPart(partId, { status: "failed", error: describe(e) });
     }
@@ -849,6 +850,31 @@ export default function Chapters() {
     queueMicrotask(() => void analyzeWardrobe(next));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded, p.step, p.groups, p.library, p.defaultRefs, p.range, tasks]);
+
+  // Every finished render gets its piece positions measured once from its own cuts.
+  const calibrating = useRef(false);
+  useEffect(() => {
+    if (!loaded || calibrating.current) return;
+    const next = p.parts.find((x) => x.status === "done" && x.resultUrl && !x.calibrated);
+    if (!next) return;
+    calibrating.current = true;
+    const fps = p.fps;
+    (async () => {
+      try {
+        const blob = await fetch(next.resultUrl!).then((r) => r.blob());
+        const cuts = await detectCuts(blob, next.clipLength);
+        const offsets = measureOffsets(next, cuts, fps);
+        const moved = offsets.filter((o, i) => Math.abs(o - next.pieces[i].offset) > 0.5 / fps).length;
+        patchPart(next.id, { measuredOffsets: offsets, calibrated: true });
+        if (moved) flash(`Lined up ${moved} piece${moved === 1 ? "" : "s"} in a render with its real cuts`);
+      } catch {
+        patchPart(next.id, { calibrated: true });
+      } finally {
+        calibrating.current = false;
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded, p.parts]);
 
   // Parts always follow the current shots and span: any trim in Scenes or span drag
   // rebuilds the not-yet-rendered parts, wherever you navigate from.
@@ -915,13 +941,18 @@ export default function Chapters() {
             }),
         ),
       );
-      const stretch = [1, ...done.map((d, i) => (isFinite(lengths[i]) && lengths[i] > 0 ? lengths[i] / d.clipLength : 1))];
+      // Calibrated renders already have measured piece positions; only uncalibrated ones get stretched.
+      const stretch = [
+        1,
+        ...done.map((d, i) => (d.measuredOffsets ? 1 : isFinite(lengths[i]) && lengths[i] > 0 ? lengths[i] / d.clipLength : 1)),
+      ];
       const drift = stretch.slice(1).map((k, i) => Math.abs(k - 1) * done[i].clipLength * p.fps);
       const files: Blob[] = [p.prepared.blob, ...results];
       type Rep = { start: number; end: number; file: number; offset: number };
       let reps: Rep[] = [];
       done.forEach((d, i) =>
-        d.pieces.forEach((pc) => {
+        d.pieces.forEach((pc, j) => {
+          const at = d.measuredOffsets?.[j] ?? pc.offset;
           // Newer renders replace older ones where they overlap.
           reps = reps.flatMap((r) => {
             if (pc.end <= r.start || pc.start >= r.end) return [r];
@@ -930,7 +961,7 @@ export default function Chapters() {
             if (pc.end < r.end) out.push({ ...r, start: pc.end, offset: r.offset + (pc.end - r.start) });
             return out;
           });
-          reps.push({ start: pc.start, end: pc.end, file: i + 1, offset: pc.offset });
+          reps.push({ start: pc.start, end: pc.end, file: i + 1, offset: at });
         }),
       );
       reps.sort((a, b) => a.start - b.start);
@@ -1972,7 +2003,7 @@ function RenderStep(props: {
             renders={p.parts
               .filter((x) => x.status === "done" && x.resultUrl)
               .sort((a, b) => (a.renderedAt ?? 0) - (b.renderedAt ?? 0))
-              .flatMap((x) => x.pieces.map((pc) => ({ start: pc.start, end: pc.end, offset: pc.offset, url: x.resultUrl! })))
+              .flatMap((x) => x.pieces.map((pc, j) => ({ start: pc.start, end: pc.end, offset: x.measuredOffsets?.[j] ?? pc.offset, url: x.resultUrl! })))
               .reverse()}
             className="h-[34vh] max-w-full aspect-video mx-auto"
           />
