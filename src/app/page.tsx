@@ -558,8 +558,12 @@ export default function Home() {
                     s
                   </label>
                 </div>
+                <span className="text-[13px] tabular-nums">
+                  {fmtTime(time)} <span className="text-faint">/ {fmtTime(duration)}</span>
+                </span>
                 <span className="text-muted text-[13px] tabular-nums">
-                  {fmtTime(range[0])} – {fmtTime(range[1])}
+                  {fmtTime(range[0])} – {fmtTime(range[1])}{" "}
+                  <span className="text-faint">({(range[1] - range[0]).toFixed(1)}s)</span>
                 </span>
                 <span className="flex-1" />
                 <FrameSaver onSave={saveFrame} first={range[0]} current={time} last={Math.max(range[0], range[1] - 1 / fps)} />
