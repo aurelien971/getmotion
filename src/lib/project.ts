@@ -68,8 +68,10 @@ export function wardrobePrompt(description: string, w: Wardrobe | undefined, ref
   const take = (w?.reference ?? []).filter((x) => x.on && !/^face$/i.test(x.label)).map((x) => x.label.toLowerCase());
   const hair = take.filter((x) => HAIR_OR_FACE.test(x));
   const outfit = take.filter((x) => !HAIR_OR_FACE.test(x));
-  const keep = (w?.target ?? []).filter((x) => x.on).map((x) => x.label.toLowerCase());
-  const drop = (w?.target ?? []).filter((x) => !x.on).map((x) => x.label.toLowerCase());
+  // His own hair and beard go with the new face; they're not wardrobe.
+  const worn = (w?.target ?? []).filter((x) => !HAIR_OR_FACE.test(x.label));
+  const keep = worn.filter((x) => x.on).map((x) => x.label.toLowerCase());
+  const drop = worn.filter((x) => !x.on).map((x) => x.label.toLowerCase());
   const who = refCount > 1 ? `the man in reference images 1 to ${refCount} (all the same person)` : "the man in reference image 1";
   const list = (xs: string[], and = "and") => (xs.length < 2 ? xs.join("") : `${xs.slice(0, -1).join(", ")} ${and} ${xs[xs.length - 1]}`);
 

@@ -4,6 +4,7 @@ import { fal } from "@fal-ai/client";
 import Image from "next/image";
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CompositePlayer } from "@/components/CompositePlayer";
 import { EdgeEditor } from "@/components/EdgeEditor";
 import { FrameStrip } from "@/components/FrameStrip";
 import { RangePicker } from "@/components/RangePicker";
@@ -772,9 +773,14 @@ export default function Chapters() {
         side: "center",
       });
       const job =
-        model.provider === "sume" ? await submitSume(model.id, model.name, input) : await submitFal(model.id, model.name, input);
+        model.provider === "sume"
+          ? await submitSume(model.id, model.name, input)
+          : await submitFal(model.id, model.name, input, (n) =>
+              patchPart(part.id, { error: `Provider busy, retrying (${n}/3)…` }),
+            );
       patchPart(part.id, {
         status: "rendering",
+        error: undefined,
         endpoint: job.endpoint,
         requestId: job.requestId,
         signature: signature(part, g, photos),
@@ -1943,7 +1949,17 @@ function RenderStep(props: {
           </div>
         </div>
         <div className="max-w-3xl mx-auto">
-          <ReelPlayer src={props.src} fps={p.fps} spans={[range]} className="h-[34vh] max-w-full aspect-video mx-auto" />
+          <CompositePlayer
+            src={props.src}
+            fps={p.fps}
+            span={range}
+            renders={p.parts
+              .filter((x) => x.status === "done" && x.resultUrl)
+              .sort((a, b) => (a.renderedAt ?? 0) - (b.renderedAt ?? 0))
+              .flatMap((x) => x.pieces.map((pc) => ({ start: pc.start, end: pc.end, offset: pc.offset, url: x.resultUrl! })))
+              .reverse()}
+            className="h-[34vh] max-w-full aspect-video mx-auto"
+          />
         </div>
         <RangePicker
           duration={p.duration}

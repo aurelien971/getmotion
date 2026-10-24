@@ -75,8 +75,30 @@ export async function waitForFal(
   }
 }
 
-export async function submitFal(endpoint: string, model: string, input: Record<string, unknown>): Promise<PendingJob> {
-  const { request_id } = await fal.queue.submit(endpoint, { input });
+// The provider behind fal is sometimes briefly down (502/503/504, "downstream service
+// unavailable"). Nothing is charged for those, so retry a few times before failing.
+const transient = (e: unknown) => {
+  const o = e as { status?: number; body?: unknown };
+  return [502, 503, 504].includes(o?.status ?? 0) || /downstream_service_unavailable|timeout/i.test(JSON.stringify(o?.body ?? "") + String(e));
+};
+
+export async function submitFal(
+  endpoint: string,
+  model: string,
+  input: Record<string, unknown>,
+  onRetry?: (attempt: number) => void,
+): Promise<PendingJob> {
+  let request_id = "";
+  for (let attempt = 1; ; attempt++) {
+    try {
+      request_id = (await fal.queue.submit(endpoint, { input })).request_id;
+      break;
+    } catch (e) {
+      if (!transient(e) || attempt >= 4) throw e;
+      onRetry?.(attempt);
+      await sleep(4000 * attempt);
+    }
+  }
   const job: PendingJob = { provider: "fal", endpoint, requestId: request_id, model, at: Date.now() };
   addJob(job);
   return job;
