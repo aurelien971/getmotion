@@ -5,6 +5,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CompositePlayer } from "@/components/CompositePlayer";
+import { ClipInspector } from "@/components/ClipInspector";
 import { EdgeEditor } from "@/components/EdgeEditor";
 import { FrameRow } from "@/components/FrameRow";
 import { FrameStrip } from "@/components/FrameStrip";
@@ -601,6 +602,7 @@ export default function Chapters() {
   const [sel, setSel] = useState<string>("unassigned");
   const [trimming, setTrimming] = useState<string | null>(null);
   const [trimmingRender, setTrimmingRender] = useState<{ partId: string; j: number } | null>(null);
+  const [inspecting, setInspecting] = useState<{ part: Part; file: File } | null>(null);
 
   // ---- render ---------------------------------------------------------------
   const plan = (x: Project): Part[] => {
@@ -936,6 +938,20 @@ export default function Chapters() {
     } catch (e) {
       patchPart(part.id, { status: "idle", progress: undefined, error: describe(e) });
       throw e;
+    }
+  }
+
+  // Build the exact upload and open it frame by frame.
+  async function inspectPart(part: Part) {
+    if (!p.prepared) return setError("The video is still being prepared.");
+    try {
+      patchPart(part.id, { status: "building", progress: 0 });
+      const file = await buildPartClip(part);
+      setInspecting({ part, file });
+    } catch (e) {
+      setError(describe(e));
+    } finally {
+      patchPart(part.id, { status: "idle", progress: undefined });
     }
   }
 
@@ -1476,6 +1492,7 @@ export default function Chapters() {
             onAnalyze={analyzeWardrobe}
             onRender={renderParts}
             onCheck={checkParts}
+            onInspect={(pt) => void inspectPart(pt)}
             onUseTake={useTake}
             onRedoShot={redoShot}
             onTrimPiece={(id, j) => setTrimmingRender({ partId: id, j })}
@@ -1606,6 +1623,18 @@ export default function Chapters() {
         );
       })()}
 
+      {inspecting && (
+        <ClipInspector
+          file={inspecting.file}
+          fps={evalRate(fpsExpr(p.fps))}
+          sourceFps={p.fps}
+          pieces={inspecting.part.pieces}
+          padFrom={inspecting.part.duration}
+          title={`${p.groups.find((g) => g.id === inspecting.part.groupId)?.name ?? ""} · ${inspecting.part.pieces.length} pieces`}
+          onClose={() => setInspecting(null)}
+        />
+      )}
+
       {trimmingRender && (() => {
         const pt = p.parts.find((x) => x.id === trimmingRender.partId);
         if (!pt?.resultUrl) return null;
@@ -1687,6 +1716,8 @@ async function cropDataUrl(src: string, box: number[], size = 240): Promise<stri
 function defaultPrompt(g: Group, refCount = 1) {
   return wardrobePrompt(g.description, g.wardrobe, Math.max(1, refCount));
 }
+
+const evalRate = (e: string) => (e.includes("/") ? +e.split("/")[0] / +e.split("/")[1] : +e);
 
 function blobToDataUrl(b: Blob) {
   return new Promise<string>((res, rej) => {
@@ -2357,6 +2388,7 @@ function RenderStep(props: {
   onAnalyze: (g: Group) => void;
   onRender: (partIds: string[]) => void;
   onCheck: (partIds: string[]) => void;
+  onInspect: (part: Part) => void;
   onUseTake: (shot: { start: number; end: number }, partId: string, j: number) => void;
   onRedoShot: (shot: { start: number; end: number }) => void;
   onTrimPiece: (partId: string, piece: number) => void;
@@ -2695,6 +2727,7 @@ function RenderStep(props: {
                 <PartRow
                   key={pt.id}
                   onCheck={() => props.onCheck([pt.id])}
+                  onInspect={() => props.onInspect(pt)}
                   onFix={(only) => props.onFix(pt, only)}
                   onIgnore={(is) => props.onIgnore(pt, is)}
                   onTrimShot={props.onTrimShot}
@@ -3232,6 +3265,7 @@ function FaceTile({
 
 function PartRow({
   onCheck,
+  onInspect,
   onFix,
   onIgnore,
   onTrimShot,
@@ -3248,6 +3282,7 @@ function PartRow({
   onRender,
 }: {
   onCheck: () => void;
+  onInspect: () => void;
   onFix: (only?: Issue[]) => void;
   onIgnore: (issue: Issue) => void;
   onTrimShot: (shotId: string) => void;
@@ -3302,6 +3337,11 @@ function PartRow({
       {(part.status === "idle" || part.status === "failed") && (
         <button className="btn" onClick={onCheck} title="Build the clip locally and look for frames from other scenes">
           {part.checkedKey ? "Checked ✓" : "Check"}
+        </button>
+      )}
+      {(part.status === "idle" || part.status === "failed") && (
+        <button className="btn" onClick={onInspect} title="Every frame of the exact file that will be uploaded">
+          Inspect
         </button>
       )}
       <button className="btn" onClick={() => setOpen((o) => !o)}>{open ? "Hide" : part.status === "done" ? "Review" : "Preview"}</button>
