@@ -58,7 +58,7 @@ import {
   wardrobePrompt,
 } from "@/lib/project";
 import { kv } from "@/lib/store";
-import { measureOffset, openReader, refineEdge } from "@/lib/sync";
+import { alignSpans, measureOffset, openReader, refineEdge } from "@/lib/sync";
 import { assembleTimeline, buildClip, detectCuts, fileHasAudio, fpsExpr, probeVideo, warmUp } from "@/lib/trim";
 import { transcodeInBrowser } from "@/lib/transcode";
 
@@ -230,7 +230,7 @@ export default function Chapters() {
 
   useEffect(() => {
     if (process.env.NODE_ENV === "development") {
-      (window as unknown as { __engine: unknown }).__engine = { buildClip, assembleTimeline, detectCuts, measureOffset, fpsExpr, measureOffsets, findIssues };
+      (window as unknown as { __engine: unknown }).__engine = { buildClip, assembleTimeline, detectCuts, measureOffset, fpsExpr, measureOffsets, findIssues, alignSpans };
     }
   }, []);
 
@@ -911,9 +911,25 @@ export default function Chapters() {
     const h = Math.min(720, p.height);
     const w = Math.round((p.width / p.height) * h);
     const off = p.preparedOffset ?? 0;
+    const spans = [...part.pieces, ...part.pad];
+    let copySpans = spans.map((x) => ({ start: Math.max(0, x.start + off), end: x.end + off }));
+    // A converted copy's frame timing jitters; line every span's first and last frame
+    // up with the original so no piece starts or ends one frame off.
+    if (p.source && p.prepared && p.source.blob !== p.prepared.blob) {
+      const a = URL.createObjectURL(p.source.blob);
+      const b = URL.createObjectURL(p.prepared.blob);
+      try {
+        copySpans = await alignSpans(a, b, p.fps, off, spans);
+      } finally {
+        URL.revokeObjectURL(a);
+        URL.revokeObjectURL(b);
+      }
+    }
+    // Output exactly the planned number of frames per span, whatever the copy's timing.
+    const planned = spans.map((x) => Math.max(1, Math.round((x.end - x.start) * evalRate(fpsExpr(p.fps)))));
     const clip = await buildClip(
       p.prepared!.blob,
-      [...part.pieces, ...part.pad].map((x) => ({ start: Math.max(0, x.start + off), end: x.end + off })),
+      copySpans.map((x, i) => ({ ...x, frames: planned[i] })),
       { w, h },
       p.hasAudio,
       (r) => patchPart(part.id, { progress: r }),
@@ -953,6 +969,24 @@ export default function Chapters() {
     } finally {
       patchPart(part.id, { status: "idle", progress: undefined });
     }
+  }
+
+  // Remove the first or last frame of a piece by moving its shot's edge one frame in.
+  async function dropPieceFrame(part: Part, j: number, edge: "start" | "end") {
+    const pc = part.pieces[j];
+    const shot = p.shots.find((x) => x.id === pc.shotId);
+    const tol = 0.6 / p.fps;
+    const f = 1 / p.fps;
+    if (!shot) return;
+    let st = { boundaries: p.boundaries, cuts: p.cuts ?? [] };
+    if (edge === "start" && Math.abs(shot.start - pc.start) < tol) st = moveEdge(st.boundaries, st.cuts, shot.start, shot.start + f, tol);
+    else if (edge === "end" && Math.abs(shot.end - pc.end) < tol) st = moveEdge(st.boundaries, st.cuts, shot.end, shot.end - f, tol);
+    else return setError("That frame is inside a shot (a long shot split across parts). Use Trim in Scenes.");
+    const next = { ...p, ...st };
+    const shots = buildShots(next);
+    update(() => ({ ...next, shots }));
+    await refreshThumbs(shots);
+    flash("Frame dropped. The part was rebuilt; Inspect again.");
   }
 
   async function checkParts(ids: string[]) {
@@ -1632,6 +1666,11 @@ export default function Chapters() {
           padFrom={inspecting.part.duration}
           title={`${p.groups.find((g) => g.id === inspecting.part.groupId)?.name ?? ""} · ${inspecting.part.pieces.length} pieces`}
           onClose={() => setInspecting(null)}
+          onDrop={(j, edge) => {
+            const part = inspecting.part;
+            setInspecting(null);
+            void dropPieceFrame(part, j, edge);
+          }}
         />
       )}
 

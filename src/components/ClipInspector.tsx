@@ -16,6 +16,7 @@ export function ClipInspector({
   padFrom,
   title,
   onClose,
+  onDrop,
 }: {
   file: Blob;
   fps: number; // the clip's frame rate
@@ -24,6 +25,7 @@ export function ClipInspector({
   padFrom: number; // clip time where loop filler starts
   title: string;
   onClose: () => void;
+  onDrop?: (piece: number, edge: "start" | "end") => void; // remove a piece's first / last frame
 }) {
   const [url, setUrl] = useState<string | null>(null);
   useEffect(() => {
@@ -135,6 +137,20 @@ export function ClipInspector({
               <button className="btn flex-1" onClick={() => setSel((s) => Math.max(0, s - 1))}>‹ Frame</button>
               <button className="btn flex-1" onClick={() => setSel((s) => Math.min(count - 1, s + 1))}>Frame ›</button>
             </div>
+            {(() => {
+              if (!onDrop || cur.piece < 0) return null;
+              const pc = pieces[cur.piece];
+              const firstF = Math.round(pc.offset * fps);
+              const lastF = Math.round((pc.offset + (pc.end - pc.start)) * fps) - 1;
+              const edge = sel === firstF ? "start" : sel === lastF ? "end" : null;
+              return edge ? (
+                <button className="btn btn-on w-full" onClick={() => onDrop(cur.piece, edge)}>
+                  Drop this frame ({edge === "start" ? "first" : "last"} of piece {cur.piece + 1})
+                </button>
+              ) : (
+                <p className="text-faint text-[11px]">Only a piece&apos;s first or last frame can be dropped here; use Trim in Scenes for the rest.</p>
+              );
+            })()}
             {thumbs.length < count && <p className="text-faint text-[11px]">Reading frames… {thumbs.length}/{count}</p>}
           </div>
         </div>

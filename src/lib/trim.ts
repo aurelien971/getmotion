@@ -288,7 +288,7 @@ export async function detectCuts(
   });
 }
 
-type Span = { start: number; end: number };
+type Span = { start: number; end: number; frames?: number }; // frames: exact count to output
 
 // Build one clip from several spans of the same source, back to back, conformed
 // to w x h. Spans are cut with input seeking so late spans don't decode the whole file.
@@ -312,7 +312,7 @@ export async function buildClip(
     // trim=end_frame stops it from ever running one frame into the next shot.
     const rate = evalFps(fps);
     const pre = 0.25 / rate;
-    const frames = spans.map((s) => Math.max(1, Math.round((s.end - s.start) * rate)));
+    const frames = spans.map((s) => s.frames ?? Math.max(1, Math.round((s.end - s.start) * rate)));
     const args: string[] = [];
     spans.forEach((s, i) =>
       args.push("-ss", Math.max(0, s.start - pre).toFixed(4), "-t", ((frames[i] + 2) / rate).toFixed(4), "-i", src),

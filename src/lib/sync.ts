@@ -6,6 +6,7 @@ const H = 36;
 
 type Reader = {
   frame: (f: number) => Promise<Uint8ClampedArray>;
+  at: (t: number) => Promise<Uint8ClampedArray>; // frame shown at time t (uncached)
   close: () => void;
 };
 
@@ -25,7 +26,19 @@ export async function openReader(src: string, fps: number): Promise<Reader> {
   c.height = H;
   const ctx = c.getContext("2d", { willReadFrequently: true })!;
   const cache = new Map<number, Uint8ClampedArray>();
+  const grab = async (t: number) => {
+    await new Promise<void>((r) => {
+      v.onseeked = () => r();
+      v.currentTime = Math.max(0, t);
+    });
+    ctx.drawImage(v, 0, 0, W, H);
+    const data = ctx.getImageData(0, 0, W, H).data;
+    const y = new Uint8ClampedArray(W * H);
+    for (let i = 0; i < W * H; i++) y[i] = (data[i * 4] * 299 + data[i * 4 + 1] * 587 + data[i * 4 + 2] * 114) / 1000;
+    return y;
+  };
   return {
+    at: grab,
     async frame(f: number) {
       const hit = cache.get(f);
       if (hit) return hit;
@@ -100,6 +113,47 @@ export async function measureOffset(src: string, copy: string, fps: number, dura
     if (!shifts.length) return null;
     shifts.sort((x, y) => x - y);
     return shifts[Math.floor(shifts.length / 2)] / fps;
+  } finally {
+    a.close();
+    b.close();
+  }
+}
+
+// For each span (original times), find where its first and last frame really sit in
+// a converted copy whose timing jitters: search ±range frames around the expected
+// position (original time + offset) and pick the best match. Returns copy times.
+export async function alignSpans(
+  original: string,
+  copy: string,
+  fps: number,
+  offset: number,
+  spans: { start: number; end: number }[],
+  range = 3,
+): Promise<{ start: number; end: number }[]> {
+  const a = await openReader(original, fps);
+  const b = await openReader(copy, fps);
+  const f = 1 / fps;
+  try {
+    const best = async (origT: number) => {
+      const ref = await a.at(origT);
+      let bestS = 0;
+      let bestD = Infinity;
+      for (let s = -range; s <= range; s++) {
+        const d = diff(ref, await b.at(origT + offset + s * f));
+        if (d < bestD - 0.01 || (Math.abs(d - bestD) < 0.01 && Math.abs(s) < Math.abs(bestS))) {
+          bestD = d;
+          bestS = s;
+        }
+      }
+      return bestS;
+    };
+    const out: { start: number; end: number }[] = [];
+    for (const sp of spans) {
+      const s1 = await best(sp.start + 0.5 * f);
+      const s2 = await best(sp.end - 0.5 * f);
+      out.push({ start: Math.max(0, sp.start + offset + s1 * f), end: sp.end + offset + s2 * f });
+    }
+    return out;
   } finally {
     a.close();
     b.close();
