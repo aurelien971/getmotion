@@ -119,9 +119,17 @@ export default function Home() {
   const [zoomed, setZoomed] = useState<Frame | null>(null);
   const [stripStep, setStripStep] = useState(1); // frames per thumbnail in the frame strip
   const [shots, setShots] = useState<Shot[]>([]);
-  const [notes, setNotes] = useState("");
+  const [notes, setNotesState] = useState("");
+  const setNotes = (v: string) => {
+    setNotesState(v);
+    try { localStorage.setItem("getmotion.notes", v); } catch {}
+  };
   const [direction, setDirection] = useState<Direction | null>(null);
-  const [directed, setDirected] = useState("");
+  const [directed, setDirectedState] = useState("");
+  const setDirected = (v: string) => {
+    setDirectedState(v);
+    try { localStorage.setItem("getmotion.directed", v); } catch {}
+  };
   const [directing, setDirecting] = useState(false);
   const pasteTarget = useRef<"face" | "shot">("face");
 
@@ -136,9 +144,13 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    // Hydrate saved takes after mount so server and client markup match.
+    // Hydrate saved takes, prompt and notes after mount so server and client markup match.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setHistory(loadHistory());
+    try {
+      setDirectedState(localStorage.getItem("getmotion.directed") ?? "");
+      setNotesState(localStorage.getItem("getmotion.notes") ?? "");
+    } catch {}
   }, []);
 
   // I / O set In and Out at the playhead while trimming; space toggles play.
@@ -1111,26 +1123,30 @@ export default function Home() {
               >
                 {directing ? "Writing prompt…" : "Write the prompt"}
               </button>
-              {direction && (
-                <div className="space-y-2">
-                  {direction.target && <p className="text-muted text-[12px]">Target: {direction.target}</p>}
-                  <textarea
-                    value={directed}
-                    onChange={(e) => setDirected(e.target.value)}
-                    className="field text-[13px] leading-relaxed"
-                    rows={8}
-                  />
-                  {direction.warnings?.length > 0 && (
-                    <ul className="text-[12px] text-muted list-disc pl-4 space-y-0.5">
-                      {direction.warnings.map((w, i) => <li key={i}>{w}</li>)}
-                    </ul>
-                  )}
-                  <div className="flex items-center justify-between">
-                    <span className="text-faint text-[12px]">{directed.trim() ? "This prompt will be sent as is." : "Empty: falls back to Cast descriptions."}</span>
-                    <button className="btn" onClick={() => { setDirected(""); setDirection(null); }}>Discard</button>
-                  </div>
+              <div className="space-y-2">
+                <div className="flex items-baseline justify-between">
+                  <span className="text-[13px]">Prompt</span>
+                  <span className="text-faint text-[12px]">sent as is; saved on this device</span>
                 </div>
-              )}
+                {direction?.target && <p className="text-muted text-[12px]">Target: {direction.target}</p>}
+                <textarea
+                  value={directed}
+                  onChange={(e) => setDirected(e.target.value)}
+                  placeholder="Paste a saved prompt here, or press Write the prompt."
+                  className="field text-[13px] leading-relaxed"
+                  rows={directed ? 10 : 3}
+                />
+                {direction?.warnings?.length ? (
+                  <ul className="text-[12px] text-muted list-disc pl-4 space-y-0.5">
+                    {direction.warnings.map((w, i) => <li key={i}>{w}</li>)}
+                  </ul>
+                ) : null}
+                {directed.trim() && (
+                  <div className="flex justify-end">
+                    <button className="btn" onClick={() => { setDirected(""); setDirection(null); }}>Clear prompt</button>
+                  </div>
+                )}
+              </div>
             </div>
 
             <div className="space-y-3">
