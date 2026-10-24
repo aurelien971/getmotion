@@ -26,6 +26,11 @@ declare global {
 
 let instance: Promise<FFmpegLike> | null = null;
 
+// Start fetching the engine early (e.g. as soon as a clip is dropped).
+export function warmUp() {
+  load().catch(() => {});
+}
+
 function script(src: string) {
   return new Promise<void>((resolve, reject) => {
     const el = document.createElement("script");
@@ -62,13 +67,16 @@ export async function trimVideo(
   start: number,
   end: number,
   onProgress?: (ratio: number) => void,
+  onStage?: (stage: "engine" | "cut" | "copy") => void,
 ): Promise<File> {
+  onStage?.("engine");
   const ff = await load();
   const handler = ({ progress }: Progress) => onProgress?.(Math.max(0, Math.min(1, progress)));
   ff.on("progress", handler);
   try {
     await ff.writeFile("in", await fetchFile(file));
-    await ff.exec([
+    onStage?.("cut");
+    const code = await ff.exec([
       "-ss", start.toFixed(3),
       "-to", end.toFixed(3),
       "-i", "in",
@@ -80,6 +88,20 @@ export async function trimVideo(
       "-movflags", "+faststart",
       "-y", "out.mp4",
     ]);
+    if (code !== 0) {
+      // The wasm build has no HEVC decoder (iPhone footage). Fall back to a stream
+      // copy, which needs no decoding; edges land on the nearest keyframes.
+      onStage?.("copy");
+      const copy = await ff.exec([
+        "-ss", start.toFixed(3),
+        "-to", end.toFixed(3),
+        "-i", "in",
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-y", "out.mp4",
+      ]);
+      if (copy !== 0) throw new Error("This clip's codec can't be cut in the browser. Export it as H.264 MP4 and try again.");
+    }
     const data = (await ff.readFile("out.mp4")) as Uint8Array;
     const name = file.name.replace(/\.[^.]+$/, "") + `-${start.toFixed(1)}-${end.toFixed(1)}.mp4`;
     return new File([data.slice().buffer as ArrayBuffer], name, { type: "video/mp4" });

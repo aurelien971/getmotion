@@ -4,7 +4,7 @@ import { fal } from "@fal-ai/client";
 import Image from "next/image";
 import { useEffect, useRef, useState } from "react";
 import { MODELS, SAM2_VIDEO } from "@/lib/models";
-import { muxAudio, stitchVideos, trimVideo } from "@/lib/trim";
+import { muxAudio, stitchVideos, trimVideo, warmUp } from "@/lib/trim";
 import { Trimmer } from "@/components/Trimmer";
 
 fal.config({ proxyUrl: "/api/fal/proxy" });
@@ -13,6 +13,7 @@ type Point = { x: number; y: number; label: 0 | 1 };
 type Result = { url: string; model: string; at: number; localUrl?: string };
 type CastSlot = { file: File; preview: string; who: string };
 type StitchItem = { id: number; name: string; url: string };
+type Frame = { id: number; url: string; blob: Blob; frame: number; time: number };
 
 const HISTORY_KEY = "getmotion.history";
 
@@ -91,6 +92,8 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<Result[]>([]);
   const [stitch, setStitch] = useState<StitchItem[]>([]);
+  const [frames, setFrames] = useState<Frame[]>([]);
+  const [cutStage, setCutStage] = useState<string | null>(null);
 
   // Dev only: ?clip=/dev-long.mp4 loads a clip from /public for quick checks.
   useEffect(() => {
@@ -128,6 +131,7 @@ export default function Home() {
 
   function onVideo(file: File) {
     if (!file.type.startsWith("video/")) return;
+    warmUp();
     setVideoFile(file);
     setLocalVideo(URL.createObjectURL(file));
     setVideoUrl(null);
@@ -137,6 +141,20 @@ export default function Home() {
     setError(null);
     setTime(0);
     setMode("mask");
+  }
+
+  function nudge(edge: 0 | 1, frames: number) {
+    const step = frames / fps;
+    setRange(([a, b]) => {
+      if (edge === 0) {
+        const a2 = Math.max(0, Math.min(b - 1, a + step));
+        seek(a2);
+        return [a2, Math.min(b, a2 + maxLen)];
+      }
+      const b2 = Math.min(duration, Math.max(a + 1, b + step));
+      seek(b2);
+      return [Math.max(a, b2 - maxLen), b2];
+    });
   }
 
   function setSlot(n: number) {
@@ -154,12 +172,14 @@ export default function Home() {
     setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
   }
 
-  // Save a single frame of the current clip as PNG.
-  async function saveFrame(t: number) {
+  const frameOf = (t: number) => Math.round(t * fps);
+
+  // Grab one frame into the Frames library.
+  async function grabFrame(t: number) {
     const v = videoRef.current;
     if (!v) return;
     v.pause();
-    if (Math.abs(v.currentTime - t) > 0.01) {
+    if (Math.abs(v.currentTime - t) > 0.001) {
       await new Promise<void>((res) => {
         v.addEventListener("seeked", () => res(), { once: true });
         v.currentTime = t;
@@ -171,11 +191,19 @@ export default function Home() {
     c.getContext("2d")!.drawImage(v, 0, 0);
     const blob = await new Promise<Blob | null>((r) => c.toBlob(r, "image/png"));
     if (!blob) return;
+    setFrames((f) => [{ id: Date.now(), url: URL.createObjectURL(blob), blob, frame: frameOf(t), time: t }, ...f]);
+  }
+
+  function saveFrame(f: Frame) {
     const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `frame-${t.toFixed(2)}s.png`;
+    a.href = f.url;
+    a.download = `frame-${String(f.frame).padStart(5, "0")}-${f.time.toFixed(3)}s.png`;
     a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+  }
+
+  function frameToCast(f: Frame) {
+    const file = new File([f.blob], `frame-${f.frame}.png`, { type: "image/png" });
+    setCast((c) => (c.length >= 4 ? c : [...c, { file, preview: f.url, who: "" }]));
   }
 
   function addToStitch(name: string, url: string) {
@@ -211,8 +239,25 @@ export default function Home() {
   // Cut the selected window in the browser; returns the new file and loads it.
   async function cutSelection(): Promise<File> {
     setBusy("Cutting the clip");
-    const cut = await trimVideo(videoFile!, range[0], range[1], (p) => setLog(`${Math.round(p * 100)}%`));
+    setCutStage("Loading engine");
+    const stages = { engine: "Loading engine", cut: "Cutting", copy: "Cutting (keyframes)" };
+    let stage = "Cutting";
+    const cut = await trimVideo(
+      videoFile!,
+      range[0],
+      range[1],
+      (p) => {
+        const pct = `${Math.round(p * 100)}%`;
+        setLog(pct);
+        setCutStage(`${stage} ${pct}`);
+      },
+      (st) => {
+        stage = stages[st];
+        setCutStage(stage);
+      },
+    );
     setLog("");
+    setCutStage(null);
     onVideo(cut);
     return cut;
   }
@@ -225,6 +270,7 @@ export default function Home() {
       setError(String(e));
     } finally {
       setBusy(null);
+      setCutStage(null);
     }
   }
 
@@ -440,16 +486,28 @@ export default function Home() {
         <h1 className="flex items-center">
           <Image src="/logo.png" alt="getmotion.art" width={1700} height={290} priority className="h-[22px] w-auto" />
         </h1>
-        {busy && (
-          <p className="text-muted text-[13px] inline-flex items-center gap-2">
-            <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
-            {busy}
-            {log && <span className="text-faint tabular-nums">{log}</span>}
-          </p>
-        )}
+        <div className="flex items-center gap-4">
+          {busy && (
+            <p className="text-muted text-[13px] inline-flex items-center gap-2">
+              <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
+              {busy}
+              {log && <span className="text-faint tabular-nums">{log}</span>}
+            </p>
+          )}
+          {localVideo && (
+            <div className="seg glass" aria-label="Grab a frame into the library">
+              <span className="px-2 text-faint text-[12px]">Grab frame</span>
+              <button onClick={() => grabFrame(mode === "trim" ? range[0] : 0)}>First</button>
+              <button onClick={() => grabFrame(time)}>Now · f{frameOf(time)}</button>
+              <button onClick={() => grabFrame(mode === "trim" ? Math.max(range[0], range[1] - 1 / fps) : Math.max(0, duration - 1 / fps))}>
+                Last
+              </button>
+            </div>
+          )}
+        </div>
       </header>
 
-      <main className="flex-1 grid lg:grid-cols-[minmax(0,1fr)_360px]">
+      <main className={`flex-1 grid ${mode === "trim" && localVideo ? "" : "lg:grid-cols-[minmax(0,1fr)_360px]"}`}>
         {/* Stage */}
         <section className="px-6 pb-8 flex flex-col gap-4 min-w-0">
           <div
@@ -534,10 +592,16 @@ export default function Home() {
                 onRange={setRange}
                 onSeek={seek}
               />
+
               <div className="flex flex-wrap items-center gap-2">
                 <button className="btn btn-icon" aria-label={playing ? "Pause" : "Play"} onClick={togglePlay}>
                   <PlayIcon playing={playing} />
                 </button>
+                <span className="text-[13px] tabular-nums">
+                  {fmtTime(time)} <span className="text-faint">/ {fmtTime(duration)} · f{frameOf(time)}</span>
+                </span>
+                <span className="flex-1" />
+                <span className="text-faint text-[12px]">Window</span>
                 <div className="seg glass">
                   {[5, 15, 30].map((n) => (
                     <button key={n} className={maxLen === n ? "on" : ""} onClick={() => setSlot(n)}>
@@ -558,25 +622,26 @@ export default function Home() {
                     s
                   </label>
                 </div>
-                <span className="text-[13px] tabular-nums">
-                  {fmtTime(time)} <span className="text-faint">/ {fmtTime(duration)}</span>
-                </span>
+              </div>
+
+              {/* Frame-accurate edges */}
+              <div className="glass rounded-2xl px-4 py-3 flex flex-wrap items-center gap-x-6 gap-y-3">
+                <Edge label="In" t={range[0]} frame={frameOf(range[0])} onNudge={(n) => nudge(0, n)} onGo={() => seek(range[0])} />
+                <Edge label="Out" t={range[1]} frame={frameOf(range[1])} onNudge={(n) => nudge(1, n)} onGo={() => seek(range[1])} />
                 <span className="text-muted text-[13px] tabular-nums">
-                  {fmtTime(range[0])} – {fmtTime(range[1])}{" "}
-                  <span className="text-faint">({(range[1] - range[0]).toFixed(1)}s)</span>
+                  {(range[1] - range[0]).toFixed(2)}s · {frameOf(range[1]) - frameOf(range[0])} frames · {fps} fps
                 </span>
                 <span className="flex-1" />
-                <FrameSaver onSave={saveFrame} first={range[0]} current={time} last={Math.max(range[0], range[1] - 1 / fps)} />
+                <button className="btn" onClick={() => fileRef.current?.click()}>
+                  Replace clip
+                </button>
                 {duration <= 30 && (
                   <button className="btn" onClick={() => setMode("mask")}>
                     Use whole clip
                   </button>
                 )}
-                <button className="btn" onClick={() => fileRef.current?.click()}>
-                  Replace
-                </button>
-                <button className="btn btn-on" disabled={!!busy} onClick={applyTrim}>
-                  Cut
+                <button className="btn btn-on min-w-44" disabled={!!busy} onClick={applyTrim}>
+                  {cutStage ?? `Use ${fmtTime(range[0])} – ${fmtTime(range[1])}`}
                 </button>
               </div>
             </>
@@ -598,7 +663,7 @@ export default function Home() {
                   onChange={(e) => seek(Number(e.target.value))}
                 />
                 <span className="text-muted text-[13px] tabular-nums">
-                  {fmtTime(time)} <span className="text-faint">/ {fmtTime(duration)}</span>
+                  {fmtTime(time)} <span className="text-faint">/ {fmtTime(duration)} · f{frameOf(time)}</span>
                 </span>
               </div>
 
@@ -619,7 +684,6 @@ export default function Home() {
                     : `${points.length} point${points.length > 1 ? "s" : ""} on frame ${frameIndex}`}
                 </span>
                 <span className="flex-1" />
-                <FrameSaver onSave={saveFrame} first={0} current={time} last={Math.max(0, duration - 1 / fps)} />
                 {points.length > 0 && (
                   <button className="btn" onClick={() => setPoints([])}>
                     Clear
@@ -653,7 +717,38 @@ export default function Home() {
             <p className="glass text-[13px] text-ink/90 break-all rounded-xl px-4 py-3">{error}</p>
           )}
 
-          {(stitch.length > 0 || history.length > 0 || videoFile) && (
+          {frames.length > 0 && (
+            <div className="pt-6 space-y-3">
+              <div className="flex items-baseline gap-3">
+                <h2 className="text-[15px]">Frames</h2>
+                <span className="text-faint text-[12px]">Grabbed stills. Save them or use one as a face.</span>
+              </div>
+              <div className="grid gap-3 grid-cols-2 sm:grid-cols-3 xl:grid-cols-4">
+                {frames.map((f) => (
+                  <figure key={f.id} className="space-y-1.5">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={f.url} alt="" className="w-full aspect-video object-cover rounded-xl bg-black ring-1 ring-hair" />
+                    <figcaption className="text-[12px] text-muted flex justify-between items-center gap-2">
+                      <span className="tabular-nums">f{f.frame} · {f.time.toFixed(2)}s</span>
+                      <span className="flex gap-1.5">
+                        <button className="btn h-7 px-2.5 text-[12px]" onClick={() => frameToCast(f)}>
+                          Use as face
+                        </button>
+                        <button className="btn h-7 px-2.5 text-[12px]" onClick={() => saveFrame(f)}>
+                          Save
+                        </button>
+                        <button className="btn h-7 w-7 px-0 text-[12px] text-muted" aria-label="Remove" onClick={() => setFrames((s) => s.filter((x) => x.id !== f.id))}>
+                          ×
+                        </button>
+                      </span>
+                    </figcaption>
+                  </figure>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {mode === "mask" && (stitch.length > 0 || history.length > 0 || videoFile) && (
             <div className="pt-8 space-y-3">
               <div className="flex items-center gap-3 flex-wrap">
                 <h2 className="text-[15px]">Stitch</h2>
@@ -714,7 +809,7 @@ export default function Home() {
             </div>
           )}
 
-          {history.length > 0 && (
+          {mode === "mask" && history.length > 0 && (
             <div className="pt-8 space-y-3">
               <h2 className="text-[15px]">Takes</h2>
               <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
@@ -747,6 +842,7 @@ export default function Home() {
         </section>
 
         {/* Side panel */}
+        {!(mode === "trim" && localVideo) && (
         <aside className="lg:border-l border-hair flex flex-col">
           <div className="flex-1 px-6 py-2 space-y-9 overflow-y-auto">
             <div className="space-y-3">
@@ -841,28 +937,39 @@ export default function Home() {
             </p>
           </div>
         </aside>
+        )}
       </main>
     </div>
   );
 }
 
-function FrameSaver({
-  onSave,
-  first,
-  current,
-  last,
+function Edge({
+  label,
+  t,
+  frame,
+  onNudge,
+  onGo,
 }: {
-  onSave: (t: number) => void;
-  first: number;
-  current: number;
-  last: number;
+  label: string;
+  t: number;
+  frame: number;
+  onNudge: (frames: number) => void;
+  onGo: () => void;
 }) {
   return (
-    <div className="seg glass" aria-label="Save a frame as PNG">
-      <span className="px-2 text-faint text-[12px]">Frame</span>
-      <button onClick={() => onSave(first)}>First</button>
-      <button onClick={() => onSave(current)}>Now</button>
-      <button onClick={() => onSave(last)}>Last</button>
+    <div className="flex items-center gap-2">
+      <button className="text-left" onClick={onGo} title="Jump here">
+        <span className="block text-faint text-[11px] leading-none">{label}</span>
+        <span className="block text-[13px] tabular-nums leading-tight">
+          {fmtTime(t)} <span className="text-faint">f{frame}</span>
+        </span>
+      </button>
+      <div className="seg glass">
+        <button onClick={() => onNudge(-10)} aria-label={`${label} back 10 frames`}>‹‹</button>
+        <button onClick={() => onNudge(-1)} aria-label={`${label} back 1 frame`}>‹</button>
+        <button onClick={() => onNudge(1)} aria-label={`${label} forward 1 frame`}>›</button>
+        <button onClick={() => onNudge(10)} aria-label={`${label} forward 10 frames`}>››</button>
+      </div>
     </div>
   );
 }
