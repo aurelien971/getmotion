@@ -15,7 +15,18 @@ export type Shot = {
 
 export type LibFace = { id: string; file: StoredFile; label: string };
 
+// A prompt written by Claude for one render clip, from that clip's own scenes.
+export type ScenePrompt = {
+  prompt: string;
+  target: string;
+  scenes: { time: string; shot: string; where: string; action: string; visibility: string; decoys?: string }[];
+  warnings: string[];
+  at: number;
+  edited?: boolean;
+};
+
 export type Group = {
+  partPrompts?: Record<string, ScenePrompt>; // by partKey
   id: string;
   name: string;
   description: string;

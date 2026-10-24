@@ -50,6 +50,7 @@ import {
   type Shot,
   type Step,
   type StoredFile,
+  type ScenePrompt,
   type Wardrobe,
   defaultTicks,
   refKey,
@@ -771,6 +772,96 @@ export default function Chapters() {
     }
   }
 
+  // Claude looks at every scene of one render clip, in order, and writes its prompt.
+  async function writePartPrompt(part: Part) {
+    const g = p.groups.find((x) => x.id === part.groupId);
+    if (!g || !srcUrl) return;
+    const key = partKey(part);
+    setTask(`pp-${part.id}`, { label: "Claude is studying each scene", pct: null });
+    try {
+      // Pieces continuing the same shot are one scene; every cut starts a new one.
+      const scenes: { from: number; to: number; src: { start: number; end: number } }[] = [];
+      const f0 = 1 / p.fps;
+      const split = part.pieces.flatMap((pc) => {
+        const cs = (p.cuts ?? []).filter((c) => c > pc.start + 2 * f0 && c < pc.end - 2 * f0);
+        const edges = [pc.start, ...cs, pc.end];
+        return edges.slice(1).map((e, k) => ({ shotId: `${pc.shotId}#${k}`, start: edges[k], end: e, offset: pc.offset + (edges[k] - pc.start) }));
+      });
+      split.forEach((pc, i) => {
+        const len = pc.end - pc.start;
+        const last = scenes[scenes.length - 1];
+        if (last && i > 0 && split[i - 1].shotId === pc.shotId && Math.abs(split[i - 1].end - pc.start) < 1e-3) {
+          last.to = pc.offset + len;
+          last.src.end = pc.end;
+        } else scenes.push({ from: pc.offset, to: pc.offset + len, src: { start: pc.start, end: pc.end } });
+      });
+      const f = 1 / p.fps;
+      const withFrames = [];
+      for (const sc of scenes) {
+        const len = sc.src.end - sc.src.start;
+        const ks = len < 0.7 ? [0.5] : len < 1.5 ? [0.2, 0.75] : [0.12, 0.5, 0.88];
+        const frames = await grabFrames(srcUrl, ks.map((k) => Math.min(sc.src.end - f, sc.src.start + len * k + 0.5 * f)));
+        withFrames.push({ from: sc.from, to: sc.to, frames });
+      }
+      const jpeg = async (r: StoredFile) => ({ name: r.name, dataUrl: await blobToDataUrl((await toJpeg(r.blob, r.name, 1280)).blob) });
+      const faces = await Promise.all(refsOf(p, g).map(jpeg));
+      const others = await Promise.all(otherRefsOf(p, g).map(jpeg));
+      const w = g.wardrobe;
+      const rules = w
+        ? [
+            `Take from the reference photos: ${w.reference.filter((x) => x.on).map((x) => x.label).join(", ") || "face only"}.`,
+            `Keep from the original: ${w.target.filter((x) => x.on).map((x) => x.label).join(", ") || "nothing"}.`,
+            `Remove / replace: ${w.target.filter((x) => !x.on).map((x) => x.label).join(", ") || "nothing"}.`,
+            ...(w.others ?? []).filter((o) => o.faceId).map((o, k) => `Also replace ${o.label} with reference image ${faces.length + k + 1}.`),
+            ...(w.others ?? []).filter((o) => !o.faceId).map((o) => `${o.label} stays unchanged.`),
+          ].join(" ")
+        : "";
+      const res = await fetch("/api/scenes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          scenes: withFrames,
+          faces,
+          others,
+          look: `${g.name}. ${g.description}`,
+          rules,
+          basePrompt: defaultPrompt(g, faces.length),
+          notes: g.notes,
+          model: RENDER_MODELS.find((m) => m.id === g.modelId)?.name ?? g.modelId,
+          clipLength: part.clipLength,
+          loopFrom: part.duration,
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? res.statusText);
+      const sp: ScenePrompt = {
+        prompt: String(json.prompt ?? ""),
+        target: String(json.target ?? ""),
+        scenes: Array.isArray(json.scenes) ? json.scenes : [],
+        warnings: Array.isArray(json.warnings) ? json.warnings : [],
+        at: Date.now(),
+      };
+      update((x) => ({
+        ...x,
+        groups: x.groups.map((gg) => (gg.id === g.id ? { ...gg, partPrompts: { ...(gg.partPrompts ?? {}), [key]: sp } } : gg)),
+      }));
+    } catch (e) {
+      setError(`Scene prompt: ${describe(e)}`);
+    } finally {
+      setTask(`pp-${part.id}`, null);
+    }
+  }
+  function editPartPrompt(part: Part, prompt: string) {
+    const key = partKey(part);
+    update((x) => ({
+      ...x,
+      groups: x.groups.map((gg) => {
+        const cur = gg.partPrompts?.[key];
+        return gg.id === part.groupId && cur ? { ...gg, partPrompts: { ...gg.partPrompts, [key]: { ...cur, prompt, edited: true } } } : gg;
+      }),
+    }));
+  }
+
   async function writeGroupPrompt(g: Group) {
     setTask(`prompt-${g.id}`, { label: `Writing prompt for ${g.name}`, pct: null });
     try {
@@ -1086,6 +1177,7 @@ export default function Chapters() {
         cast,
         prompt: "",
         directed:
+          g.partPrompts?.[partKey(part)]?.prompt ||
           g.prompt ||
           `The target appears in every single shot of this clip. Replace him with the man in reference image 1 in all of them, even with sunglasses, a hat, a side angle or when small in frame. ${g.description} Keep his clothing, hats and sunglasses exactly. Everyone else unchanged. Preserve lip-sync and motion.`,
         duration: part.clipLength,
@@ -1626,6 +1718,9 @@ export default function Chapters() {
             onAnalyze={analyzeWardrobe}
             onRender={renderParts}
             onCheck={checkParts}
+            onWritePrompt={(pt) => void writePartPrompt(pt)}
+            onEditPrompt={editPartPrompt}
+            writing={new Set(Object.keys(tasks).filter((k) => k.startsWith("pp-") && tasks[k]).map((k) => k.slice(3)))}
             onDownloadRender={(pt) => void downloadRender(pt)}
             onDownloadAll={() => void downloadAllRenders()}
             onComposite={() => {
@@ -1857,6 +1952,33 @@ async function cropDataUrl(src: string, box: number[], size = 240): Promise<stri
   c.height = Math.max(1, Math.round(sh * k));
   c.getContext("2d")!.drawImage(img, sx, sy, sw, sh, 0, 0, c.width, c.height);
   return c.toDataURL("image/jpeg", 0.85);
+}
+
+// Full-size stills at given source times, for Claude to look at.
+async function grabFrames(src: string, times: number[], maxW = 1024): Promise<string[]> {
+  const v = document.createElement("video");
+  v.src = src;
+  v.muted = true;
+  v.preload = "auto";
+  await new Promise<void>((r, j) => {
+    v.onloadedmetadata = () => r();
+    v.onerror = () => j(new Error("Could not read the video"));
+  });
+  const k = Math.min(1, maxW / v.videoWidth);
+  const c = document.createElement("canvas");
+  c.width = Math.round(v.videoWidth * k);
+  c.height = Math.round(v.videoHeight * k);
+  const out: string[] = [];
+  for (const t of times) {
+    await new Promise<void>((r) => {
+      v.onseeked = () => r();
+      v.currentTime = t;
+    });
+    c.getContext("2d")!.drawImage(v, 0, 0, c.width, c.height);
+    out.push(c.toDataURL("image/jpeg", 0.82));
+  }
+  v.src = "";
+  return out;
 }
 
 // Starting prompt for a look, built from its description and wardrobe. Editable; Claude can rewrite it.
@@ -2535,6 +2657,9 @@ function RenderStep(props: {
   onAnalyze: (g: Group) => void;
   onRender: (partIds: string[]) => void;
   onCheck: (partIds: string[]) => void;
+  onWritePrompt: (part: Part) => void;
+  onEditPrompt: (part: Part, prompt: string) => void;
+  writing: Set<string>;
   onDownloadRender: (part: Part) => void;
   onDownloadAll: () => void;
   onComposite: () => void;
@@ -2927,6 +3052,10 @@ function RenderStep(props: {
                   cost={costOf(pt)}
                   canRender={refsOf(p, g).length > 0}
                   onRender={() => props.onRender([pt.id])}
+                  scenePrompt={g.partPrompts?.[partKey(pt)]}
+                  writing={props.writing.has(pt.id)}
+                  onWritePrompt={() => props.onWritePrompt(pt)}
+                  onEditPrompt={(t) => props.onEditPrompt(pt, t)}
                 />
               ))}
             </ol>
@@ -3549,7 +3678,15 @@ function PartRow({
   cost,
   canRender,
   onRender,
+  scenePrompt,
+  writing,
+  onWritePrompt,
+  onEditPrompt,
 }: {
+  scenePrompt?: ScenePrompt;
+  writing: boolean;
+  onWritePrompt: () => void;
+  onEditPrompt: (prompt: string) => void;
   onCheck: () => void;
   onInspect: () => void;
   onFix: (only?: Issue[]) => void;
@@ -3578,6 +3715,7 @@ function PartRow({
   const busy = part.status === "building" || part.status === "uploading" || part.status === "rendering";
   const padLen = part.clipLength - part.duration;
   const [open, setOpen] = useState(false);
+  const [showPrompt, setShowPrompt] = useState(false);
   return (
     <li className="rounded-2xl ring-1 ring-hair p-3 space-y-3">
       <div className="flex flex-wrap items-center gap-4">
@@ -3603,6 +3741,14 @@ function PartRow({
         <video src={part.resultUrl} muted playsInline className="h-12 rounded-md ring-1 ring-hair bg-black" />
       )}
       <span className="text-faint text-[12px] tabular-nums">~${cost.toFixed(2)}</span>
+      <button
+        className={`btn ${scenePrompt ? "" : "btn-on"}`}
+        disabled={writing}
+        onClick={() => (scenePrompt ? setShowPrompt((s) => !s) : (setShowPrompt(true), onWritePrompt()))}
+        title="Claude studies every scene of this clip and writes its prompt (one Claude call)"
+      >
+        {writing ? "Studying scenes…" : scenePrompt ? `Prompt ✓${scenePrompt.warnings.length ? ` · ${scenePrompt.warnings.length} ⚠` : ""}` : "Write prompt"}
+      </button>
       {(part.status === "idle" || part.status === "failed") && (
         <button className="btn" onClick={onCheck} title="Build the clip locally and look for frames from other scenes">
           {part.checkedKey ? "Checked ✓" : "Check"}
@@ -3618,6 +3764,50 @@ function PartRow({
         {outdated ? "Superseded" : part.status === "done" || part.status === "failed" ? "Re-roll" : "Render"}
       </button>
       </div>
+      {showPrompt && scenePrompt && (
+        <div className="rounded-xl bg-white/[0.03] ring-1 ring-hair p-3 space-y-3">
+          {scenePrompt.target && <p className="text-[12px]"><span className="text-muted">Target · </span>{scenePrompt.target}</p>}
+          {!!scenePrompt.warnings.length && (
+            <ul className="space-y-1">
+              {scenePrompt.warnings.map((w, k) => (
+                <li key={k} className="text-[12px] text-[#fcd34d]">⚠ {w}</li>
+              ))}
+            </ul>
+          )}
+          {!!scenePrompt.scenes.length && (
+            <ol className="grid gap-1">
+              {scenePrompt.scenes.map((sc, k) => (
+                <li key={k} className="grid grid-cols-[70px_minmax(0,1fr)_auto] gap-3 text-[12px] items-baseline">
+                  <span className="text-muted tabular-nums">{sc.time}</span>
+                  <span>
+                    <span className="text-muted">{sc.shot} · {sc.where} · </span>
+                    {sc.action}
+                    {sc.decoys ? <span className="text-faint"> · leave: {sc.decoys}</span> : null}
+                  </span>
+                  <span
+                    className={`text-[11px] rounded-full px-2 ${sc.visibility === "clear" ? "text-[#86efac]" : sc.visibility === "absent" ? "text-[#fca5a5]" : "text-[#fcd34d]"}`}
+                  >
+                    {sc.visibility}
+                  </span>
+                </li>
+              ))}
+            </ol>
+          )}
+          <textarea
+            className="w-full min-h-48 rounded-lg bg-black/40 ring-1 ring-hair p-3 text-[13px] leading-relaxed"
+            value={scenePrompt.prompt}
+            onChange={(e) => onEditPrompt(e.target.value)}
+          />
+          <div className="flex items-center gap-2">
+            <span className="text-faint text-[11px] flex-1">
+              {scenePrompt.prompt.length} characters{scenePrompt.edited ? " · edited" : ""} · this prompt is used when this part renders
+            </span>
+            <button className="btn h-8 px-3 text-[12px]" disabled={writing} onClick={onWritePrompt}>
+              {writing ? "Studying scenes…" : "Rewrite"}
+            </button>
+          </div>
+        </div>
+      )}
       {!!part.issues?.length && part.status !== "done" && (
         <div className="rounded-xl bg-[rgba(252,211,77,0.06)] ring-1 ring-[rgba(252,211,77,0.3)] p-3 space-y-3">
           <div className="flex items-center gap-3">
