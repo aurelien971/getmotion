@@ -4,13 +4,13 @@ import { fal } from "@fal-ai/client";
 import Image from "next/image";
 import { useEffect, useRef, useState } from "react";
 import { MODELS, SAM2_VIDEO } from "@/lib/models";
-import { trimVideo } from "@/lib/trim";
+import { muxAudio, trimVideo } from "@/lib/trim";
 import { Trimmer } from "@/components/Trimmer";
 
 fal.config({ proxyUrl: "/api/fal/proxy" });
 
 type Point = { x: number; y: number; label: 0 | 1 };
-type Result = { url: string; model: string; at: number };
+type Result = { url: string; model: string; at: number; localUrl?: string };
 type CastSlot = { file: File; preview: string; who: string };
 
 const HISTORY_KEY = "getmotion.history";
@@ -77,7 +77,7 @@ export default function Home() {
   const [maskOk, setMaskOk] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [mode, setMode] = useState<"trim" | "mask">("mask");
-  const [maxLen, setMaxLen] = useState<15 | 30>(15);
+  const [maxLen, setMaxLen] = useState<number>(15);
   const [range, setRange] = useState<[number, number]>([0, 15]);
   const [trimPct, setTrimPct] = useState<number | null>(null);
 
@@ -120,6 +120,34 @@ export default function Home() {
     setError(null);
     setTime(0);
     setMode("mask");
+  }
+
+  function setSlot(n: number) {
+    const len = Math.max(1, Math.min(30, n));
+    setMaxLen(len);
+    setRange(([s]) => [s, Math.min(duration, s + len)]);
+  }
+
+  // Paste a face straight from the clipboard.
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const item = Array.from(e.clipboardData?.items ?? []).find((i) => i.type.startsWith("image/"));
+      const f = item?.getAsFile();
+      if (!f) return;
+      e.preventDefault();
+      setCast((c) => (c.length >= 4 ? c : [...c, { file: f, preview: URL.createObjectURL(f), who: "" }]));
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, []);
+
+  async function saveTake(r: Result) {
+    const blob = r.localUrl ? await fetch(r.localUrl).then((x) => x.blob()) : await fetch(r.url).then((x) => x.blob());
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `getmotion-${new Date(r.at).toISOString().slice(0, 19).replace(/[:T]/g, "-")}.mp4`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
   }
 
   async function applyTrim() {
@@ -260,10 +288,18 @@ export default function Home() {
         });
         out = (res.data as { video: { url: string } }).video.url;
       }
-      const next = [{ url: out, model: model.name, at: Date.now() }, ...history];
+      let localUrl: string | undefined;
+      if (!model.keepsAudio && videoFile) {
+        setBusy("Adding the original audio back");
+        const silent = await fetch(out).then((r) => r.blob());
+        localUrl = URL.createObjectURL(await muxAudio(silent, videoFile));
+      }
+      const take: Result = { url: out, model: model.name, at: Date.now(), localUrl };
+      const next = [take, ...history];
       setHistory(next);
       try {
-        localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
+        // Blob URLs don't survive a reload; keep only the provider URL.
+        localStorage.setItem(HISTORY_KEY, JSON.stringify(next.map((r) => ({ url: r.url, model: r.model, at: r.at }))));
       } catch {}
     } catch (e) {
       setError(String(e));
@@ -437,19 +473,29 @@ export default function Home() {
                 >
                   {playing ? "❚❚" : "▶"}
                 </button>
-                <div className="flex rounded-[10px] border border-line overflow-hidden">
-                  {([15, 30] as const).map((n) => (
+                <div className="flex items-center rounded-[10px] border border-line overflow-hidden">
+                  {[5, 15, 30].map((n) => (
                     <button
                       key={n}
                       className={`h-9 px-3 text-sm ${maxLen === n ? "bg-raise" : "text-muted hover:text-ink"}`}
-                      onClick={() => {
-                        setMaxLen(n);
-                        setRange(([s]) => [s, Math.min(duration, s + n)]);
-                      }}
+                      onClick={() => setSlot(n)}
                     >
-                      {n}s max
+                      {n}s
                     </button>
                   ))}
+                  <label className="flex items-center gap-1 h-9 px-3 text-sm text-muted border-l border-line">
+                    <input
+                      type="number"
+                      min={1}
+                      max={30}
+                      step={0.5}
+                      value={maxLen}
+                      onChange={(e) => setSlot(Number(e.target.value) || 1)}
+                      className="w-12 bg-transparent text-ink tabular-nums text-right"
+                      aria-label="Slot length in seconds"
+                    />
+                    s max
+                  </label>
                 </div>
                 <span className="text-muted text-sm tabular-nums">
                   {fmtTime(range[0])} to {fmtTime(range[1])}, {(range[1] - range[0]).toFixed(1)}s of {fmtTime(duration)}
@@ -557,7 +603,7 @@ export default function Home() {
                 {history.map((r) => (
                   <figure key={r.at} className="space-y-1.5">
                     <video
-                      src={r.url}
+                      src={r.localUrl ?? r.url}
                       controls
                       playsInline
                       className="w-full rounded-xl bg-black ring-1 ring-line"
@@ -566,9 +612,9 @@ export default function Home() {
                       <span>
                         {r.model}, {new Date(r.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                       </span>
-                      <a href={r.url} target="_blank" className="hover:text-ink">
-                        Download
-                      </a>
+                      <button className="hover:text-ink" onClick={() => saveTake(r)}>
+                        Save
+                      </button>
                     </figcaption>
                   </figure>
                 ))}
@@ -620,8 +666,8 @@ export default function Home() {
                 </label>
               )}
               <p className="text-muted text-sm">
-                One photo per person. Say who each one replaces by look and position so the model
-                picks the right one.
+                One photo per person, or paste one with ⌘V. Say who each one replaces by look and
+                position so the model picks the right one.
               </p>
             </div>
 

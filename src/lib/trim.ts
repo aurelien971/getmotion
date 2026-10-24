@@ -87,3 +87,27 @@ export async function trimVideo(
     await ff.deleteFile("out.mp4").catch(() => {});
   }
 }
+
+// Put the source clip's audio under a silent generated video (Wan models drop audio).
+export async function muxAudio(video: Blob, source: File): Promise<File> {
+  const ff = await load();
+  try {
+    await ff.writeFile("v.mp4", await fetchFile(video));
+    await ff.writeFile("src", await fetchFile(source));
+    await ff.exec([
+      "-i", "v.mp4",
+      "-i", "src",
+      "-map", "0:v:0",
+      "-map", "1:a:0?",
+      "-c:v", "copy",
+      "-c:a", "aac",
+      "-shortest",
+      "-movflags", "+faststart",
+      "-y", "muxed.mp4",
+    ]);
+    const data = (await ff.readFile("muxed.mp4")) as Uint8Array;
+    return new File([data.slice().buffer as ArrayBuffer], "take.mp4", { type: "video/mp4" });
+  } finally {
+    for (const f of ["v.mp4", "src", "muxed.mp4"]) await ff.deleteFile(f).catch(() => {});
+  }
+}

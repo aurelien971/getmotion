@@ -17,6 +17,7 @@ export type Model = {
   name: string;
   note: string;
   usesMask: boolean;
+  keepsAudio: boolean; // false = output is silent, we mux the source audio back
   maxCast: number; // 0 = prompt only, no face photos
   usdPerSec: number; // rough, check provider pricing
   build: (i: GenInput) => Record<string, unknown>;
@@ -39,6 +40,7 @@ export const MODELS: Model[] = [
     name: "Wan VACE — masked",
     note: "Uses your mask exactly. Cheap. Output at 16fps, max ~15s.",
     usesMask: true,
+    keepsAudio: false,
     maxCast: 1,
     usdPerSec: 0.08,
     build: (i) => ({
@@ -58,6 +60,7 @@ export const MODELS: Model[] = [
     name: "Wan 2.2 Animate Replace",
     note: "Cheapest swap. Finds the person itself (no mask). Best with one person.",
     usesMask: false,
+    keepsAudio: false,
     maxCast: 1,
     usdPerSec: 0.04,
     build: (i) => ({
@@ -73,6 +76,7 @@ export const MODELS: Model[] = [
     name: "H3 Max Recast (fal)",
     note: "Best quality, keeps audio. Targets people by your descriptions.",
     usesMask: false,
+    keepsAudio: true,
     maxCast: 4,
     usdPerSec: 0.3,
     build: (i) => ({
@@ -88,6 +92,7 @@ export const MODELS: Model[] = [
     name: "H3 Max Recast (Sume)",
     note: "Same model via Sume. $0.30/s at 768p.",
     usesMask: false,
+    keepsAudio: true,
     maxCast: 4,
     usdPerSec: 0.3,
     build: (i) => ({
@@ -104,6 +109,7 @@ export const MODELS: Model[] = [
     name: "Hailuo H3 Regen (Sume)",
     note: "Restyles the whole clip from your prompt. No face photo. $0.05/s.",
     usesMask: false,
+    keepsAudio: true,
     maxCast: 0,
     usdPerSec: 0.05,
     build: (i) => ({

@@ -6,7 +6,7 @@ type Props = {
   src: string;
   duration: number;
   time: number;
-  maxLen: 15 | 30;
+  maxLen: number;
   range: [number, number];
   onRange: (r: [number, number]) => void;
   onSeek: (t: number) => void;
