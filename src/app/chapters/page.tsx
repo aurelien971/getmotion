@@ -575,7 +575,8 @@ export default function Chapters() {
   function enterRender() {
     update((x) => {
       const range = x.range ?? { start: 0, end: x.duration };
-      const next = { ...x, range };
+      const groups = x.groups.map((g) => (g.prompt.trim() ? g : { ...g, prompt: defaultPrompt(g) }));
+      const next = { ...x, range, groups };
       return { ...next, parts: plan(next), step: "render" };
     });
   }
@@ -699,6 +700,14 @@ export default function Chapters() {
     }
     await Promise.all(waits);
   }
+
+  // Looks reaching the Render step with an empty prompt get the suggested one.
+  useEffect(() => {
+    if (!loaded || p.step !== "render" || !p.groups.some((g) => !g.prompt.trim())) return;
+    queueMicrotask(() =>
+      update((x) => ({ ...x, groups: x.groups.map((g) => (g.prompt.trim() ? g : { ...g, prompt: defaultPrompt(g) })) })),
+    );
+  }, [loaded, p.step, p.groups, update]);
 
   // Resume renders that were in flight when the page closed.
   const resumed = useRef(false);
@@ -1072,6 +1081,17 @@ export default function Chapters() {
       )}
     </div>
   );
+}
+
+// Starting prompt for a look, built from its description. Editable; Claude can rewrite it.
+function defaultPrompt(g: Group) {
+  return [
+    `The man to replace appears in every single shot of this clip. ${g.description}`.trim(),
+    "He is the same person in every shot, even when he wears sunglasses or a hat, turns sideways, or is small in the frame.",
+    "Replace his face and head with the man in reference image 1 in all of them.",
+    "Keep his clothing, headwear, sunglasses and jewelry exactly as they are; add nothing, remove nothing.",
+    "Everyone else, the background and the camera stay unchanged. Preserve lip-sync, expressions, gestures and motion.",
+  ].join(" ");
 }
 
 function blobToDataUrl(b: Blob) {
@@ -1795,6 +1815,9 @@ function RenderStep(props: {
             </button>
           </div>
         </div>
+        <div className="max-w-3xl mx-auto">
+          <ReelPlayer src={props.src} fps={p.fps} spans={[range]} className="h-[34vh] max-w-full aspect-video mx-auto" />
+        </div>
         <RangePicker
           duration={p.duration}
           blocks={p.shots.map((s) => ({ start: s.start, end: s.end, color: p.groups.find((g) => g.id === s.groupId)?.color ?? "#888" }))}
@@ -1860,15 +1883,17 @@ function RenderStep(props: {
                   {shots.length} shots in span · {fmtShort(len)} · {left > 0.01 ? `${fmtShort(left)} to render` : "all rendered"}
                 </p>
               </div>
-              <div className="flex gap-1.5 overflow-hidden max-w-[45%]">
-                {shots.slice(0, 6).map((s) =>
-                  s.thumb ? (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img key={s.id} src={s.thumb} alt="" title={`${fmt(s.start)} · ${fmtShort(s.end - s.start)}`} className="h-12 aspect-video object-cover rounded-md ring-1 ring-hair" />
-                  ) : null,
-                )}
-              </div>
             </header>
+
+            <div className="space-y-1.5">
+              <ReelPlayer
+                src={props.src}
+                fps={p.fps}
+                spans={clipTo(shots.map((s) => ({ start: s.start, end: s.end })), range)}
+                className="h-[30vh] max-w-full aspect-video"
+              />
+              <p className="text-faint text-[11px]">Every shot of this look inside the span, back to back. This is the footage that gets replaced.</p>
+            </div>
 
             <div className="grid md:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)] gap-5">
               <div className="space-y-4">
@@ -1942,6 +1967,8 @@ function RenderStep(props: {
               {parts.map((pt, i) => (
                 <PartRow
                   key={pt.id}
+                  src={props.src}
+                  fps={p.fps}
                   part={pt}
                   index={i}
                   stale={!!pt.signature && pt.status === "done" && pt.signature !== signature(pt, g)}
@@ -1982,6 +2009,8 @@ function RefThumb({ file, onRemove }: { file: StoredFile; onRemove: () => void }
 }
 
 function PartRow({
+  src,
+  fps,
   part,
   index,
   stale,
@@ -1989,6 +2018,8 @@ function PartRow({
   canRender,
   onRender,
 }: {
+  src: string;
+  fps: number;
   part: Part;
   index: number;
   stale: boolean;
@@ -2006,8 +2037,10 @@ function PartRow({
   };
   const busy = part.status === "building" || part.status === "uploading" || part.status === "rendering";
   const padLen = part.clipLength - part.duration;
+  const [open, setOpen] = useState(false);
   return (
-    <li className="rounded-2xl ring-1 ring-hair p-3 flex flex-wrap items-center gap-4">
+    <li className="rounded-2xl ring-1 ring-hair p-3 space-y-3">
+      <div className="flex flex-wrap items-center gap-4">
       <span className="text-[13px] w-16">Part {index + 1}</span>
       <span className="text-muted text-[12px] tabular-nums w-48">
         {part.pieces.length} pieces · {fmtShort(part.duration)}
@@ -2026,13 +2059,29 @@ function PartRow({
       </span>
       {part.error && <span className="text-[12px] text-[#fca5a5] break-all flex-1 min-w-48">{part.error}</span>}
       <span className="flex-1" />
-      {part.resultUrl && (
-        <video src={part.resultUrl} controls playsInline className="h-20 rounded-lg ring-1 ring-hair bg-black" />
+      {part.resultUrl && !open && (
+        <video src={part.resultUrl} muted playsInline className="h-12 rounded-md ring-1 ring-hair bg-black" />
       )}
       <span className="text-faint text-[12px] tabular-nums">~${cost.toFixed(2)}</span>
+      <button className="btn" onClick={() => setOpen((o) => !o)}>{open ? "Hide" : "Preview"}</button>
       <button className={`btn ${part.status === "idle" ? "btn-on" : ""}`} disabled={busy || !canRender} onClick={onRender}>
         {part.status === "done" || part.status === "failed" ? "Re-roll" : "Render"}
       </button>
+      </div>
+      {open && (
+        <div className="grid md:grid-cols-2 gap-4">
+          <div className="space-y-1.5">
+            <span className="text-[12px] text-muted">What gets sent{padLen > 0.05 ? ` (last ${fmtShort(padLen)} is loop filler, thrown away)` : ""}</span>
+            <ReelPlayer src={src} fps={fps} spans={[...part.pieces, ...part.pad]} className="aspect-video" />
+          </div>
+          {part.resultUrl && (
+            <div className="space-y-1.5">
+              <span className="text-[12px] text-muted">What came back</span>
+              <video src={part.resultUrl} controls playsInline className="w-full aspect-video rounded-2xl ring-1 ring-hair bg-black" />
+            </div>
+          )}
+        </div>
+      )}
     </li>
   );
 }
