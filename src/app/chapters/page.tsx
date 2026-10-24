@@ -4,6 +4,7 @@ import { fal } from "@fal-ai/client";
 import Image from "next/image";
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { EdgeEditor } from "@/components/EdgeEditor";
 import { FrameStrip } from "@/components/FrameStrip";
 import { ReelPlayer } from "@/components/ReelPlayer";
 import { SpotTrack } from "@/components/SpotTrack";
@@ -33,7 +34,7 @@ import {
   type StoredFile,
 } from "@/lib/project";
 import { kv } from "@/lib/store";
-import { assembleTimeline, buildClip, detectCuts, fileHasAudio, probeVideoCodec, warmUp } from "@/lib/trim";
+import { assembleTimeline, buildClip, detectCuts, fileHasAudio, probeVideo, warmUp } from "@/lib/trim";
 import { transcodeInBrowser } from "@/lib/transcode";
 
 fal.config({ proxyUrl: "/api/fal/proxy" });
@@ -218,7 +219,9 @@ export default function Chapters() {
       try {
         warmUp();
         setTask("prepare", { label: "Checking codec", pct: null });
-        const codec = await probeVideoCodec(source.blob).catch(() => null);
+        const info = await probeVideo(source.blob).catch(() => ({ codec: null, fps: null }));
+        const codec = info.codec;
+        if (info.fps) update((x) => ({ ...x, fps: info.fps!, fpsProbed: true }));
         if (codec && READABLE.has(codec)) {
           update((x) => ({ ...x, codec, prepared: source }));
         } else {
@@ -236,6 +239,17 @@ export default function Chapters() {
       }
     })();
   }, [loaded, p.source, p.prepared, update]);
+
+  // Older projects guessed the frame rate; read it from the container once.
+  useEffect(() => {
+    if (!loaded || !p.source || p.fpsProbed || running.current.fps || running.current.prepare) return;
+    running.current.fps = true;
+    const source = p.source;
+    probeVideo(source.blob)
+      .then((info) => update((x) => ({ ...x, fps: info.fps ?? x.fps, fpsProbed: true })))
+      .catch(() => update((x) => ({ ...x, fpsProbed: true })))
+      .finally(() => (running.current.fps = false));
+  }, [loaded, p.source, p.fpsProbed, update]);
 
   useEffect(() => {
     if (!loaded || !p.prepared || p.cuts !== null || running.current.cuts) return;
@@ -419,7 +433,48 @@ export default function Chapters() {
     }
   }
 
+  // Move a shot's edges. An edge is either a spotting mark or a scene cut; moving it
+  // moves that mark/cut, so the neighbouring shot follows and grouping is kept.
+  async function moveEdges(shotId: string, newStart: number, newEnd: number) {
+    const shot = p.shots.find((s) => s.id === shotId);
+    if (!shot) return;
+    const tol = 0.6 / p.fps;
+    const moveIn = (xs: number[], from: number, to: number) => {
+      let hit = false;
+      const out = xs.map((x) => (Math.abs(x - from) < tol ? ((hit = true), to) : x));
+      return { out, hit };
+    };
+    let boundaries = p.boundaries.map((b) => ({ ...b }));
+    let cuts = [...(p.cuts ?? [])];
+    for (const [from, to] of [
+      [shot.start, newStart],
+      [shot.end, newEnd],
+    ] as const) {
+      if (Math.abs(from - to) < 1e-6) continue;
+      const b = moveIn(boundaries.map((x) => x.t), from, to);
+      if (b.hit) boundaries = boundaries.map((x, i) => ({ ...x, t: b.out[i] }));
+      const c = moveIn(cuts, from, to);
+      if (c.hit) cuts = c.out;
+      if (!b.hit && !c.hit) cuts.push(to); // edge came from nowhere we track: add a cut
+    }
+    boundaries.sort((a, b) => a.t - b.t);
+    cuts = [...new Set(cuts)].sort((a, b) => a - b);
+    const next = { ...p, boundaries, cuts };
+    const shots = buildShots(next);
+    // The trimmed shot keeps its group even if its id changed.
+    const trimmed = shots.find((s) => Math.abs(s.start - newStart) < tol);
+    if (trimmed) trimmed.groupId = shot.groupId;
+    update(() => ({ ...next, shots }));
+    const missing = shots.filter((s) => !s.thumb);
+    if (missing.length && srcUrl) {
+      const map = await grabThumbs(srcUrl, missing, () => {});
+      update((x) => ({ ...x, shots: x.shots.map((s) => (map[s.id] ? { ...s, thumb: map[s.id] } : s)) }));
+    }
+    flash("Edges saved");
+  }
+
   const [sel, setSel] = useState<string>("unassigned");
+  const [trimming, setTrimming] = useState<string | null>(null);
 
   // ---- render ---------------------------------------------------------------
   function enterRender() {
@@ -702,6 +757,7 @@ export default function Chapters() {
             }}
             onNext={enterRender}
             canNext={reach.render}
+            onTrim={setTrimming}
           />
         )}
         {p.step === "render" && srcUrl && (
@@ -746,6 +802,27 @@ export default function Chapters() {
         className="hidden"
         onChange={(e) => e.target.files?.[0] && onSource(e.target.files[0])}
       />
+
+      {trimming && srcUrl && (() => {
+        const s = p.shots.find((x) => x.id === trimming);
+        if (!s) return null;
+        const g = p.groups.find((x) => x.id === s.groupId);
+        return (
+          <EdgeEditor
+            src={srcUrl}
+            fps={p.fps}
+            duration={p.duration}
+            start={s.start}
+            end={s.end}
+            title={`${g?.name ?? "Shot"} · ${fmt(s.start)}`}
+            onClose={() => setTrimming(null)}
+            onSave={(a, b) => {
+              setTrimming(null);
+              void moveEdges(s.id, a, b);
+            }}
+          />
+        );
+      })()}
 
       {(taskList.length > 0 || error || toast) && (
         <div className="fixed bottom-5 right-5 z-40 w-[340px] space-y-2">
@@ -1173,8 +1250,10 @@ function ScenesStep(props: {
   onNewGroupFor: (shotId: string) => void;
   onNext: () => void;
   canNext: boolean;
+  onTrim: (shotId: string) => void;
 }) {
   const { p, src, sel, setSel } = props;
+  const [reelIdx, setReelIdx] = useState(0);
   const unassigned = p.shots.filter((s) => !s.groupId);
   const coverage = props.presentLen ? Math.round((props.groupedLen / props.presentLen) * 100) : 0;
   const group = p.groups.find((g) => g.id === sel);
@@ -1276,8 +1355,15 @@ function ScenesStep(props: {
             )}
           </div>
 
-          <div className="max-w-4xl">
-            <ReelPlayer src={src} spans={reel} className="h-[44vh] max-w-full aspect-video mx-auto" />
+          <div className="max-w-4xl space-y-2">
+            <ReelPlayer src={src} fps={p.fps} spans={reel} onShot={setReelIdx} className="h-[44vh] max-w-full aspect-video mx-auto" />
+            {sel !== "absent" && shownShots[reelIdx] && (
+              <div className="flex justify-end">
+                <button className="btn" onClick={() => props.onTrim(shownShots[reelIdx].id)}>
+                  Trim shot {reelIdx + 1} frame by frame
+                </button>
+              </div>
+            )}
           </div>
 
           {sel !== "absent" ? (
@@ -1307,6 +1393,9 @@ function ScenesStep(props: {
                       ))}
                       <option value="__new">+ New look</option>
                     </select>
+                    <button className="btn h-8 px-2.5 text-[11px]" title="Pick the exact first and last frame" onClick={() => props.onTrim(s.id)}>
+                      Trim
+                    </button>
                     <button
                       className="btn h-8 px-2.5 text-[11px]"
                       title="This isn't him: mark as not in frame"

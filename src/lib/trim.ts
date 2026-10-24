@@ -382,3 +382,33 @@ export async function assembleTimeline(
     }
   });
 }
+
+// Codec and frame rate from the container, as ffmpeg reports them.
+export async function probeVideo(file: Blob): Promise<{ codec: string | null; fps: number | null }> {
+  return exclusive(async () => {
+    const ff = await load();
+    let codec: string | null = null;
+    let fps: number | null = null;
+    const onLog = ({ message }: { message: string }) => {
+      if (!/Stream #\d+:\d+.*Video:/.test(message)) return;
+      const c = /Video: ([a-z0-9_]+)/i.exec(message);
+      if (c && !codec) codec = c[1].toLowerCase();
+      const f = /([\d.]+) fps/.exec(message) ?? /([\d.]+) tbr/.exec(message);
+      if (f && !fps) fps = parseFloat(f[1]);
+    };
+    ff.on("log", onLog);
+    const name = tmp("bin");
+    try {
+      await ff.writeFile(name, await fetchFile(file));
+      await ff.exec(["-i", name, "-f", "null", "-t", "0.01", "-"]).catch(() => {});
+    } finally {
+      ff.off("log", onLog);
+      await ff.deleteFile(name).catch(() => {});
+    }
+    // 23.98 -> 23.976, 29.97 stays.
+    if (fps && Math.abs(fps - 23.98) < 0.01) fps = 24000 / 1001;
+    if (fps && Math.abs(fps - 29.97) < 0.01) fps = 30000 / 1001;
+    if (fps && Math.abs(fps - 59.94) < 0.01) fps = 60000 / 1001;
+    return { codec, fps };
+  });
+}

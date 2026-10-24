@@ -54,6 +54,7 @@ export type Project = {
   codec?: string | null;
   duration: number;
   fps: number;
+  fpsProbed?: boolean; // fps read from the container (not guessed)
   width: number;
   height: number;
   hasAudio: boolean;

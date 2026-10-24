@@ -5,25 +5,49 @@ import { useEffect, useRef, useState } from "react";
 type Span = { start: number; end: number };
 
 // Plays a list of spans of one source back to back, straight from the original
-// file: no encoding, so any selection can be reviewed instantly.
-export function ReelPlayer({ src, spans, className = "" }: { src: string; spans: Span[]; className?: string }) {
+// file: no encoding, so any selection can be reviewed instantly. Span edges are
+// frame starts; playback hops on a per-frame callback so no frame from outside a
+// span is ever shown.
+export function ReelPlayer({
+  src,
+  spans,
+  fps,
+  className = "",
+  onShot,
+}: {
+  src: string;
+  spans: Span[];
+  fps: number;
+  className?: string;
+  onShot?: (index: number) => void;
+}) {
   const v = useRef<HTMLVideoElement>(null);
   const [idx, setIdx] = useState(0);
   const [playing, setPlaying] = useState(false);
-  const [local, setLocal] = useState(0); // seconds into the reel
+  const [local, setLocal] = useState(0);
+  const idxRef = useRef(0);
   const total = spans.reduce((s, x) => s + x.end - x.start, 0);
   const key = spans.map((s) => `${s.start}-${s.end}`).join("|");
+  const half = 0.5 / fps;
 
-  // Jump to the first span whenever the selection changes.
+  // Seek to a frame by landing in its middle, so rounding never shows the one before.
+  const seekTo = (el: HTMLVideoElement, t: number) => (el.currentTime = t + half);
+
+  const select = (i: number) => {
+    idxRef.current = i;
+    setIdx(i);
+    onShot?.(i);
+  };
+
   useEffect(() => {
     const el = v.current;
     if (!el || !spans.length) return;
     el.pause();
-    const go = () => (el.currentTime = spans[0].start);
+    const go = () => seekTo(el, spans[0].start);
     if (el.readyState >= 1) go();
     else el.addEventListener("loadedmetadata", go, { once: true });
     const t = setTimeout(() => {
-      setIdx(0);
+      select(0);
       setLocal(0);
       setPlaying(false);
     }, 0);
@@ -31,32 +55,40 @@ export function ReelPlayer({ src, spans, className = "" }: { src: string; spans:
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, src]);
 
-  // While playing, hop from one span to the next at its exact end.
   useEffect(() => {
     if (!playing) return;
     const el = v.current!;
-    let i = idx;
-    const tick = setInterval(() => {
+    let handle = 0;
+    let stopped = false;
+    const onFrame = (_: number, meta: VideoFrameCallbackMetadata) => {
+      if (stopped) return;
+      const i = idxRef.current;
       const s = spans[i];
-      if (!s) return;
-      if (el.currentTime >= s.end - 0.01 || el.currentTime < s.start - 0.25) {
-        i = (i + 1) % spans.length;
-        el.currentTime = spans[i].start;
-        setIdx(i);
+      // If the next frame would fall outside this span, hop now.
+      if (meta.mediaTime + 1 / fps >= s.end - half / 2 || meta.mediaTime < s.start - 1 / fps) {
+        const n = (i + 1) % spans.length;
+        seekTo(el, spans[n].start);
+        select(n);
       }
-      const before = spans.slice(0, i).reduce((t, x) => t + x.end - x.start, 0);
-      setLocal(before + Math.max(0, el.currentTime - spans[i].start));
-    }, 25);
-    return () => clearInterval(tick);
+      const j = idxRef.current;
+      const before = spans.slice(0, j).reduce((t, x) => t + x.end - x.start, 0);
+      setLocal(before + Math.max(0, meta.mediaTime - spans[j].start));
+      handle = el.requestVideoFrameCallback(onFrame);
+    };
+    handle = el.requestVideoFrameCallback(onFrame);
+    return () => {
+      stopped = true;
+      el.cancelVideoFrameCallback(handle);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playing, key]);
+  }, [playing, key, fps]);
 
   const toggle = () => {
     const el = v.current;
     if (!el || !spans.length) return;
     if (el.paused) {
-      const s = spans[idx];
-      if (el.currentTime < s.start || el.currentTime >= s.end) el.currentTime = s.start;
+      const s = spans[idxRef.current];
+      if (el.currentTime < s.start || el.currentTime >= s.end - 1 / fps) seekTo(el, s.start);
       el.play();
       setPlaying(true);
     } else {
@@ -67,9 +99,9 @@ export function ReelPlayer({ src, spans, className = "" }: { src: string; spans:
   const jump = (d: number) => {
     const el = v.current;
     if (!el || !spans.length) return;
-    const i = (idx + d + spans.length) % spans.length;
-    el.currentTime = spans[i].start;
-    setIdx(i);
+    const i = (idxRef.current + d + spans.length) % spans.length;
+    seekTo(el, spans[i].start);
+    select(i);
     setLocal(spans.slice(0, i).reduce((t, x) => t + x.end - x.start, 0));
   };
 
