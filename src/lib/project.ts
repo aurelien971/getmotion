@@ -22,7 +22,42 @@ export type Group = {
   notes: string;
   prompt: string;
   modelId: string;
+  wardrobe?: Wardrobe;
 };
+
+export type WardrobeItem = { label: string; on: boolean };
+// target: what he wears in this look (on = keep it); reference: what the photo has (on = take it).
+export type Wardrobe = { target: WardrobeItem[]; reference: WardrobeItem[] };
+
+const TOPS = /hoodie|tee|t-shirt|shirt|sweatshirt|jacket|coat|suit|top|jersey|vest|sweater|blazer/i;
+
+export function wardrobeClashes(w: Wardrobe): string[] {
+  const keepTops = w.target.filter((x) => x.on && TOPS.test(x.label)).map((x) => x.label);
+  const takeTops = w.reference.filter((x) => x.on && TOPS.test(x.label)).map((x) => x.label);
+  return keepTops.length && takeTops.length
+    ? [`Keeping ${keepTops.join(", ")} while taking ${takeTops.join(", ")}: the tops will fight each other.`]
+    : [];
+}
+
+export function wardrobePrompt(description: string, w: Wardrobe): string {
+  const take = w.reference.filter((x) => x.on).map((x) => x.label.toLowerCase());
+  const keep = w.target.filter((x) => x.on).map((x) => x.label.toLowerCase());
+  const drop = w.target.filter((x) => !x.on).map((x) => x.label.toLowerCase());
+  const outfit = take.filter((x) => x !== "face");
+  return [
+    `The man to replace appears in every single shot of this clip. ${description}`.trim(),
+    "He is the same person in every shot, even when he wears sunglasses or a hat, turns sideways, or is small in the frame.",
+    `Give him, from reference image 1: ${["his face and identity", ...outfit].join(", ")}.`,
+    keep.length ? `Keep from the original exactly as they are: ${keep.join(", ")}.` : "",
+    drop.length && outfit.length
+      ? `His ${drop.join(", ")} ${drop.length === 1 ? "is" : "are"} replaced by the reference outfit; none of it stays visible.`
+      : "",
+    drop.length && !outfit.length ? `Remove his ${drop.join(", ")}.` : "",
+    "Add nothing else. Everyone else, the background and the camera stay unchanged. Preserve lip-sync, expressions, gestures and motion.",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
 
 export type PartPiece = { shotId: string; start: number; end: number; offset: number };
 

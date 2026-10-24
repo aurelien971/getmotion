@@ -38,6 +38,9 @@ import {
   type Shot,
   type Step,
   type StoredFile,
+  type Wardrobe,
+  wardrobeClashes,
+  wardrobePrompt,
 } from "@/lib/project";
 import { kv } from "@/lib/store";
 import { measureOffset, openReader, refineEdge } from "@/lib/sync";
@@ -589,6 +592,39 @@ export default function Chapters() {
   const patchPart = (id: string, patch: Partial<Part>) =>
     update((x) => ({ ...x, parts: x.parts.map((pt) => (pt.id === id ? { ...pt, ...patch } : pt)) }));
 
+  async function analyzeWardrobe(g: Group) {
+    setTask(`wardrobe-${g.id}`, { label: `Reading the wardrobe for ${g.name}`, pct: null });
+    try {
+      const range = p.range ?? { start: 0, end: p.duration };
+      const shots = p.shots.filter((s) => s.groupId === g.id && s.thumb && s.end > range.start && s.start < range.end).slice(0, 8);
+      const refs = await Promise.all(
+        g.refs.map(async (r) => ({ name: r.name, dataUrl: await blobToDataUrl((await toJpeg(r.blob, r.name, 1280)).blob) })),
+      );
+      const res = await fetch("/api/wardrobe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ targets: shots.map((s) => ({ name: s.id, dataUrl: s.thumb })), refs }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? res.statusText);
+      const prev = g.wardrobe;
+      const was = (list: { label: string; on: boolean }[] | undefined, label: string) => list?.find((x) => x.label === label)?.on;
+      const w: Wardrobe = {
+        target: (json.target as string[]).map((label) => ({ label, on: was(prev?.target, label) ?? false })),
+        reference: (json.reference as string[]).map((label) => ({
+          label,
+          on: /^face$/i.test(label) ? true : (was(prev?.reference, label) ?? true),
+        })),
+      };
+      if (!w.reference.some((x) => /^face$/i.test(x.label))) w.reference.unshift({ label: "Face", on: true });
+      patchGroup(g.id, { wardrobe: w });
+    } catch (e) {
+      setError(`Wardrobe for ${g.name}: ${describe(e)}`);
+    } finally {
+      setTask(`wardrobe-${g.id}`, null);
+    }
+  }
+
   async function writeGroupPrompt(g: Group) {
     setTask(`prompt-${g.id}`, { label: `Writing prompt for ${g.name}`, pct: null });
     try {
@@ -606,6 +642,9 @@ export default function Chapters() {
           notes: [
             `This clip contains only one look: "${g.name}". ${g.description}`,
             "It is a stitched sequence of short shots; the target appears in every single shot of it, often the only person or the one rapping to camera. Replace him in all of them, even with sunglasses, a hat, a side angle or when small in frame.",
+            g.wardrobe
+              ? `Wardrobe, follow exactly. Take from reference image 1: ${g.wardrobe.reference.filter((x) => x.on).map((x) => x.label).join(", ")}. Keep from the original: ${g.wardrobe.target.filter((x) => x.on).map((x) => x.label).join(", ") || "nothing"}. Replace: ${g.wardrobe.target.filter((x) => !x.on).map((x) => x.label).join(", ") || "nothing"}.`
+              : "",
             g.notes,
           ]
             .filter(Boolean)
@@ -1003,6 +1042,7 @@ export default function Chapters() {
               update((x) => ({ ...x, groups: x.groups.map((g) => (g.id === gid ? { ...g, refs: g.refs.filter((_, k) => k !== i) } : g)) }))
             }
             onWrite={writeGroupPrompt}
+            onAnalyze={analyzeWardrobe}
             onRender={renderParts}
             onNext={() => go("assemble")}
             onError={setError}
@@ -1757,6 +1797,7 @@ function RenderStep(props: {
   onAddRef: (gid: string, f: File) => void;
   onRemoveRef: (gid: string, i: number) => void;
   onWrite: (g: Group) => void;
+  onAnalyze: (g: Group) => void;
   onRender: (partIds: string[]) => void;
   onNext: () => void;
   onError: (m: string) => void;
@@ -1922,6 +1963,13 @@ function RenderStep(props: {
                     Tip: for a sunglasses or hat look, add a second photo of him wearing that.
                   </p>
                 </div>
+                <WardrobePanel
+                  group={g}
+                  busy={!!props.tasks[`wardrobe-${g.id}`]}
+                  onAnalyze={() => props.onAnalyze(g)}
+                  onChange={(w) => props.onPatch(g.id, { wardrobe: w })}
+                  onBuild={() => g.wardrobe && props.onPatch(g.id, { prompt: wardrobePrompt(g.description, g.wardrobe) })}
+                />
                 <div className="space-y-2">
                   <span className="text-[13px]">Model</span>
                   <div className="flex flex-wrap gap-1.5">
@@ -1987,6 +2035,141 @@ function RenderStep(props: {
           Not in this span: {idleGroups.map((g) => g.name).join(", ")}
         </p>
       )}
+    </div>
+  );
+}
+
+function WardrobePanel({
+  group,
+  busy,
+  onAnalyze,
+  onChange,
+  onBuild,
+}: {
+  group: Group;
+  busy: boolean;
+  onAnalyze: () => void;
+  onChange: (w: Wardrobe) => void;
+  onBuild: () => void;
+}) {
+  const w = group.wardrobe;
+  const clashes = w ? wardrobeClashes(w) : [];
+  const set = (side: "target" | "reference", i: number, on: boolean) =>
+    w && onChange({ ...w, [side]: w[side].map((x, k) => (k === i ? { ...x, on } : x)) });
+  const remove = (side: "target" | "reference", i: number) => w && onChange({ ...w, [side]: w[side].filter((_, k) => k !== i) });
+  const add = (side: "target" | "reference", label: string) =>
+    onChange({
+      target: w?.target ?? [],
+      reference: w?.reference ?? [{ label: "Face", on: true }],
+      [side]: [...(w?.[side] ?? (side === "reference" ? [{ label: "Face", on: true }] : [])), { label, on: true }],
+    } as Wardrobe);
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="text-[13px]">Wardrobe</span>
+        <button
+          className="btn h-7 px-3 text-[12px]"
+          disabled={busy || !group.refs.length}
+          title={group.refs.length ? "Claude lists what he wears here and what your photo has" : "Add a face first"}
+          onClick={onAnalyze}
+        >
+          {busy ? "Reading…" : w ? "Analyze again" : "Analyze"}
+        </button>
+      </div>
+      {!w ? (
+        <p className="text-faint text-[11px]">
+          Analyze to list what he wears in this look and what your reference photo has, then tick what to keep and what
+          to take. Or{" "}
+          <button className="underline text-muted" onClick={() => onChange({ target: [], reference: [{ label: "Face", on: true }] })}>
+            start the list by hand
+          </button>
+          .
+        </p>
+      ) : (
+        <div className="grid grid-cols-2 gap-3">
+          <ItemList
+            title="Take from the photo"
+            items={w.reference}
+            locked={(x) => /^face$/i.test(x.label)}
+            onToggle={(i, on) => set("reference", i, on)}
+            onRemove={(i) => remove("reference", i)}
+            onAdd={(l) => add("reference", l)}
+          />
+          <ItemList
+            title="Keep from the original"
+            items={w.target}
+            onToggle={(i, on) => set("target", i, on)}
+            onRemove={(i) => remove("target", i)}
+            onAdd={(l) => add("target", l)}
+          />
+        </div>
+      )}
+      {clashes.map((c) => (
+        <p key={c} className="text-[11px] text-[#fcd34d]">{c}</p>
+      ))}
+      {w && (
+        <button className="btn w-full" onClick={onBuild}>
+          Build prompt from checklist
+        </button>
+      )}
+    </div>
+  );
+}
+
+function ItemList({
+  title,
+  items,
+  locked,
+  onToggle,
+  onRemove,
+  onAdd,
+}: {
+  title: string;
+  items: { label: string; on: boolean }[];
+  locked?: (x: { label: string; on: boolean }) => boolean;
+  onToggle: (i: number, on: boolean) => void;
+  onRemove: (i: number) => void;
+  onAdd: (label: string) => void;
+}) {
+  const [draft, setDraft] = useState("");
+  return (
+    <div className="rounded-xl ring-1 ring-hair p-2.5 space-y-1.5">
+      <span className="block text-[11px] text-muted">{title}</span>
+      {items.map((x, i) => {
+        const lock = locked?.(x);
+        return (
+          <label key={`${x.label}-${i}`} className="flex items-center gap-2 text-[12px] group cursor-pointer">
+            <input
+              type="checkbox"
+              checked={lock ? true : x.on}
+              disabled={lock}
+              onChange={(e) => onToggle(i, e.target.checked)}
+              className="accent-white"
+            />
+            <span className={`flex-1 ${x.on || lock ? "" : "text-faint line-through"}`}>{x.label}</span>
+            {!lock && (
+              <button className="text-faint opacity-0 group-hover:opacity-100" onClick={(e) => { e.preventDefault(); onRemove(i); }} aria-label="Remove">
+                ×
+              </button>
+            )}
+          </label>
+        );
+      })}
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (draft.trim()) onAdd(draft.trim());
+          setDraft("");
+        }}
+      >
+        <input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="+ add item"
+          className="w-full bg-transparent text-[12px] outline-none placeholder:text-faint"
+        />
+      </form>
     </div>
   );
 }
