@@ -6,6 +6,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EdgeEditor } from "@/components/EdgeEditor";
 import { FrameStrip } from "@/components/FrameStrip";
+import { RangePicker } from "@/components/RangePicker";
 import { ReelPlayer } from "@/components/ReelPlayer";
 import { SpotTrack } from "@/components/SpotTrack";
 import { submitFal, submitSume, waitFor, removeJob, type PendingJob } from "@/lib/jobs";
@@ -13,6 +14,10 @@ import { MODELS } from "@/lib/models";
 import {
   buildParts,
   buildShots,
+  clipTo,
+  covered,
+  partsInRange,
+  pending as pendingFor,
   emptyProject,
   fmt,
   fmtShort,
@@ -36,7 +41,7 @@ import {
 } from "@/lib/project";
 import { kv } from "@/lib/store";
 import { measureOffset, openReader, refineEdge } from "@/lib/sync";
-import { assembleTimeline, buildClip, detectCuts, fileHasAudio, probeVideo, warmUp } from "@/lib/trim";
+import { assembleTimeline, buildClip, detectCuts, fileHasAudio, fpsExpr, probeVideo, warmUp } from "@/lib/trim";
 import { transcodeInBrowser } from "@/lib/transcode";
 
 fal.config({ proxyUrl: "/api/fal/proxy" });
@@ -192,7 +197,7 @@ export default function Chapters() {
 
   useEffect(() => {
     if (process.env.NODE_ENV === "development") {
-      (window as unknown as { __engine: unknown }).__engine = { buildClip, assembleTimeline, detectCuts, measureOffset };
+      (window as unknown as { __engine: unknown }).__engine = { buildClip, assembleTimeline, detectCuts, measureOffset, fpsExpr };
     }
   }, []);
 
@@ -561,11 +566,23 @@ export default function Chapters() {
   const [trimming, setTrimming] = useState<string | null>(null);
 
   // ---- render ---------------------------------------------------------------
+  const plan = (x: Project): Part[] => {
+    let parts: Part[] = [];
+    for (const g of x.groups) parts = parts.concat(buildParts(x, g.id));
+    // Renders of looks that no longer exist are dropped; renders are otherwise kept forever.
+    return parts;
+  };
   function enterRender() {
     update((x) => {
-      let parts: Part[] = [];
-      for (const g of x.groups) parts = parts.concat(buildParts(x, g.id));
-      return { ...x, parts, step: "render" };
+      const range = x.range ?? { start: 0, end: x.duration };
+      const next = { ...x, range };
+      return { ...next, parts: plan(next), step: "render" };
+    });
+  }
+  function setRange(r: { start: number; end: number }) {
+    update((x) => {
+      const next = { ...x, range: r };
+      return { ...next, parts: plan(next) };
     });
   }
   const patchPart = (id: string, patch: Partial<Part>) =>
@@ -628,6 +645,7 @@ export default function Chapters() {
         { w, h },
         p.hasAudio,
         (r) => patchPart(part.id, { progress: r }),
+        fpsExpr(p.fps),
       );
       patchPart(part.id, { status: "uploading", progress: undefined });
       const videoUrl = await fal.storage.upload(clip);
@@ -702,19 +720,60 @@ export default function Chapters() {
   }, [loaded]);
 
   // ---- assemble -------------------------------------------------------------
-  const [rangeMode, setRangeMode] = useState<"all" | "span">("all");
+  const [rangeMode, setRangeMode] = useState<"range" | "all" | "span">("range");
   async function assemble() {
     if (!p.prepared) return;
     setError(null);
     setTask("assemble", { label: "Downloading renders", pct: null });
     try {
-      const done = p.parts.filter((x) => x.status === "done" && x.resultUrl);
+      const span =
+        rangeMode === "range" && p.range
+          ? p.range
+          : rangeMode === "span" && present.length
+            ? { start: present[0].start, end: present[present.length - 1].end }
+            : { start: 0, end: p.duration };
+      // Every finished render that touches the span, from any batch; newest wins on overlap.
+      const done = p.parts
+        .filter((x) => x.status === "done" && x.resultUrl)
+        .filter((x) => x.pieces.some((pc) => pc.end > span.start && pc.start < span.end))
+        .sort((a, b) => (a.renderedAt ?? 0) - (b.renderedAt ?? 0));
       const results = await Promise.all(done.map((d) => fetch(d.resultUrl!).then((r) => r.blob())));
+      // Each render should be exactly as long as the clip that was sent. If the model
+      // returned it shorter or longer, read it stretched so every piece lands on its frame.
+      const lengths = await Promise.all(
+        results.map(
+          (b) =>
+            new Promise<number>((res) => {
+              const v = document.createElement("video");
+              const u = URL.createObjectURL(b);
+              v.preload = "metadata";
+              v.onloadedmetadata = () => {
+                res(v.duration);
+                URL.revokeObjectURL(u);
+              };
+              v.onerror = () => res(NaN);
+              v.src = u;
+            }),
+        ),
+      );
+      const stretch = [1, ...done.map((d, i) => (isFinite(lengths[i]) && lengths[i] > 0 ? lengths[i] / d.clipLength : 1))];
+      const drift = stretch.slice(1).map((k, i) => Math.abs(k - 1) * done[i].clipLength * p.fps);
       const files: Blob[] = [p.prepared.blob, ...results];
-      const span = rangeMode === "span" && present.length ? { start: present[0].start, end: present[present.length - 1].end } : { start: 0, end: p.duration };
       type Rep = { start: number; end: number; file: number; offset: number };
-      const reps: Rep[] = [];
-      done.forEach((d, i) => d.pieces.forEach((pc) => reps.push({ start: pc.start, end: pc.end, file: i + 1, offset: pc.offset })));
+      let reps: Rep[] = [];
+      done.forEach((d, i) =>
+        d.pieces.forEach((pc) => {
+          // Newer renders replace older ones where they overlap.
+          reps = reps.flatMap((r) => {
+            if (pc.end <= r.start || pc.start >= r.end) return [r];
+            const out: Rep[] = [];
+            if (pc.start > r.start) out.push({ ...r, end: pc.start });
+            if (pc.end < r.end) out.push({ ...r, start: pc.end, offset: r.offset + (pc.end - r.start) });
+            return out;
+          });
+          reps.push({ start: pc.start, end: pc.end, file: i + 1, offset: pc.offset });
+        }),
+      );
       reps.sort((a, b) => a.start - b.start);
       const pieces: { file: number; start: number; end: number }[] = [];
       let t = span.start;
@@ -722,11 +781,11 @@ export default function Chapters() {
         if (r.end <= span.start || r.start >= span.end) continue;
         const a = Math.max(r.start, span.start);
         const b = Math.min(r.end, span.end);
-        if (a - t > 0.01) pieces.push({ file: 0, start: t, end: a });
+        if (a - t > 0.5 / p.fps) pieces.push({ file: 0, start: t, end: a });
         pieces.push({ file: r.file, start: r.offset + (a - r.start), end: r.offset + (b - r.start) });
         t = b;
       }
-      if (span.end - t > 0.01) pieces.push({ file: 0, start: t, end: span.end });
+      if (span.end - t > 0.5 / p.fps) pieces.push({ file: 0, start: t, end: span.end });
       const size = await new Promise<{ w: number; h: number }>((res) => {
         if (!done[0]) return res({ w: Math.round((p.width / p.height) * Math.min(720, p.height)), h: Math.min(720, p.height) });
         const v = document.createElement("video");
@@ -740,15 +799,65 @@ export default function Chapters() {
       const off = p.preparedOffset ?? 0;
       const shifted = pieces.map((x) => (x.file === 0 ? { ...x, start: Math.max(0, x.start + off), end: x.end + off } : x));
       const audioSpan = { start: Math.max(0, span.start + off), end: span.end + off };
-      const out = await assembleTimeline(files, shifted, p.hasAudio ? audioSpan : null, size, (r) =>
-        setTask("assemble", { label: "Assembling on the original timeline", pct: r }),
+      const out = await assembleTimeline(
+        files,
+        shifted,
+        p.hasAudio ? audioSpan : null,
+        size,
+        (r) => setTask("assemble", { label: "Assembling on the original timeline", pct: r }),
+        fpsExpr(p.fps),
+        stretch,
       );
-      update((x) => ({ ...x, output: { blob: out, name: `${x.name}-recast.mp4`, type: "video/mp4" } }));
-      flash("Assembled");
+      update((x) => ({ ...x, output: { blob: out, name: `${x.name}-${fmt(span.start)}-${fmt(span.end)}.mp4`.replace(/:/g, "."), type: "video/mp4" } }));
+      const worst = Math.max(0, ...drift);
+      flash(worst >= 1 ? `Assembled · corrected a render that was ${Math.round(worst)} frames off` : "Assembled · every render matched its clip");
     } catch (e) {
       setError(`Assembly failed: ${describe(e)}`);
     } finally {
       setTask("assemble", null);
+    }
+  }
+
+  // ---- analysis backup ------------------------------------------------------
+  function exportAnalysis() {
+    const data = {
+      kind: "getmotion.analysis",
+      version: 1,
+      source: { name: p.source?.name, duration: p.duration, width: p.width, height: p.height, fps: p.fps },
+      boundaries: p.boundaries,
+      cuts: p.cuts,
+      watched: p.watched,
+      shots: p.shots.map(({ thumb: _t, ...s }) => (void _t, s)),
+      groups: p.groups.map(({ refs: _r, ...g }) => (void _r, g)),
+      parts: p.parts.filter((x) => x.status === "done"),
+      range: p.range,
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    save({ blob, name: `${p.name}-analysis.json`, type: "application/json" });
+  }
+  async function importAnalysis(f: File) {
+    try {
+      const d = JSON.parse(await f.text());
+      if (d.kind !== "getmotion.analysis") throw new Error("Not a getmotion analysis file");
+      if (p.duration && Math.abs(d.source.duration - p.duration) > 0.5) {
+        if (!confirm(`This analysis is for a ${fmt(d.source.duration)} video, the loaded one is ${fmt(p.duration)}. Import anyway?`)) return;
+      }
+      update((x) => ({
+        ...x,
+        boundaries: d.boundaries ?? [],
+        cuts: d.cuts ?? x.cuts,
+        watched: d.watched ?? x.watched,
+        fps: d.source?.fps ?? x.fps,
+        shots: d.shots ?? [],
+        groups: (d.groups ?? []).map((g: Group) => ({ ...g, refs: [] })),
+        parts: d.parts ?? [],
+        range: d.range,
+        step: d.shots?.length ? "scenes" : "spot",
+      }));
+      flash("Analysis imported");
+      if (srcUrl && d.shots?.length) await refreshThumbs(d.shots);
+    } catch (e) {
+      setError(`Import failed: ${describe(e)}`);
     }
   }
 
@@ -798,6 +907,26 @@ export default function Chapters() {
           })}
         </nav>
         <span className="flex-1" />
+        {p.shots.length > 0 && (
+          <button className="btn h-8 px-3 text-[12px]" onClick={exportAnalysis} title="Download the spotting, cuts, looks and renders as a file">
+            Export analysis
+          </button>
+        )}
+        {p.source && (
+          <label className="btn h-8 px-3 text-[12px] cursor-pointer" title="Load a saved analysis for this video">
+            Import
+            <input
+              type="file"
+              accept="application/json"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void importAnalysis(f);
+                e.target.value = "";
+              }}
+            />
+          </label>
+        )}
         <Link href="/" className="btn h-8 px-3 text-[12px]">Single clip</Link>
         {p.source && (
           <button className="btn h-8 px-3 text-[12px] text-muted" onClick={newProject}>
@@ -868,6 +997,7 @@ export default function Chapters() {
             onRender={renderParts}
             onNext={() => go("assemble")}
             onError={setError}
+            onRange={setRange}
           />
         )}
         {p.step === "assemble" && srcUrl && (
@@ -1610,16 +1740,27 @@ function RenderStep(props: {
   onRender: (partIds: string[]) => void;
   onNext: () => void;
   onError: (m: string) => void;
+  onRange: (r: { start: number; end: number }) => void;
 }) {
   const { p } = props;
-  const pending = p.parts.filter((x) => x.status !== "done" && x.status !== "rendering" && x.status !== "building" && x.status !== "uploading");
-  const done = p.parts.filter((x) => x.status === "done").length;
-  const est = p.parts.reduce((s, pt) => {
+  const [snap, setSnap] = useState(true);
+  const range = p.range ?? { start: 0, end: p.duration };
+  const inRange = partsInRange(p);
+  const toRender = inRange.filter((x) => x.status === "idle" || x.status === "failed");
+  const doneIn = inRange.filter((x) => x.status === "done").length;
+  const costOf = (pt: Part) => {
     const g = p.groups.find((x) => x.id === pt.groupId);
     const m = RENDER_MODELS.find((x) => x.id === g?.modelId) ?? RENDER_MODELS[0];
-    return s + m.usdPerSec * pt.clipLength;
-  }, 0);
-  const missingFaces = p.groups.filter((g) => !g.refs.length);
+    return m.usdPerSec * pt.clipLength;
+  };
+  const est = toRender.reduce((s, pt) => s + costOf(pt), 0);
+  const himInRange = total(clipTo(p.shots.map((s) => ({ start: s.start, end: s.end })), range));
+  const renderedAll = covered(p);
+  const renderedIn = total(clipTo(renderedAll, range));
+  const activeGroups = p.groups.filter((g) => partsInRange(p, g.id).length > 0);
+  const idleGroups = p.groups.filter((g) => !activeGroups.includes(g));
+  const missingFaces = activeGroups.filter((g) => !g.refs.length && partsInRange(p, g.id).some((x) => x.status === "idle" || x.status === "failed"));
+  const snapPoints = [...(p.cuts ?? []), ...p.boundaries.map((b) => b.t)];
 
   const paste = async (gid: string) => {
     try {
@@ -1635,41 +1776,77 @@ function RenderStep(props: {
 
   return (
     <div className="max-w-6xl mx-auto p-6 space-y-6">
-      <div className="glass rounded-2xl p-5 flex flex-wrap items-center gap-6">
-        <div className="space-y-1">
-          <h2 className="text-[20px] tracking-tight">Renders</h2>
-          <p className="text-muted text-[13px]">
-            {done} of {p.parts.length} parts done · about ${est.toFixed(2)} for everything
-          </p>
+      <section className="glass rounded-3xl p-5 space-y-4">
+        <div className="flex flex-wrap items-end gap-4">
+          <div className="flex-1 min-w-60">
+            <h2 className="text-[20px] tracking-tight">What to render</h2>
+            <p className="text-muted text-[13px]">
+              Drag the span. Only shots with him inside it are rendered, and anything already rendered is reused.
+            </p>
+          </div>
+          <label className="flex items-center gap-2 text-[12px] text-muted cursor-pointer">
+            <input type="checkbox" checked={snap} onChange={(e) => setSnap(e.target.checked)} className="accent-white" />
+            Snap to cuts
+          </label>
+          <div className="seg glass">
+            <button onClick={() => props.onRange({ start: 0, end: p.duration })}>Whole video</button>
+            <button onClick={() => p.shots.length && props.onRange({ start: Math.min(...p.shots.map((s) => s.start)), end: Math.max(...p.shots.map((s) => s.end)) })}>
+              All of him
+            </button>
+          </div>
         </div>
-        <div className="flex-1 min-w-48 h-1.5 rounded-full bg-white/10 overflow-hidden flex">
-          {p.parts.map((pt) => (
-            <div
-              key={pt.id}
-              className="h-full border-r border-black/50"
-              style={{
-                width: `${100 / (p.parts.length || 1)}%`,
-                background:
-                  pt.status === "done" ? "#fff" : pt.status === "failed" ? "rgba(252,165,165,0.8)" : pt.status === "idle" ? "transparent" : "rgba(255,255,255,0.4)",
-              }}
-            />
-          ))}
+        <RangePicker
+          duration={p.duration}
+          blocks={p.shots.map((s) => ({ start: s.start, end: s.end, color: p.groups.find((g) => g.id === s.groupId)?.color ?? "#888" }))}
+          rendered={renderedAll}
+          snapPoints={snapPoints}
+          snap={snap}
+          range={range}
+          onChange={props.onRange}
+        />
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
+          <Stat label="span" value={fmtShort(range.end - range.start)} />
+          <Stat label="him in span" value={fmtShort(himInRange)} />
+          <Stat label="already rendered" value={fmtShort(renderedIn)} />
+          <Stat label={`to render · ${toRender.length} parts`} value={`$${est.toFixed(2)}`} />
         </div>
-        <button
-          className="btn btn-on"
-          disabled={!pending.length || missingFaces.length > 0}
-          title={missingFaces.length ? `Add a face to: ${missingFaces.map((g) => g.name).join(", ")}` : ""}
-          onClick={() => props.onRender(pending.map((x) => x.id))}
-        >
-          Render {pending.length ? `all ${pending.length}` : "all"}
-        </button>
-        <button className="btn" disabled={done === 0} onClick={props.onNext}>Assemble</button>
-      </div>
+        <div className="flex items-center gap-3 flex-wrap">
+          <div className="flex-1 min-w-48 h-1.5 rounded-full bg-white/10 overflow-hidden flex">
+            {inRange.map((pt) => (
+              <div
+                key={pt.id}
+                className="h-full border-r border-black/50"
+                style={{
+                  width: `${100 / (inRange.length || 1)}%`,
+                  background:
+                    pt.status === "done" ? "#fff" : pt.status === "failed" ? "rgba(252,165,165,0.8)" : pt.status === "idle" ? "transparent" : "rgba(255,255,255,0.4)",
+                }}
+              />
+            ))}
+          </div>
+          <span className="text-muted text-[12px] tabular-nums">
+            {doneIn} of {inRange.length} parts done
+          </span>
+          <button
+            className="btn btn-on"
+            disabled={!toRender.length || missingFaces.length > 0}
+            title={missingFaces.length ? `Add a face to: ${missingFaces.map((g) => g.name).join(", ")}` : ""}
+            onClick={() => props.onRender(toRender.map((x) => x.id))}
+          >
+            Render {toRender.length ? `${toRender.length} part${toRender.length === 1 ? "" : "s"}` : "all"}
+          </button>
+          <button className="btn" disabled={doneIn === 0} onClick={props.onNext}>Assemble span</button>
+        </div>
+        {missingFaces.length > 0 && (
+          <p className="text-[12px] text-muted">Add a face to {missingFaces.map((g) => g.name).join(", ")} to render.</p>
+        )}
+      </section>
 
-      {p.groups.map((g) => {
-        const parts = p.parts.filter((x) => x.groupId === g.id);
-        const shots = p.shots.filter((s) => s.groupId === g.id);
-        const len = total(shots);
+      {activeGroups.map((g) => {
+        const parts = partsInRange(p, g.id);
+        const shots = p.shots.filter((s) => s.groupId === g.id && s.end > range.start && s.start < range.end);
+        const len = total(clipTo(shots.map((s) => ({ start: s.start, end: s.end })), range));
+        const left = total(pendingFor(p, g.id));
         const model = RENDER_MODELS.find((m) => m.id === g.modelId) ?? RENDER_MODELS[0];
         const writing = !!props.tasks[`prompt-${g.id}`];
         return (
@@ -1680,14 +1857,14 @@ function RenderStep(props: {
                 <h3 className="text-[18px] tracking-tight">{g.name}</h3>
                 <p className="text-muted text-[13px]">{g.description}</p>
                 <p className="text-faint text-[12px] mt-0.5">
-                  {shots.length} shots · {fmtShort(len)} · {parts.length} part{parts.length === 1 ? "" : "s"}
+                  {shots.length} shots in span · {fmtShort(len)} · {left > 0.01 ? `${fmtShort(left)} to render` : "all rendered"}
                 </p>
               </div>
-              <div className="flex gap-1.5 overflow-hidden max-w-[40%]">
-                {shots.slice(0, 5).map((s) =>
+              <div className="flex gap-1.5 overflow-hidden max-w-[45%]">
+                {shots.slice(0, 6).map((s) =>
                   s.thumb ? (
                     // eslint-disable-next-line @next/next/no-img-element
-                    <img key={s.id} src={s.thumb} alt="" className="h-12 aspect-video object-cover rounded-md ring-1 ring-hair" />
+                    <img key={s.id} src={s.thumb} alt="" title={`${fmt(s.start)} · ${fmtShort(s.end - s.start)}`} className="h-12 aspect-video object-cover rounded-md ring-1 ring-hair" />
                   ) : null,
                 )}
               </div>
@@ -1768,7 +1945,7 @@ function RenderStep(props: {
                   part={pt}
                   index={i}
                   stale={!!pt.signature && pt.status === "done" && pt.signature !== signature(pt, g)}
-                  cost={model.usdPerSec * pt.clipLength}
+                  cost={costOf(pt)}
                   canRender={g.refs.length > 0}
                   onRender={() => props.onRender([pt.id])}
                 />
@@ -1777,6 +1954,12 @@ function RenderStep(props: {
           </section>
         );
       })}
+
+      {idleGroups.length > 0 && (
+        <p className="text-faint text-[12px]">
+          Not in this span: {idleGroups.map((g) => g.name).join(", ")}
+        </p>
+      )}
     </div>
   );
 }
@@ -1860,8 +2043,8 @@ function PartRow({
 function AssembleStep(props: {
   p: Project;
   present: { start: number; end: number }[];
-  rangeMode: "all" | "span";
-  setRangeMode: (m: "all" | "span") => void;
+  rangeMode: "range" | "all" | "span";
+  setRangeMode: (m: "range" | "all" | "span") => void;
   busy: boolean;
   onAssemble: () => void;
   outUrl: string | null;
@@ -1928,6 +2111,12 @@ function AssembleStep(props: {
 
           <div className="glass rounded-2xl p-4 space-y-3">
             <h3 className="text-[14px]">Length</h3>
+            {p.range && (
+              <label className="flex items-center gap-2 text-[13px] cursor-pointer">
+                <input type="radio" checked={props.rangeMode === "range"} onChange={() => props.setRangeMode("range")} className="accent-white" />
+                Render span · {fmt(p.range.start)} – {fmt(p.range.end)}
+              </label>
+            )}
             <label className="flex items-center gap-2 text-[13px] cursor-pointer">
               <input type="radio" checked={props.rangeMode === "all"} onChange={() => props.setRangeMode("all")} className="accent-white" />
               Whole video · {fmt(p.duration)}

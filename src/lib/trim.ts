@@ -221,6 +221,12 @@ function exclusive<T>(fn: () => Promise<T>): Promise<T> {
 let seq = 0;
 const tmp = (ext: string) => `t${++seq}.${ext}`;
 
+// Exact rational frame rate for ffmpeg ("24000/1001" rather than 23.976).
+export function fpsExpr(fps: number): string {
+  for (const [n, d] of [[24000, 1001], [30000, 1001], [60000, 1001]] as const) if (Math.abs(fps - n / d) < 0.002) return `${n}/${d}`;
+  return String(Math.round(fps * 1000) / 1000);
+}
+
 // Run ffmpeg and report progress from its "time=" log lines against an expected length.
 async function execTimed(ff: FFmpegLike, args: string[], total: number, onProgress?: (r: number) => void) {
   const onLog = ({ message }: { message: string }) => {
@@ -290,6 +296,7 @@ export async function buildClip(
   size: { w: number; h: number },
   withAudio: boolean,
   onProgress?: (r: number) => void,
+  fps = "24",
 ): Promise<File> {
   return exclusive(async () => {
     const ff = await load();
@@ -300,7 +307,7 @@ export async function buildClip(
     const h = size.h - (size.h % 2);
     const args: string[] = [];
     spans.forEach((s) => args.push("-ss", s.start.toFixed(3), "-t", (s.end - s.start).toFixed(3), "-i", src));
-    const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24,format=yuv420p`;
+    const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps},format=yuv420p`;
     let graph = "";
     let ins = "";
     spans.forEach((_, i) => {
@@ -336,14 +343,20 @@ export async function buildClip(
 
 export type TimelinePiece = { file: number; start: number; end: number }; // file 0 = source
 
+const evalFps = (e: string) => (e.includes("/") ? +e.split("/")[0] / +e.split("/")[1] : +e);
+
 // Lay pieces end to end, conform every piece to w x h, and put the source's own
 // audio for [audioStart, audioEnd] underneath.
+// `stretch[i]` = actual length of file i / the length it should have had. Piece
+// times are given in "should" time; they're read at stretch x and retimed back.
 export async function assembleTimeline(
   files: Blob[],
   pieces: TimelinePiece[],
   audio: { start: number; end: number } | null,
   size: { w: number; h: number },
   onProgress?: (r: number) => void,
+  fps = "24",
+  stretch: number[] = [],
 ): Promise<File> {
   return exclusive(async () => {
     const ff = await load();
@@ -353,11 +366,20 @@ export async function assembleTimeline(
     const w = size.w - (size.w % 2);
     const h = size.h - (size.h % 2);
     const args: string[] = [];
-    pieces.forEach((p) => args.push("-ss", p.start.toFixed(3), "-t", (p.end - p.start).toFixed(3), "-i", names[p.file]));
-    if (audio) args.push("-ss", audio.start.toFixed(3), "-t", (audio.end - audio.start).toFixed(3), "-i", names[0]);
-    const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24,format=yuv420p`;
+    pieces.forEach((p) => {
+      const k = stretch[p.file] ?? 1;
+      args.push("-ss", (p.start * k).toFixed(4), "-t", ((p.end - p.start) * k).toFixed(4), "-i", names[p.file]);
+    });
+    if (audio) args.push("-ss", audio.start.toFixed(4), "-t", (audio.end - audio.start).toFixed(4), "-i", names[0]);
+    const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps},format=yuv420p`;
     let graph = "";
-    pieces.forEach((_, i) => (graph += `[${i}:v]setpts=PTS-STARTPTS,${vf}[v${i}];`));
+    pieces.forEach((p, i) => {
+      const k = stretch[p.file] ?? 1;
+      const retime = Math.abs(k - 1) > 1e-4 ? `(PTS-STARTPTS)/${k.toFixed(6)}` : "PTS-STARTPTS";
+      // Trim each piece to its exact frame count after retiming.
+      const frames = Math.round((p.end - p.start) * evalFps(fps));
+      graph += `[${i}:v]setpts=${retime},${vf},trim=end_frame=${frames},setpts=PTS-STARTPTS[v${i}];`;
+    });
     graph += pieces.map((_, i) => `[v${i}]`).join("") + `concat=n=${pieces.length}:v=1:a=0[v]`;
     const total = pieces.reduce((t, p) => t + p.end - p.start, 0);
     const code = await execTimed(

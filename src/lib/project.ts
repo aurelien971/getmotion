@@ -67,6 +67,7 @@ export type Project = {
   parts: Part[];
   step: Step;
   output?: StoredFile;
+  range?: Interval; // the span being rendered now; all renders are kept across spans
 };
 
 export const emptyProject = (): Project => ({
@@ -203,10 +204,63 @@ export const MIN_CLIP = 5.2; // H3 needs >= 5 s
 export const MAX_CLIP = 28; // H3 takes <= 30 s
 export const MAX_RUN = 14; // and no single continuous shot over ~14.7 s
 
-// Split a group's shots into renderable parts and add looped filler where a part is
-// shorter than the minimum. Existing results are kept when a part's footage is unchanged.
+// Union of the source spans already covered by renders (done or in flight).
+export function covered(p: Project, groupId?: string): Interval[] {
+  const xs = p.parts
+    .filter((x) => (groupId ? x.groupId === groupId : true))
+    .filter((x) => x.status === "done" || x.status === "rendering" || x.status === "building" || x.status === "uploading")
+    .flatMap((x) => x.pieces.map((pc) => ({ start: pc.start, end: pc.end })));
+  return merge(xs);
+}
+
+export function merge(xs: Interval[]): Interval[] {
+  const s = [...xs].sort((a, b) => a.start - b.start);
+  const out: Interval[] = [];
+  for (const x of s) {
+    const last = out[out.length - 1];
+    if (last && x.start <= last.end + 1e-4) last.end = Math.max(last.end, x.end);
+    else out.push({ ...x });
+  }
+  return out;
+}
+
+// a minus b
+export function subtract(a: Interval[], b: Interval[]): Interval[] {
+  let out = a.map((x) => ({ ...x }));
+  for (const cut of b) {
+    const next: Interval[] = [];
+    for (const x of out) {
+      if (cut.end <= x.start || cut.start >= x.end) next.push(x);
+      else {
+        if (cut.start > x.start) next.push({ start: x.start, end: cut.start });
+        if (cut.end < x.end) next.push({ start: cut.end, end: x.end });
+      }
+    }
+    out = next;
+  }
+  return out.filter((x) => x.end - x.start > 1e-3);
+}
+
+export const clipTo = (xs: Interval[], r: Interval) =>
+  xs.map((x) => ({ start: Math.max(x.start, r.start), end: Math.min(x.end, r.end) })).filter((x) => x.end - x.start > 1e-3);
+
+// What still needs rendering for one look inside the span, as shot pieces.
+export function pending(p: Project, groupId: string): { shotId: string; start: number; end: number }[] {
+  const range = p.range ?? { start: 0, end: p.duration };
+  const done = covered(p, groupId);
+  const out: { shotId: string; start: number; end: number }[] = [];
+  for (const s of p.shots.filter((x) => x.groupId === groupId).sort((a, b) => a.start - b.start)) {
+    for (const piece of subtract(clipTo([{ start: s.start, end: s.end }], range), done)) {
+      if (piece.end - piece.start >= 1 / p.fps) out.push({ shotId: s.id, ...piece });
+    }
+  }
+  return out;
+}
+
+// Split what's pending for a look into renderable parts (H3 limits), loop short
+// parts up to the minimum, and keep renders that already exist.
 export function buildParts(p: Project, groupId: string): Part[] {
-  const shots = p.shots.filter((s) => s.groupId === groupId).sort((a, b) => a.start - b.start);
+  const todo = pending(p, groupId);
   const parts: { pieces: PartPiece[]; duration: number }[] = [];
   let cur: { pieces: PartPiece[]; duration: number } = { pieces: [], duration: 0 };
   let run = 0;
@@ -215,7 +269,7 @@ export function buildParts(p: Project, groupId: string): Part[] {
     cur = { pieces: [], duration: 0 };
     run = 0;
   };
-  for (const s of shots) {
+  for (const s of todo) {
     let a = s.start;
     while (a < s.end - 1e-3) {
       const last = cur.pieces[cur.pieces.length - 1];
@@ -227,7 +281,7 @@ export function buildParts(p: Project, groupId: string): Part[] {
         continue;
       }
       const b = Math.min(s.end, a + room);
-      cur.pieces.push({ shotId: s.id, start: a, end: b, offset: cur.duration });
+      cur.pieces.push({ shotId: s.shotId, start: a, end: b, offset: cur.duration });
       cur.duration += b - a;
       run += b - a;
       a = b;
@@ -235,8 +289,9 @@ export function buildParts(p: Project, groupId: string): Part[] {
   }
   flush();
 
+  const keyOf = (pcs: PartPiece[]) => pcs.map((x) => `${x.start.toFixed(3)}-${x.end.toFixed(3)}`).join("|");
   const old = p.parts.filter((x) => x.groupId === groupId);
-  return parts.map((pt) => {
+  const fresh = parts.map((pt) => {
     const pad: { start: number; end: number }[] = [];
     let len = pt.duration;
     let i = 0;
@@ -247,12 +302,22 @@ export function buildParts(p: Project, groupId: string): Part[] {
       len += take;
       i++;
     }
-    const key = pt.pieces.map((x) => `${x.start.toFixed(3)}-${x.end.toFixed(3)}`).join("|");
-    const prev = old.find((o) => o.pieces.map((x) => `${x.start.toFixed(3)}-${x.end.toFixed(3)}`).join("|") === key);
+    const prev = old.find((o) => (o.status === "idle" || o.status === "failed") && keyOf(o.pieces) === keyOf(pt.pieces));
     return prev
-      ? { ...prev, pieces: pt.pieces, pad, duration: pt.duration, clipLength: len }
+      ? { ...prev, pad, clipLength: len }
       : { id: uid(), groupId, pieces: pt.pieces, pad, duration: pt.duration, clipLength: len, status: "idle" as const };
   });
+  // Renders that exist (or are running) stay, whatever span is selected.
+  const keep = old.filter((x) => x.status !== "idle" && x.status !== "failed");
+  return [...keep, ...fresh];
+}
+
+// Parts relevant to the current span: new ones, plus existing renders overlapping it.
+export function partsInRange(p: Project, groupId?: string): Part[] {
+  const r = p.range ?? { start: 0, end: p.duration };
+  return p.parts.filter(
+    (x) => (!groupId || x.groupId === groupId) && x.pieces.some((pc) => pc.end > r.start + 1e-3 && pc.start < r.end - 1e-3),
+  );
 }
 
 export function signature(part: Part, group: Group) {
