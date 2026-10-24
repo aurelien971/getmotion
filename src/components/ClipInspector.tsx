@@ -25,7 +25,7 @@ export function ClipInspector({
   padFrom: number; // clip time where loop filler starts
   title: string;
   onClose: () => void;
-  onDrop?: (piece: number, edge: "start" | "end") => void; // remove a piece's first / last frame
+  onDrop?: (drops: { piece: number; start: number; end: number }[]) => void; // frames to cut off each piece's start / end
 }) {
   const [url, setUrl] = useState<string | null>(null);
   useEffect(() => {
@@ -39,6 +39,14 @@ export function ClipInspector({
   const [count, setCount] = useState(0);
   const [thumbs, setThumbs] = useState<string[]>([]);
   const [sel, setSel] = useState(0);
+  const [marked, setMarked] = useState<Set<number>>(new Set());
+  const toggleMark = (f: number) =>
+    setMarked((m) => {
+      const n = new Set(m);
+      if (n.has(f)) n.delete(f);
+      else n.add(f);
+      return n;
+    });
   const player = useRef<HTMLVideoElement>(null);
 
   // Decode every frame once into a small thumbnail.
@@ -81,10 +89,11 @@ export function ClipInspector({
       if (e.key === "Escape") onClose();
       if (e.key === "ArrowRight") setSel((s) => Math.min(count - 1, s + 1));
       if (e.key === "ArrowLeft") setSel((s) => Math.max(0, s - 1));
+      if (e.key === "d" || e.key === "D") toggleMark(sel);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose, count]);
+  }, [onClose, count, sel]);
 
   useEffect(() => {
     const v = player.current;
@@ -115,7 +124,8 @@ export function ClipInspector({
           <div className="flex-1">
             <h2 className="text-[20px] tracking-tight">Inspect · {title}</h2>
             <p className="text-muted text-[13px]">
-              This is the exact file that gets uploaded: {count || "…"} frames. Click any frame, or use ← → to step.
+              This is the exact file that gets uploaded: {count || "…"} frames. Click a frame (or ← →), press D to mark it for
+              drop, then drop them all at once.
             </p>
           </div>
           <button className="btn" onClick={onClose}>Close</button>
@@ -137,18 +147,38 @@ export function ClipInspector({
               <button className="btn flex-1" onClick={() => setSel((s) => Math.max(0, s - 1))}>‹ Frame</button>
               <button className="btn flex-1" onClick={() => setSel((s) => Math.min(count - 1, s + 1))}>Frame ›</button>
             </div>
-            {(() => {
-              if (!onDrop || cur.piece < 0) return null;
-              const pc = pieces[cur.piece];
-              const firstF = Math.round(pc.offset * fps);
-              const lastF = Math.round((pc.offset + (pc.end - pc.start)) * fps) - 1;
-              const edge = sel === firstF ? "start" : sel === lastF ? "end" : null;
-              return edge ? (
-                <button className="btn btn-on w-full" onClick={() => onDrop(cur.piece, edge)}>
-                  Drop this frame ({edge === "start" ? "first" : "last"} of piece {cur.piece + 1})
-                </button>
-              ) : (
-                <p className="text-faint text-[11px]">Only a piece&apos;s first or last frame can be dropped here; use Trim in Scenes for the rest.</p>
+            {onDrop && cur.piece >= 0 && (
+              <button className={`btn w-full ${marked.has(sel) ? "btn-on" : ""}`} onClick={() => toggleMark(sel)}>
+                {marked.has(sel) ? "Unmark (D)" : "Mark for drop (D)"}
+              </button>
+            )}
+            {onDrop && marked.size > 0 && (() => {
+              // Marked frames must run from a piece's first frame in, or from its last frame back.
+              const drops: { piece: number; start: number; end: number }[] = [];
+              let stray = 0;
+              pieces.forEach((pc, j) => {
+                const first = Math.round(pc.offset * fps);
+                const last = Math.round((pc.offset + (pc.end - pc.start)) * fps) - 1;
+                let a = 0;
+                while (marked.has(first + a) && first + a <= last) a++;
+                let b = 0;
+                while (marked.has(last - b) && last - b >= first + a) b++;
+                for (let f = first + a; f <= last - b; f++) if (marked.has(f)) stray++;
+                if (a || b) drops.push({ piece: j, start: a, end: b });
+              });
+              const total = drops.reduce((n, d) => n + d.start + d.end, 0);
+              return (
+                <div className="space-y-1.5 pt-1">
+                  {stray > 0 && (
+                    <p className="text-[11px] text-[#fcd34d]">
+                      {stray} marked frame{stray === 1 ? " is" : "s are"} in the middle of a piece. Only frames at a piece&apos;s start or end can be dropped here.
+                    </p>
+                  )}
+                  <button className="btn btn-on w-full" disabled={!total} onClick={() => onDrop(drops)}>
+                    Drop {total} frame{total === 1 ? "" : "s"} and rebuild
+                  </button>
+                  <button className="btn w-full" onClick={() => setMarked(new Set())}>Clear marks</button>
+                </div>
               );
             })()}
             {thumbs.length < count && <p className="text-faint text-[11px]">Reading frames… {thumbs.length}/{count}</p>}
@@ -174,6 +204,9 @@ export function ClipInspector({
                     {thumbs[f] && (
                       // eslint-disable-next-line @next/next/no-img-element
                       <img src={thumbs[f]} alt="" className="absolute inset-0 w-full h-full object-cover" />
+                    )}
+                    {marked.has(f) && (
+                      <span className="absolute inset-0 grid place-items-center bg-[rgba(220,38,38,0.45)] text-white text-[18px]">✕</span>
                     )}
                     <span className="absolute bottom-0 inset-x-0 text-[9px] leading-[13px] text-center bg-black/60 tabular-nums">{f}</span>
                   </button>

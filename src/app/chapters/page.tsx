@@ -971,22 +971,40 @@ export default function Chapters() {
     }
   }
 
-  // Remove the first or last frame of a piece by moving its shot's edge one frame in.
-  async function dropPieceFrame(part: Part, j: number, edge: "start" | "end") {
-    const pc = part.pieces[j];
-    const shot = p.shots.find((x) => x.id === pc.shotId);
+  // Cut frames off pieces' starts/ends by moving their shots' edges, rebuild the
+  // plan, and reopen Inspect on the rebuilt clip.
+  async function dropFrames(part: Part, drops: { piece: number; start: number; end: number }[]) {
     const tol = 0.6 / p.fps;
     const f = 1 / p.fps;
-    if (!shot) return;
     let st = { boundaries: p.boundaries, cuts: p.cuts ?? [] };
-    if (edge === "start" && Math.abs(shot.start - pc.start) < tol) st = moveEdge(st.boundaries, st.cuts, shot.start, shot.start + f, tol);
-    else if (edge === "end" && Math.abs(shot.end - pc.end) < tol) st = moveEdge(st.boundaries, st.cuts, shot.end, shot.end - f, tol);
-    else return setError("That frame is inside a shot (a long shot split across parts). Use Trim in Scenes.");
-    const next = { ...p, ...st };
-    const shots = buildShots(next);
-    update(() => ({ ...next, shots }));
+    let skipped = 0;
+    for (const d of drops) {
+      const pc = part.pieces[d.piece];
+      const shot = p.shots.find((x) => x.id === pc.shotId);
+      if (!shot) continue;
+      if (d.start) {
+        if (Math.abs(shot.start - pc.start) < tol) st = moveEdge(st.boundaries, st.cuts, shot.start, shot.start + d.start * f, tol);
+        else skipped += d.start;
+      }
+      if (d.end) {
+        if (Math.abs(shot.end - pc.end) < tol) st = moveEdge(st.boundaries, st.cuts, shot.end, shot.end - d.end * f, tol);
+        else skipped += d.end;
+      }
+    }
+    const next0 = { ...p, ...st };
+    const shots = buildShots(next0);
+    const next1 = { ...next0, shots };
+    const parts = plan(next1);
+    update(() => ({ ...next1, parts }));
     await refreshThumbs(shots);
-    flash("Frame dropped. The part was rebuilt; Inspect again.");
+    if (skipped) setError(`${skipped} frame(s) sit inside a long shot split across parts; use Trim in Scenes for those.`);
+    // Reopen on the rebuilt part that now covers the same footage.
+    const first = part.pieces[0];
+    const again = parts.find(
+      (x) => x.groupId === part.groupId && (x.status === "idle" || x.status === "failed") && x.pieces.some((pc) => pc.end > first.start && pc.start < first.end + 1),
+    );
+    flash(`Dropped ${drops.reduce((n, d) => n + d.start + d.end, 0) - skipped} frame(s).`);
+    if (again) void inspectPart(again);
   }
 
   async function checkParts(ids: string[]) {
@@ -1666,10 +1684,10 @@ export default function Chapters() {
           padFrom={inspecting.part.duration}
           title={`${p.groups.find((g) => g.id === inspecting.part.groupId)?.name ?? ""} · ${inspecting.part.pieces.length} pieces`}
           onClose={() => setInspecting(null)}
-          onDrop={(j, edge) => {
+          onDrop={(drops) => {
             const part = inspecting.part;
             setInspecting(null);
-            void dropPieceFrame(part, j, edge);
+            void dropFrames(part, drops);
           }}
         />
       )}
