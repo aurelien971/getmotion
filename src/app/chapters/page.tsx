@@ -6,6 +6,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CompositePlayer } from "@/components/CompositePlayer";
 import { EdgeEditor } from "@/components/EdgeEditor";
+import { FrameRow } from "@/components/FrameRow";
 import { FrameStrip } from "@/components/FrameStrip";
 import { RangePicker } from "@/components/RangePicker";
 import { ReelPlayer } from "@/components/ReelPlayer";
@@ -927,7 +928,9 @@ export default function Chapters() {
     try {
       const clip = await buildPartClip(part);
       const cuts = await detectCuts(clip, part.clipLength, undefined, 0.25);
-      const issues = findIssues(part, cuts, p.fps);
+      const issues = findIssues(part, cuts, p.fps).filter(
+        (is) => !(part.ignored ?? []).some((t) => Math.abs(t - is.at) <= 1.5 / p.fps),
+      );
       patchPart(part.id, { status: "idle", progress: undefined, issues, checkedKey: issues.length ? undefined : partKey(part) });
       return issues;
     } catch (e) {
@@ -946,18 +949,23 @@ export default function Chapters() {
   }
 
   // Trim slivers onto the neighbouring shot; split shots where a cut was missed.
-  async function fixIssues(part: Part) {
-    if (!part.issues?.length) return;
+  async function fixIssues(part: Part, only?: Issue[]) {
+    const list = only ?? part.issues ?? [];
+    if (!list.length) return;
     const tol = 0.6 / p.fps;
     let st = { boundaries: p.boundaries, cuts: p.cuts ?? [] };
-    for (const is of part.issues) {
+    for (const is of list) {
       const shot = p.shots.find((x) => x.id === is.shotId);
       if (!shot) continue;
       if (is.kind === "start") st = moveEdge(st.boundaries, st.cuts, shot.start, is.at, tol);
       else if (is.kind === "end") st = moveEdge(st.boundaries, st.cuts, shot.end, is.at, tol);
       else st = { ...st, cuts: [...new Set([...st.cuts, is.at])].sort((a, b) => a - b) };
     }
-    const next = { ...p, ...st };
+    const next = {
+      ...p,
+      ...st,
+      parts: p.parts.map((x) => (x.id === part.id ? { ...x, issues: (x.issues ?? []).filter((is) => !list.includes(is)) } : x)),
+    };
     const shots = buildShots(next);
     update(() => ({ ...next, shots }));
     await refreshThumbs(shots);
@@ -1445,7 +1453,18 @@ export default function Chapters() {
             onUseTake={useTake}
             onRedoShot={redoShot}
             onTrimPiece={(id, j) => setTrimmingRender({ partId: id, j })}
-            onFix={fixIssues}
+            onFix={(pt, only) => void fixIssues(pt, only)}
+            onIgnore={(pt, is) =>
+              update((x) => ({
+                ...x,
+                parts: x.parts.map((y) => {
+                  if (y.id !== pt.id) return y;
+                  const issues = (y.issues ?? []).filter((z) => z !== is);
+                  return { ...y, ignored: [...(y.ignored ?? []), is.at], issues, checkedKey: issues.length ? undefined : partKey(y) };
+                }),
+              }))
+            }
+            onTrimShot={setTrimming}
             onReject={(id, j, rejected) =>
               update((x) => ({
                 ...x,
@@ -2265,7 +2284,9 @@ function RenderStep(props: {
   onUseTake: (shot: { start: number; end: number }, partId: string, j: number) => void;
   onRedoShot: (shot: { start: number; end: number }) => void;
   onTrimPiece: (partId: string, piece: number) => void;
-  onFix: (part: Part) => void;
+  onFix: (part: Part, only?: Issue[]) => void;
+  onIgnore: (part: Part, issue: Issue) => void;
+  onTrimShot: (shotId: string) => void;
   onReject: (partId: string, piece: number, rejected: boolean) => void;
   onNext: () => void;
   onError: (m: string) => void;
@@ -2592,7 +2613,9 @@ function RenderStep(props: {
                 <PartRow
                   key={pt.id}
                   onCheck={() => props.onCheck([pt.id])}
-                  onFix={() => props.onFix(pt)}
+                  onFix={(only) => props.onFix(pt, only)}
+                  onIgnore={(is) => props.onIgnore(pt, is)}
+                  onTrimShot={props.onTrimShot}
                   onReject={(j, r) => props.onReject(pt.id, j, r)}
                   onTrim={(j) => props.onTrimPiece(pt.id, j)}
                   src={props.src}
@@ -3125,6 +3148,8 @@ function FaceTile({
 function PartRow({
   onCheck,
   onFix,
+  onIgnore,
+  onTrimShot,
   onReject,
   onTrim,
   src,
@@ -3138,7 +3163,9 @@ function PartRow({
   onRender,
 }: {
   onCheck: () => void;
-  onFix: () => void;
+  onFix: (only?: Issue[]) => void;
+  onIgnore: (issue: Issue) => void;
+  onTrimShot: (shotId: string) => void;
   onReject: (piece: number, rejected: boolean) => void;
   onTrim: (piece: number) => void;
   src: string;
@@ -3198,23 +3225,39 @@ function PartRow({
       </button>
       </div>
       {!!part.issues?.length && part.status !== "done" && (
-        <div className="rounded-xl bg-[rgba(252,211,77,0.08)] ring-1 ring-[rgba(252,211,77,0.3)] p-3 space-y-2">
+        <div className="rounded-xl bg-[rgba(252,211,77,0.06)] ring-1 ring-[rgba(252,211,77,0.3)] p-3 space-y-3">
           <div className="flex items-center gap-3">
-            <span className="text-[13px] flex-1">Frames from another scene in this clip</span>
-            <button className="btn btn-on h-8 px-3 text-[12px]" onClick={onFix}>Fix all</button>
+            <span className="text-[13px] flex-1">
+              Possible frames from another scene. Look at each one and decide; the yellow line is where a cut was detected.
+            </span>
+            {part.issues.length > 1 && (
+              <button className="btn h-8 px-3 text-[12px]" onClick={() => onFix()}>Fix all</button>
+            )}
           </div>
-          <ul className="text-[12px] text-muted space-y-0.5 tabular-nums">
-            {part.issues.map((is, k) => (
-              <li key={k}>
-                {fmt(is.at)} ·{" "}
+          {part.issues.map((is, k) => (
+            <div key={`${is.at}-${k}`} className="space-y-2 rounded-lg bg-black/30 p-2.5">
+              <div className="text-[12px] text-muted tabular-nums">
+                {fmt(is.at)} · f{Math.round(is.at * fps)} ·{" "}
                 {is.kind === "start"
-                  ? `${is.frames} frame${is.frames === 1 ? "" : "s"} at the start of a shot: trim onto the previous shot`
+                  ? `${is.frames} frame${is.frames === 1 ? "" : "s"} at the start of the shot look different`
                   : is.kind === "end"
-                    ? `${is.frames} frame${is.frames === 1 ? "" : "s"} at the end of a shot: trim onto the next shot`
-                    : "a cut inside a shot that wasn't marked: split the shot here"}
-              </li>
-            ))}
-          </ul>
+                    ? `${is.frames} frame${is.frames === 1 ? "" : "s"} at the end of the shot look different`
+                    : "a cut inside the shot that wasn't marked"}
+              </div>
+              <FrameRow src={src} fps={fps} cut={Math.round(is.at * fps)} />
+              <div className="flex flex-wrap gap-2">
+                <button className="btn btn-on h-8 px-3 text-[12px]" onClick={() => onFix([is])}>
+                  {is.kind === "mid" ? "Real cut: split here" : "Different scene: trim it off"}
+                </button>
+                <button className="btn h-8 px-3 text-[12px]" onClick={() => onIgnore(is)}>
+                  Same scene: ignore
+                </button>
+                <button className="btn h-8 px-3 text-[12px]" onClick={() => onTrimShot(is.shotId)}>
+                  Open trim
+                </button>
+              </div>
+            </div>
+          ))}
         </div>
       )}
       {open && part.status === "done" && part.resultUrl && (

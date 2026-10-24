@@ -163,6 +163,7 @@ export type Part = {
   rejected?: number[]; // piece indices marked Redo after review
   trims?: Record<number, { start: number; end: number }>; // kept source range of a piece after review
   reviewed?: number[]; // pieces confirmed in review ("Use this take")
+  ignored?: number[]; // source times of flagged cuts confirmed as false alarms
   unused?: number[]; // pieces parked because another take of the same footage is used
 };
 
