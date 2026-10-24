@@ -187,7 +187,9 @@ export default function Chapters() {
             });
             return { ...g, refs: [], refIds: [...(g.refIds ?? []), ...ids] };
           });
-          setP({ ...emptyProject(), ...meta, groups, library, source, prepared, output });
+          // A library with photos but no default: the first photo becomes the default.
+          const defaultRefs = meta.defaultRefs?.length ? meta.defaultRefs : library.length ? [library[0].id] : [];
+          setP({ ...emptyProject(), ...meta, groups, library, defaultRefs, source, prepared, output });
         }
       } catch {}
       setLoaded(true);
