@@ -7,6 +7,7 @@ import { MODELS, SAM2_VIDEO } from "@/lib/models";
 import { muxAudio, stitchVideos, trimVideo, warmUp } from "@/lib/trim";
 import { Trimmer } from "@/components/Trimmer";
 import { FrameStrip } from "@/components/FrameStrip";
+import { kv, type SavedSession } from "@/lib/store";
 
 fal.config({ proxyUrl: "/api/fal/proxy" });
 
@@ -131,6 +132,7 @@ export default function Home() {
     try { localStorage.setItem("getmotion.directed", v); } catch {}
   };
   const [directing, setDirecting] = useState(false);
+  const [restored, setRestored] = useState(false);
   const pasteTarget = useRef<"face" | "shot">("face");
 
   // Dev only: ?clip=/dev-long.mp4 loads a clip from /public for quick checks.
@@ -179,6 +181,63 @@ export default function Home() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   });
+
+  // Restore the last session (clip, faces, shots, frames, settings) from IndexedDB.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        if (new URLSearchParams(window.location.search).get("clip")) return;
+        const saved = await kv.get<SavedSession>("session");
+        if (cancelled || !saved) return;
+        if (saved.video) onVideo(new File([saved.video.blob], saved.video.name, { type: saved.video.type }));
+        setCast(saved.cast.map((c) => {
+          const file = new File([c.blob], c.name, { type: c.type });
+          return { file, preview: URL.createObjectURL(file), who: c.who };
+        }));
+        setShots(saved.shots.map((x) => ({ id: Date.now() + Math.random(), name: x.name, url: URL.createObjectURL(x.blob), blob: x.blob })));
+        setFrames(saved.frames.map((f) => ({ id: Date.now() + Math.random(), url: URL.createObjectURL(f.blob), blob: f.blob, frame: f.frame, time: f.time })));
+        if (MODELS.some((m) => m.id === saved.modelId)) setModelId(saved.modelId);
+        setPrompt(saved.prompt ?? "");
+        if (saved.maxLen) setMaxLen(saved.maxLen);
+      } catch {
+        /* no saved session */
+      } finally {
+        if (!cancelled) setRestored(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Save the session whenever its parts change (debounced).
+  useEffect(() => {
+    if (!restored) return;
+    const t = setTimeout(() => {
+      const data: SavedSession = {
+        video: videoFile ? { blob: videoFile, name: videoFile.name, type: videoFile.type } : undefined,
+        cast: cast.map((c) => ({ blob: c.file, name: c.file.name, type: c.file.type, who: c.who })),
+        shots: shots.map((x) => ({ blob: x.blob, name: x.name })),
+        frames: frames.map((f) => ({ blob: f.blob, frame: f.frame, time: f.time })),
+        modelId,
+        prompt,
+        maxLen,
+        savedAt: Date.now(),
+      };
+      kv.set("session", data).catch(() => {});
+    }, 600);
+    return () => clearTimeout(t);
+  }, [restored, videoFile, cast, shots, frames, modelId, prompt, maxLen]);
+
+  async function resetSession() {
+    await kv.clear().catch(() => {});
+    try {
+      localStorage.removeItem("getmotion.directed");
+      localStorage.removeItem("getmotion.notes");
+    } catch {}
+    window.location.reload();
+  }
 
   function addPastedImage(f: File) {
     if (pasteTarget.current === "shot") addShot(f.name || "pasted.png", f);
@@ -635,6 +694,11 @@ export default function Home() {
           <Image src="/logo.png" alt="getmotion.art" width={1700} height={290} priority className="h-[22px] w-auto" />
         </h1>
         <div className="flex items-center gap-4">
+          {(localVideo || cast.length > 0 || shots.length > 0) && (
+            <button className="btn h-8 px-3 text-[12px] text-muted" onClick={resetSession} title="Clear the saved session">
+              New session
+            </button>
+          )}
           {busy && (
             <p className="text-muted text-[13px] inline-flex items-center gap-2">
               <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
