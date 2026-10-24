@@ -36,6 +36,7 @@ export function EdgeEditor({ src, fps, duration, start, end, title, onSave, onCl
 
   useEffect(() => {
     const v = document.createElement("video");
+    v.crossOrigin = "anonymous"; // remote renders (fal) allow it; needed to read frames
     v.src = src;
     v.muted = true;
     v.playsInline = true;

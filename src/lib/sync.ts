@@ -11,6 +11,7 @@ type Reader = {
 
 export async function openReader(src: string, fps: number): Promise<Reader> {
   const v = document.createElement("video");
+  v.crossOrigin = "anonymous"; // remote renders (fal) allow it; needed to read frames
   v.src = src;
   v.muted = true;
   v.playsInline = true;

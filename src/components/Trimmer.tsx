@@ -25,6 +25,7 @@ export function Trimmer({ src, duration, time, maxLen, range, onRange, onSeek }:
   useEffect(() => {
     let cancelled = false;
     const v = document.createElement("video");
+    v.crossOrigin = "anonymous"; // remote renders (fal) allow it; needed to read frames
     v.src = src;
     v.muted = true;
     v.playsInline = true;

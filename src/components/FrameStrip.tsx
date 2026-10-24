@@ -33,6 +33,7 @@ export function FrameStrip({ src, fps, duration, time, range, step, onSeek }: Pr
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setThumbs(new Map());
     const v = document.createElement("video");
+    v.crossOrigin = "anonymous"; // remote renders (fal) allow it; needed to read frames
     v.src = src;
     v.muted = true;
     v.playsInline = true;
