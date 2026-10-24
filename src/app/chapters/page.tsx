@@ -1794,6 +1794,7 @@ export default function Chapters() {
             onUseTake={useTake}
             onDeleteTake={deleteTake}
             onDeletePart={deletePart}
+            onAccept={(gid, xs) => patchGroup(gid, { accepted: [...(p.groups.find((g) => g.id === gid)?.accepted ?? []), ...xs] })}
             onRedoShot={redoShot}
             onTrimPiece={(id, j) => setTrimmingRender({ partId: id, j })}
             onFix={(pt, only) => void fixIssues(pt, only)}
@@ -2732,6 +2733,7 @@ function RenderStep(props: {
   onUseTake: (shot: { start: number; end: number }, partId: string, j: number) => void;
   onDeleteTake: (shot: { start: number; end: number }, partId: string, j: number) => void;
   onDeletePart: (partId: string) => void;
+  onAccept: (groupId: string, xs: { start: number; end: number }[]) => void;
   onRedoShot: (shot: { start: number; end: number }) => void;
   onTrimPiece: (partId: string, piece: number) => void;
   onFix: (part: Part, only?: Issue[]) => void;
@@ -2973,11 +2975,22 @@ function RenderStep(props: {
                   </span>
                 ) : (
                   <span className="text-[12px] text-muted">
-                    {fmtShort(left)} not rendered yet{failed ? ` · ${failed} failed` : ""}
+                    {left < 0.5 ? `${Math.round(left * p.fps)} frames` : fmtShort(left)} not rendered yet{failed ? ` · ${failed} failed` : ""}
                   </span>
                 )}
                 <span className={`text-muted transition-transform ${isOpen ? "rotate-90" : ""}`}>›</span>
               </button>
+              {!doneAll && !running && (
+                <div className="flex justify-end mt-2">
+                  <button
+                    className="btn h-8 px-3 text-[12px]"
+                    title="Count the leftover footage as done without rendering it (the original stays there)"
+                    onClick={() => props.onAccept(g.id, pendingFor(p, g.id).map(({ start, end }) => ({ start, end })))}
+                  >
+                    Validate as rendered
+                  </button>
+                </div>
+              )}
               {isOpen && <p className="text-muted text-[13px] mt-2 pl-6">{g.description}</p>}
             </header>
             {isOpen && (<>

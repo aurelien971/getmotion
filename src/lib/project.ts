@@ -27,6 +27,7 @@ export type ScenePrompt = {
 
 export type Group = {
   partPrompts?: Record<string, ScenePrompt>; // by partKey
+  accepted?: Interval[]; // leftover footage the user validated as fine without a render
   id: string;
   name: string;
   description: string;
@@ -489,11 +490,13 @@ export const clipTo = (xs: Interval[], r: Interval) =>
 // What still needs rendering for one look inside the span, as shot pieces.
 export function pending(p: Project, groupId: string): { shotId: string; start: number; end: number }[] {
   const range = p.range ?? { start: 0, end: p.duration };
-  const done = covered(p, groupId);
+  const accepted = p.groups.find((g) => g.id === groupId)?.accepted ?? [];
+  const done = merge([...covered(p, groupId), ...accepted]);
   const out: { shotId: string; start: number; end: number }[] = [];
   for (const s of p.shots.filter((x) => x.groupId === groupId).sort((a, b) => a.start - b.start)) {
     for (const piece of subtract(clipTo([{ start: s.start, end: s.end }], range), done)) {
-      if (piece.end - piece.start >= 1 / p.fps) out.push({ shotId: s.id, ...piece });
+      // 1-2 frame slivers (left by trims) are held over at assembly, never rendered.
+      if (piece.end - piece.start > 2.5 / p.fps) out.push({ shotId: s.id, ...piece });
     }
   }
   return out;
