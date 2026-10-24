@@ -9,6 +9,7 @@ import { transcodeInBrowser } from "@/lib/transcode";
 import { Trimmer } from "@/components/Trimmer";
 import { FrameStrip } from "@/components/FrameStrip";
 import { kv, type SavedSession } from "@/lib/store";
+import { loadJobs, removeJob, submitFal, submitSume, waitFor, type PendingJob } from "@/lib/jobs";
 
 fal.config({ proxyUrl: "/api/fal/proxy" });
 
@@ -30,35 +31,6 @@ function loadHistory(): Result[] {
   }
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-// Submit to Sume through our server routes and poll until done; returns the video URL.
-async function runSume(model: string, input: Record<string, unknown>, onStatus: (s: string) => void) {
-  const sub = await fetch("/api/sume/generate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, ...input }),
-  }).then((r) => r.json());
-  const id = sub.request_id ?? sub.id ?? sub.job_id;
-  if (!id) throw new Error(`Sume: ${JSON.stringify(sub)}`);
-  let wait = (sub.next_poll_after_seconds ?? 5) * 1000;
-  for (;;) {
-    await sleep(wait);
-    const st = await fetch(`/api/sume/job/${id}?part=status`).then((r) => r.json());
-    const status = st.sume_status ?? st.status;
-    onStatus(String(status));
-    if (st.terminal || ["completed", "failed", "canceled"].includes(status)) {
-      if (status !== "completed") throw new Error(`Sume job ${status}: ${JSON.stringify(st)}`);
-      break;
-    }
-    wait = (st.next_poll_after_seconds ?? 5) * 1000;
-  }
-  const res = await fetch(`/api/sume/job/${id}?part=result`).then((r) => r.json());
-  const url = (res.result ?? res).artifacts?.find((a: { url: string }) => a.url)?.url;
-  if (!url) throw new Error(`Sume result: ${JSON.stringify(res)}`);
-  return url as string;
-}
-
 // fal's ApiError hides the useful part in .body; pull it out.
 function describeError(e: unknown): string {
   if (e && typeof e === "object") {
@@ -77,6 +49,11 @@ function describeError(e: unknown): string {
   }
   return String(e);
 }
+
+const fmtElapsed = (ms: number) => {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+};
 
 const fmtTime = (s: number) => {
   const m = Math.floor(s / 60);
@@ -111,8 +88,18 @@ export default function Home() {
   const [prompt, setPrompt] = useState("");
   const [modelId, setModelId] = useState(MODELS[0].id);
 
-  const [busy, setBusy] = useState<string | null>(null);
+  const [busy, setBusyState] = useState<string | null>(null);
+  const setBusy = (v: string | null) => {
+    setBusyState(v);
+    setBusyPct(null);
+    if (!v) setBusySince(null);
+    else setBusySince((t) => t ?? Date.now());
+  };
   const [log, setLog] = useState<string>("");
+  const [busyPct, setBusyPct] = useState<number | null>(null);
+  const [busySince, setBusySince] = useState<number | null>(null);
+  const [now, setNow] = useState(0);
+  const [jobs, setJobs] = useState<PendingJob[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<Result[]>([]);
   const [stitch, setStitch] = useState<StitchItem[]>([]);
@@ -187,6 +174,60 @@ export default function Home() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   });
+
+  useEffect(() => {
+    if (!busySince) return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [busySince]);
+
+  // Finish a submitted job: wait, then store the take. Shared by generate() and resume.
+  async function finishJob(job: PendingJob, sourceFile: File | null) {
+    const out = await waitFor(job, setLog);
+    removeJob(job.requestId);
+    setJobs(loadJobs());
+    const take: Result = { url: out, model: job.model, at: job.at };
+    setHistory((h) => {
+      const next = [take, ...h.filter((r) => r.at !== job.at)];
+      try {
+        localStorage.setItem(HISTORY_KEY, JSON.stringify(next.map((r) => ({ url: r.url, model: r.model, at: r.at }))));
+      } catch {}
+      return next;
+    });
+    const m = MODELS.find((x) => x.id === job.endpoint);
+    if (m && !m.keepsAudio && sourceFile) {
+      try {
+        setBusy("Adding the original audio");
+        const silent = await fetch(out).then((r) => r.blob());
+        const localUrl = URL.createObjectURL(await muxAudio(silent, sourceFile));
+        setHistory((h) => h.map((r) => (r.at === take.at ? { ...r, localUrl } : r)));
+      } catch (e) {
+        setError(`Video saved (silent). Adding audio failed: ${String(e)}`);
+      }
+    }
+  }
+
+  // Resume renders that were running when the page was closed or lost its connection.
+  useEffect(() => {
+    const pending = loadJobs();
+    if (!pending.length) return;
+    (async () => {
+      setJobs(pending);
+      for (const job of pending) {
+        setBusy(`Resuming ${job.model}`);
+        try {
+          await finishJob(job, null);
+        } catch (e) {
+          setError(describeError(e));
+          if (!/network|fetch|gave up/i.test(String(e))) removeJob(job.requestId);
+          setJobs(loadJobs());
+        }
+      }
+      setBusy(null);
+      setLog("");
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Restore the last session (clip, faces, shots, frames, settings) from IndexedDB.
   useEffect(() => {
@@ -493,7 +534,7 @@ export default function Home() {
         v.onerror = () => rej(new Error("Could not read the first clip"));
         v.src = stitch[0].url;
       });
-      const out = await stitchVideos(blobs, size, (p) => setLog(`${Math.round(p * 100)}%`));
+      const out = await stitchVideos(blobs, size, (p) => { setLog(`${Math.round(p * 100)}%`); setBusyPct(p); });
       const localUrl = URL.createObjectURL(out);
       setHistory((h) => [{ url: localUrl, model: `Stitched ${stitch.length} clips`, at: Date.now(), localUrl }, ...h]);
       setStitch([]);
@@ -514,6 +555,7 @@ export default function Home() {
     const report = (p: number) => {
       const pct = `${Math.round(p * 100)}%`;
       setLog(pct);
+      setBusyPct(p);
       setCutStage(`${stage} ${pct}`);
     };
     let cut: File;
@@ -615,7 +657,7 @@ export default function Home() {
     const codec = await probeVideoCodec(file).catch(() => null);
     if (!codec || FAL_OK.has(codec)) return file;
     setBusy(`Converting ${codec.toUpperCase()} clip to H.264 (real time)`);
-    const out = await transcodeInBrowser(file, (p) => setLog(`${Math.round(p * 100)}%`));
+    const out = await transcodeInBrowser(file, (p) => { setLog(`${Math.round(p * 100)}%`); setBusyPct(p); });
     setLog("");
     onVideo(out);
     return out;
@@ -680,7 +722,7 @@ export default function Home() {
       const castUrls = await Promise.all(
         slots.map(async (c) => ({ url: await fal.storage.upload(c.file), who: c.who })),
       );
-      setBusy(`Rendering with ${model.name}`);
+      setBusy(`Submitting to ${model.name}`);
       const input = model.build({
         videoUrl: url,
         maskUrl,
@@ -690,43 +732,13 @@ export default function Home() {
         duration: len,
         side: side(),
       });
-      let out: string;
-      if (model.provider === "sume") {
-        out = await runSume(model.id, input, setLog);
-      } else {
-        const res = await fal.subscribe(model.id, {
-          input,
-          logs: true,
-          onQueueUpdate: (u) => {
-            const last = "logs" in u && u.logs?.length ? u.logs[u.logs.length - 1].message : "";
-            setLog(`${u.status} ${last}`);
-          },
-        });
-        out = (res.data as { video: { url: string } }).video.url;
-      }
-      // Save the paid result the moment it exists, before any post-processing.
-      const take: Result = { url: out, model: model.name, at: Date.now() };
-      const persist = (list: Result[]) => {
-        try {
-          // Blob URLs don't survive a reload; keep only the provider URL.
-          localStorage.setItem(HISTORY_KEY, JSON.stringify(list.map((r) => ({ url: r.url, model: r.model, at: r.at }))));
-        } catch {}
-      };
-      setHistory((h) => {
-        const next = [take, ...h];
-        persist(next);
-        return next;
-      });
-      if (!model.keepsAudio) {
-        try {
-          setBusy("Adding the original audio");
-          const silent = await fetch(out).then((r) => r.blob());
-          const localUrl = URL.createObjectURL(await muxAudio(silent, file));
-          setHistory((h) => h.map((r) => (r.at === take.at ? { ...r, localUrl } : r)));
-        } catch (e) {
-          setError(`Video saved (silent). Adding audio failed: ${String(e)}`);
-        }
-      }
+      const job =
+        model.provider === "sume"
+          ? await submitSume(model.id, model.name, input)
+          : await submitFal(model.id, model.name, input);
+      setJobs(loadJobs());
+      setBusy(`Rendering with ${model.name}`);
+      await finishJob(job, file);
     } catch (e) {
       setError(describeError(e));
     } finally {
@@ -792,13 +804,7 @@ export default function Home() {
               New session
             </button>
           )}
-          {busy && (
-            <p className="text-muted text-[13px] inline-flex items-center gap-2">
-              <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
-              {busy}
-              {log && <span className="text-faint tabular-nums">{log}</span>}
-            </p>
-          )}
+
           {localVideo && (
             <div className="seg glass" aria-label="Grab a frame into the library">
               <span className="px-2 text-faint text-[12px]">Grab frame</span>
@@ -1404,6 +1410,39 @@ export default function Home() {
         </aside>
         )}
       </main>
+
+      {(busy || jobs.length > 0) && (
+        <div className="fixed bottom-5 right-5 z-40 w-[340px] glass rounded-2xl p-4 space-y-3">
+          {busy ? (
+            <>
+              <div className="flex items-baseline justify-between gap-3">
+                <span className="text-[14px] font-medium">{busy}</span>
+                <span className="text-faint text-[12px] tabular-nums">
+                  {busySince ? fmtElapsed((now || Date.now()) - busySince) : ""}
+                </span>
+              </div>
+              <div className="h-1 rounded-full bg-white/10 overflow-hidden relative">
+                {busyPct !== null ? (
+                  <div className="h-full bg-white transition-[width] duration-200" style={{ width: `${Math.round(busyPct * 100)}%` }} />
+                ) : (
+                  <div className="sweep absolute inset-0" />
+                )}
+              </div>
+              <p className="text-muted text-[12px] truncate">
+                {busyPct !== null ? `${Math.round(busyPct * 100)}%` : log || "Working"}
+              </p>
+              <p className="text-faint text-[11px]">Safe to keep this tab open. If the connection drops, it reconnects and the render is saved.</p>
+            </>
+          ) : (
+            <>
+              <span className="text-[14px] font-medium">Unfinished renders</span>
+              {jobs.map((j) => (
+                <p key={j.requestId} className="text-muted text-[12px] truncate">{j.model} · {new Date(j.at).toLocaleTimeString()}</p>
+              ))}
+            </>
+          )}
+        </div>
+      )}
 
       {zoomed && <Lightbox frame={zoomed} onClose={() => setZoomed(null)} onSave={() => saveFrame(zoomed)} />}
     </div>
