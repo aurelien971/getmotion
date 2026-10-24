@@ -15,6 +15,8 @@ type Result = { url: string; model: string; at: number; localUrl?: string };
 type CastSlot = { file: File; preview: string; who: string };
 type StitchItem = { id: number; name: string; url: string };
 type Frame = { id: number; url: string; blob: Blob; frame: number; time: number };
+type Shot = { id: number; name: string; url: string; blob: Blob };
+type Direction = { prompt: string; target: string; shots: string[]; warnings: string[] };
 
 const HISTORY_KEY = "getmotion.history";
 
@@ -97,6 +99,11 @@ export default function Home() {
   const [cutStage, setCutStage] = useState<string | null>(null);
   const [zoomed, setZoomed] = useState<Frame | null>(null);
   const [stripStep, setStripStep] = useState(1); // frames per thumbnail in the frame strip
+  const [shots, setShots] = useState<Shot[]>([]);
+  const [notes, setNotes] = useState("");
+  const [direction, setDirection] = useState<Direction | null>(null);
+  const [directed, setDirected] = useState("");
+  const [directing, setDirecting] = useState(false);
 
   // Dev only: ?clip=/dev-long.mp4 loads a clip from /public for quick checks.
   useEffect(() => {
@@ -229,6 +236,47 @@ export default function Home() {
     a.href = f.url;
     a.download = `frame-${String(f.frame).padStart(5, "0")}-${f.time.toFixed(3)}s.png`;
     a.click();
+  }
+
+  function addShot(name: string, blob: Blob) {
+    setShots((s) => (s.length >= 8 ? s : [...s, { id: Date.now() + Math.random(), name, url: URL.createObjectURL(blob), blob }]));
+  }
+
+  // Downscale so eight screenshots don't become a 40 MB request.
+  async function shrink(b: Blob, max = 1280): Promise<string> {
+    const bmp = await createImageBitmap(b);
+    const k = Math.min(1, max / Math.max(bmp.width, bmp.height));
+    const c = document.createElement("canvas");
+    c.width = Math.round(bmp.width * k);
+    c.height = Math.round(bmp.height * k);
+    c.getContext("2d")!.drawImage(bmp, 0, 0, c.width, c.height);
+    return c.toDataURL("image/jpeg", 0.85);
+  }
+
+  async function direct() {
+    setError(null);
+    setDirecting(true);
+    try {
+      const body = {
+        targets: await Promise.all(shots.map(async (x) => ({ name: x.name, dataUrl: await shrink(x.blob) }))),
+        faces: await Promise.all(cast.map(async (c) => ({ name: c.file.name, dataUrl: await shrink(c.file) }))),
+        notes,
+        model: model.name,
+      };
+      const res = await fetch("/api/direct", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? res.statusText);
+      setDirection(json);
+      setDirected(json.prompt ?? "");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setDirecting(false);
+    }
   }
 
   function frameToCast(f: Frame) {
@@ -427,6 +475,7 @@ export default function Home() {
         maskUrl,
         cast: castUrls,
         prompt,
+        directed,
         duration: len,
         side: side(),
       });
@@ -784,6 +833,9 @@ export default function Home() {
                     <figcaption className="text-[12px] text-muted flex justify-between items-center gap-2">
                       <span className="tabular-nums">f{f.frame} · {f.time.toFixed(2)}s</span>
                       <span className="flex gap-1.5">
+                        <button className="btn h-7 px-2.5 text-[12px]" onClick={() => addShot(`frame-${f.frame}.png`, f.blob)}>
+                          Target shot
+                        </button>
                         <button className="btn h-7 px-2.5 text-[12px]" onClick={() => frameToCast(f)}>
                           Use as face
                         </button>
@@ -943,6 +995,82 @@ export default function Home() {
             </div>
 
             <div className="space-y-3">
+              <div className="flex items-baseline justify-between">
+                <h2 className="text-[15px]">Director</h2>
+                <span className="text-faint text-[12px]">Claude writes the prompt</span>
+              </div>
+              <p className="text-faint text-[12px] leading-relaxed">
+                Add screenshots of the person to replace across the clip&apos;s shots (grab frames above, or
+                upload). Add the faces in Cast. Say what to keep.
+              </p>
+              {shots.length > 0 && (
+                <div className="grid grid-cols-4 gap-1.5">
+                  {shots.map((x, i) => (
+                    <div key={x.id} className="relative group">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={x.url} alt="" className="w-full aspect-video object-cover rounded-md ring-1 ring-hair" />
+                      <span className="absolute left-1 bottom-1 text-[10px] bg-black/60 rounded px-1 tabular-nums">{i + 1}</span>
+                      <button
+                        className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-white text-black text-[11px] leading-5 opacity-0 group-hover:opacity-100"
+                        aria-label="Remove shot"
+                        onClick={() => setShots((s) => s.filter((y) => y.id !== x.id))}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <label className="btn cursor-pointer">
+                {shots.length ? "Add more shots" : "Add target shots"}
+                <input
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  className="hidden"
+                  onChange={(e) => {
+                    Array.from(e.target.files ?? []).forEach((f) => addShot(f.name, f));
+                    e.target.value = "";
+                  }}
+                />
+              </label>
+              <textarea
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                placeholder="Keep his full suit and the sunglasses in the shots where he wears them. Replace only the rapper, not the hype man."
+                className="field text-[13px] resize-none"
+                rows={3}
+              />
+              <button
+                className="btn btn-on w-full"
+                disabled={directing || shots.length === 0 || cast.length === 0}
+                onClick={direct}
+              >
+                {directing ? "Writing prompt…" : "Write the prompt"}
+              </button>
+              {direction && (
+                <div className="space-y-2">
+                  {direction.target && <p className="text-muted text-[12px]">Target: {direction.target}</p>}
+                  <textarea
+                    value={directed}
+                    onChange={(e) => setDirected(e.target.value)}
+                    className="field text-[13px] leading-relaxed"
+                    rows={8}
+                  />
+                  {direction.warnings?.length > 0 && (
+                    <ul className="text-[12px] text-muted list-disc pl-4 space-y-0.5">
+                      {direction.warnings.map((w, i) => <li key={i}>{w}</li>)}
+                    </ul>
+                  )}
+                  <div className="flex items-center justify-between">
+                    <span className="text-faint text-[12px]">{directed.trim() ? "This prompt will be sent as is." : "Empty: falls back to Cast descriptions."}</span>
+                    <button className="btn" onClick={() => { setDirected(""); setDirection(null); }}>Discard</button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-3">
               <h2 className="text-[15px]">Twist</h2>
               <textarea
                 value={prompt}
@@ -986,7 +1114,7 @@ export default function Home() {
               {sendLen > 0 && <span className="opacity-60 font-medium tabular-nums">${cost}</span>}
             </button>
             <p className="text-faint text-[12px] text-center h-4">
-              {missing ?? `${sendLen.toFixed(1)}s · ${model.name}${mode === "trim" ? " · cuts first" : ""}`}
+              {missing ?? `${sendLen.toFixed(1)}s · ${model.name}${directed.trim() ? " · directed prompt" : ""}`}
             </p>
           </div>
         </aside>

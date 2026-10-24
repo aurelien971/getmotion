@@ -7,6 +7,7 @@ export type GenInput = {
   maskUrl: string | null;
   cast: Cast[];
   prompt: string;
+  directed?: string; // full prompt written by the Director; used verbatim when present
   duration: number;
   side: "left" | "center" | "right";
 };
@@ -27,6 +28,7 @@ const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, M
 
 // "Reference image 1 replaces the man in the striped shirt on the left. ..."
 function castPrompt(i: GenInput) {
+  if (i.directed?.trim()) return i.directed.trim();
   const lines = i.cast.map((c, n) =>
     `Reference image ${n + 1} replaces ${c.who.trim() || `the person on the ${i.side}`}.`,
   );
@@ -48,7 +50,7 @@ export const MODELS: Model[] = [
       video_url: i.videoUrl,
       mask_video_url: i.maskUrl,
       ref_image_urls: [i.cast[0].url],
-      prompt: i.prompt || "the person from the reference image",
+      prompt: i.directed?.trim() || i.prompt || "the person from the reference image",
       frames_per_second: 16,
       num_frames: clamp(i.duration * 16, 81, 241),
       resolution: "480p",
