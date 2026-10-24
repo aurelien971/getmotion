@@ -176,6 +176,7 @@ export type Part = {
   issues?: Issue[]; // stray footage found by the pre-flight check
   checkedKey?: string; // pieces the last clean check was for
   rejected?: number[]; // piece indices marked Redo after review
+  deleted?: number[]; // takes deleted as failed renders: gone from review, footage counts as unrendered
   trims?: Record<number, { start: number; end: number }>; // kept source range of a piece after review
   reviewed?: number[]; // pieces confirmed in review ("Use this take")
   ignored?: number[]; // source times of flagged cuts confirmed as false alarms
@@ -183,7 +184,7 @@ export type Part = {
 };
 
 // A piece counts toward the video unless it was redone or parked for another take.
-export const pieceLive = (pt: Part, j: number) => !pt.rejected?.includes(j) && !pt.unused?.includes(j);
+export const pieceLive = (pt: Part, j: number) => !pt.rejected?.includes(j) && !pt.unused?.includes(j) && !pt.deleted?.includes(j);
 
 export type Take = { part: Part; j: number; range: Interval; at: number; live: boolean; reviewed: boolean; rejected: boolean };
 
@@ -193,6 +194,7 @@ export function takesFor(p: Project, r: Interval): Take[] {
   for (const pt of p.parts) {
     if (pt.status !== "done" || !pt.resultUrl) continue;
     pt.pieces.forEach((_, j) => {
+      if (pt.deleted?.includes(j)) return;
       const k = keptRange(pt, j);
       if (k.end <= r.start + 1e-3 || k.start >= r.end - 1e-3) return;
       out.push({

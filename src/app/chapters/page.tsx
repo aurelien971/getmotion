@@ -912,6 +912,37 @@ export default function Chapters() {
     }
   }
 
+  // Delete a failed take: it leaves review, and if nothing else covers the shot it
+  // counts as unrendered again. A render with every take deleted is removed.
+  function deleteTake(shotRange: { start: number; end: number }, partId: string, j: number) {
+    update((x) => {
+      let parts = x.parts.map((pt) =>
+        pt.id === partId
+          ? {
+              ...pt,
+              deleted: [...new Set([...(pt.deleted ?? []), j])],
+              reviewed: (pt.reviewed ?? []).filter((k) => k !== j),
+              unused: (pt.unused ?? []).filter((k) => k !== j),
+            }
+          : pt,
+      );
+      parts = parts.filter((pt) => !(pt.status === "done" && pt.pieces.every((_, k) => pt.deleted?.includes(k))));
+      // If the deleted take was the one in use, bring back the newest remaining take.
+      const rest = takesFor({ ...x, parts }, shotRange).filter((t) => !t.rejected);
+      if (rest.length && !rest.some((t) => t.live)) {
+        const back = rest[rest.length - 1];
+        parts = parts.map((pt) => (pt.id === back.part.id ? { ...pt, unused: (pt.unused ?? []).filter((k) => k !== back.j) } : pt));
+      }
+      return { ...x, parts };
+    });
+  }
+  function deletePart(partId: string) {
+    const pt = p.parts.find((x) => x.id === partId);
+    if (!pt) return;
+    if (pt.status === "done" && !confirm("Delete this render and all its takes? Its shots will show as not rendered.")) return;
+    update((x) => ({ ...x, parts: x.parts.filter((y) => y.id !== partId) }));
+  }
+
   // Review decisions. Using a take parks every other take of the same shot (kept, not
   // deleted); Redo marks all of them unwanted so the shot is queued again.
   function useTake(shotRange: { start: number; end: number }, partId: string, j: number) {
@@ -1360,7 +1391,7 @@ export default function Chapters() {
   // What's already covered: finished/running renders with their trims and redos.
   const coverKey = p.parts
     .filter((x) => x.status !== "idle" && x.status !== "failed")
-    .map((x) => `${x.id}:${x.status}:${JSON.stringify(x.trims ?? {})}:${(x.rejected ?? []).join(",")}:${(x.unused ?? []).join(",")}`)
+    .map((x) => `${x.id}:${x.status}:${JSON.stringify(x.trims ?? {})}:${(x.rejected ?? []).join(",")}:${(x.unused ?? []).join(",")}:${(x.deleted ?? []).join(",")}`)
     .join("|");
   useEffect(() => {
     if (!loaded || !p.groups.length) return;
@@ -1761,6 +1792,8 @@ export default function Chapters() {
             zipBusy={!!tasks.zip}
             onInspect={(pt) => void inspectPart(pt)}
             onUseTake={useTake}
+            onDeleteTake={deleteTake}
+            onDeletePart={deletePart}
             onRedoShot={redoShot}
             onTrimPiece={(id, j) => setTrimmingRender({ partId: id, j })}
             onFix={(pt, only) => void fixIssues(pt, only)}
@@ -2697,6 +2730,8 @@ function RenderStep(props: {
   zipBusy: boolean;
   onInspect: (part: Part) => void;
   onUseTake: (shot: { start: number; end: number }, partId: string, j: number) => void;
+  onDeleteTake: (shot: { start: number; end: number }, partId: string, j: number) => void;
+  onDeletePart: (partId: string) => void;
   onRedoShot: (shot: { start: number; end: number }) => void;
   onTrimPiece: (partId: string, piece: number) => void;
   onFix: (part: Part, only?: Issue[]) => void;
@@ -2848,6 +2883,7 @@ function RenderStep(props: {
         p={p}
         range={range}
         onUse={props.onUseTake}
+        onDelete={props.onDeleteTake}
         onRedo={props.onRedoShot}
         onTrim={(partId, j) => props.onTrimPiece(partId, j)}
       />
@@ -2912,8 +2948,8 @@ function RenderStep(props: {
         const model = RENDER_MODELS.find((m) => m.id === g.modelId) ?? RENDER_MODELS[0];
         const writing = !!props.tasks[`prompt-${g.id}`];
         const running = parts.some((x) => x.status === "building" || x.status === "uploading" || x.status === "rendering");
-        const doneAll = left <= 0.01 && !running;
-        const ready = parts.filter((x) => x.status === "idle" || x.status === "failed").length;
+        const doneAll = left < 1 / p.fps && !running; // slivers under a frame don't count
+        const failed = parts.filter((x) => x.status === "failed").length;
         const isOpen = openLooks[g.id] ?? !doneAll;
         return (
           <section key={g.id} className={`glass rounded-3xl ${isOpen ? "p-5 space-y-5" : "px-5 py-3.5"}`}>
@@ -2937,7 +2973,7 @@ function RenderStep(props: {
                   </span>
                 ) : (
                   <span className="text-[12px] text-muted">
-                    {fmtShort(left)} to render{ready ? ` · ${ready} part${ready === 1 ? "" : "s"} ready` : ""}
+                    {fmtShort(left)} not rendered yet{failed ? ` · ${failed} failed` : ""}
                   </span>
                 )}
                 <span className={`text-muted transition-transform ${isOpen ? "rotate-90" : ""}`}>›</span>
@@ -3085,6 +3121,7 @@ function RenderStep(props: {
                   scenePrompt={g.partPrompts?.[partKey(pt)]}
                   writing={props.writing.has(pt.id)}
                   onWritePrompt={() => props.onWritePrompt(pt)}
+                  onDelete={() => props.onDeletePart(pt.id)}
                   onEditPrompt={(t) => props.onEditPrompt(pt, t)}
                 />
               ))}
@@ -3279,14 +3316,17 @@ function ReviewPanel({
   onUse,
   onRedo,
   onTrim,
+  onDelete,
 }: {
   p: Project;
   range: { start: number; end: number };
+  onDelete: (shot: { start: number; end: number }, partId: string, j: number) => void;
   onUse: (shot: { start: number; end: number }, partId: string, j: number) => void;
   onRedo: (shot: { start: number; end: number }) => void;
   onTrim: (partId: string, j: number) => void;
 }) {
   const [open, setOpen] = useState<string | null>(null);
+  const [tab, setTab] = useState<"review" | "done" | "queued">("review");
   const [playing, setPlaying] = useState<{ shot: string; take: string } | null>(null);
   const rows = p.shots
     .filter((s) => s.groupId && s.end > range.start + 1e-3 && s.start < range.end - 1e-3)
@@ -3313,6 +3353,13 @@ function ReviewPanel({
   };
   const label: Record<ShotState, string> = { done: "Reviewed", review: "To review", missing: "Needs a render", queued: "Rendering" };
   const nextUp = rows.find((x) => x.state === "review");
+  const use = (x: (typeof rows)[number], partId: string, j: number) => {
+    onUse(x.r, partId, j);
+    // It moves to Reviewed; open the next shot still to review.
+    const next = rows.find((y) => y.state === "review" && y.shot.id !== x.shot.id && y.r.start > x.r.start) ?? rows.find((y) => y.state === "review" && y.shot.id !== x.shot.id);
+    setOpen(next?.shot.id ?? null);
+    setPlaying(null);
+  };
 
   return (
     <section className="glass rounded-3xl p-5 space-y-4">
@@ -3330,9 +3377,16 @@ function ReviewPanel({
             </span>
           ))}
         </div>
-        <button className="btn btn-on" disabled={!nextUp} onClick={() => nextUp && setOpen(nextUp.shot.id)}>
+        <button className="btn btn-on" disabled={!nextUp} onClick={() => nextUp && (setTab("review"), setOpen(nextUp.shot.id))}>
           {nextUp ? "Next to review" : "All reviewed"}
         </button>
+      </div>
+      <div className="seg glass w-fit">
+        {(["review", "done", "queued"] as const).map((t) => (
+          <button key={t} className={tab === t ? "on" : ""} onClick={() => setTab(t)}>
+            {label[t]} · {count(t)}
+          </button>
+        ))}
       </div>
 
       <div className="relative h-6 rounded-lg overflow-hidden bg-white/[0.04] ring-1 ring-hair">
@@ -3348,10 +3402,12 @@ function ReviewPanel({
       </div>
 
       <ol className="max-h-[60vh] overflow-y-auto space-y-1.5 pr-1">
-        {rows.filter((x) => x.state !== "missing").length === 0 && (
-          <li className="text-faint text-[12px] px-1">Nothing rendered in this span yet.</li>
+        {rows.filter((x) => x.state === tab).length === 0 && (
+          <li className="text-faint text-[12px] px-1">
+            {tab === "review" ? (count("done") ? "Everything rendered is reviewed." : "Nothing to review yet.") : tab === "done" ? "Nothing reviewed yet." : "Nothing rendering."}
+          </li>
         )}
-        {rows.map((x, idx) => x.state === "missing" ? null : (() => {
+        {rows.map((x, idx) => x.state !== tab ? null : (() => {
           const g = p.groups.find((gg) => gg.id === x.shot.groupId);
           const isOpen = open === x.shot.id;
           return (
@@ -3407,9 +3463,16 @@ function ReviewPanel({
                               <button className="btn h-7 px-2.5 text-[11px]" onClick={() => onTrim(t.part.id, t.j)}>Trim</button>
                               <button
                                 className={`btn h-7 px-2.5 text-[11px] ${isChosen && t.reviewed ? "btn-on" : ""}`}
-                                onClick={() => onUse(x.r, t.part.id, t.j)}
+                                onClick={() => use(x, t.part.id, t.j)}
                               >
                                 Use this take
+                              </button>
+                              <button
+                                className="btn h-7 px-2.5 text-[11px] text-[#fca5a5]"
+                                title="Delete this take (the render failed). If no other take is left, the shot shows as not rendered."
+                                onClick={() => onDelete(x.r, t.part.id, t.j)}
+                              >
+                                Delete
                               </button>
                             </div>
                           </div>
@@ -3729,7 +3792,9 @@ function PartRow({
   writing,
   onWritePrompt,
   onEditPrompt,
+  onDelete,
 }: {
+  onDelete: () => void;
   scenePrompt?: ScenePrompt;
   writing: boolean;
   onWritePrompt: () => void;
@@ -3789,6 +3854,16 @@ function PartRow({
         <video src={part.resultUrl} muted playsInline className="h-12 rounded-md ring-1 ring-hair bg-black" />
       )}
       <span className="text-faint text-[12px] tabular-nums">~${cost.toFixed(2)}</span>
+      {!busy && (
+        <button
+          className="btn btn-icon text-muted hover:text-[#fca5a5]"
+          aria-label="Delete part"
+          title={part.status === "done" ? "Delete this render and its takes" : "Remove this part"}
+          onClick={onDelete}
+        >
+          ✕
+        </button>
+      )}
       <button
         className={`btn ${scenePrompt ? "" : "btn-on"}`}
         disabled={writing}
