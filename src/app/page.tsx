@@ -266,7 +266,7 @@ export default function Home() {
     if (!v) return;
     if (v.paused) {
       const end = mode === "trim" ? range[1] : duration;
-      if (v.currentTime >= end - 0.05) v.currentTime = mode === "trim" ? range[0] : 0;
+      if (Math.abs(v.currentTime - end) < 0.05) v.currentTime = mode === "trim" ? range[0] : 0;
       v.muted = false;
       v.play();
     } else v.pause();
