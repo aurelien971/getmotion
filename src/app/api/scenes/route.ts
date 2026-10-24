@@ -49,7 +49,7 @@ The prompt must:
 - State that everyone else, the background, camera motion, lighting, haze, lens flares and the color
   grade stay exactly as they are, and that lip-sync, expressions and gestures are preserved.
 - Be plain, literal, present tense. No markdown, no hype words, no quality adjectives
-  ("cinematic", "8k", "masterpiece"). At most 2,000 characters.
+  ("cinematic", "8k", "masterpiece"). Hard limit: 1,800 characters (the model rejects more than 2,000).
 
 Respond with JSON only:
 {

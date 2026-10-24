@@ -1166,6 +1166,11 @@ export default function Chapters() {
       setError(`Pick a face for "${g.name}" first.`);
       return null;
     }
+    const text = g.partPrompts?.[partKey(part)]?.prompt || g.prompt || "";
+    if (/recast/i.test(model.id) && text.length > 2000) {
+      patchPart(part.id, { status: "failed", error: `Prompt is ${text.length} characters; H3 takes at most 2,000. Shorten it first.` });
+      return null;
+    }
     try {
       if (part.checkedKey !== partKey(part)) {
         const issues = await checkPart(part);
