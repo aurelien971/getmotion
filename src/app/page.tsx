@@ -2,6 +2,7 @@
 
 import { fal } from "@fal-ai/client";
 import Image from "next/image";
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import { MODELS, SAM2_VIDEO } from "@/lib/models";
 import { muxAudio, NoDecoderError, probeVideoCodec, stitchVideos, trimVideo, warmUp } from "@/lib/trim";
@@ -799,6 +800,7 @@ export default function Home() {
           <Image src="/logo.png" alt="getmotion.art" width={1700} height={290} priority className="h-[22px] w-auto" />
         </h1>
         <div className="flex items-center gap-4">
+          <Link href="/chapters" className="btn h-8 px-3 text-[12px]">Chapters</Link>
           {(localVideo || cast.length > 0 || shots.length > 0) && (
             <button className="btn h-8 px-3 text-[12px] text-muted" onClick={resetSession} title="Clear the saved session">
               New session

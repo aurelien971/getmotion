@@ -44,12 +44,15 @@ h2 {
   font-weight: 500;
 }
 
-input,
-textarea,
-button {
-  font: inherit;
-  color: inherit;
-  letter-spacing: inherit;
+@layer base {
+  input,
+  textarea,
+  button,
+  select {
+    font: inherit;
+    color: inherit;
+    letter-spacing: inherit;
+  }
 }
 
 :focus-visible {

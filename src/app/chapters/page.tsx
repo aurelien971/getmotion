@@ -1,0 +1,1741 @@
+"use client";
+
+import { fal } from "@fal-ai/client";
+import Image from "next/image";
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FrameStrip } from "@/components/FrameStrip";
+import { ReelPlayer } from "@/components/ReelPlayer";
+import { SpotTrack } from "@/components/SpotTrack";
+import { submitFal, submitSume, waitFor, removeJob, type PendingJob } from "@/lib/jobs";
+import { MODELS } from "@/lib/models";
+import {
+  buildParts,
+  buildShots,
+  emptyProject,
+  fmt,
+  fmtShort,
+  GROUP_COLORS,
+  intervals,
+  mark,
+  markSpan,
+  nearest,
+  notPresent,
+  signature,
+  stateAt,
+  total,
+  uid,
+  type Group,
+  type Part,
+  type Project,
+  type Shot,
+  type Step,
+  type StoredFile,
+} from "@/lib/project";
+import { kv } from "@/lib/store";
+import { assembleTimeline, buildClip, detectCuts, fileHasAudio, probeVideoCodec, warmUp } from "@/lib/trim";
+import { transcodeInBrowser } from "@/lib/transcode";
+
+fal.config({ proxyUrl: "/api/fal/proxy" });
+
+const STEPS: { id: Step; label: string; hint: string }[] = [
+  { id: "source", label: "Source", hint: "Drop the full video" },
+  { id: "spot", label: "Spot", hint: "Mark where he's in frame" },
+  { id: "scenes", label: "Scenes", hint: "Group shots by look" },
+  { id: "render", label: "Render", hint: "One render per group" },
+  { id: "assemble", label: "Assemble", hint: "Back on the original timeline" },
+];
+
+const RENDER_MODELS = MODELS.filter((m) => !m.usesMask && m.maxCast > 0);
+const READABLE = new Set(["h264", "vp8", "vp9"]);
+
+type Task = { label: string; pct: number | null };
+
+function describe(e: unknown): string {
+  if (e && typeof e === "object") {
+    const o = e as { message?: string; status?: number; body?: { detail?: unknown } };
+    const d = o.body?.detail;
+    const t = typeof d === "string" ? d : d ? JSON.stringify(d) : o.message;
+    return `${o.status ? `HTTP ${o.status}: ` : ""}${t ?? String(e)}`;
+  }
+  return String(e);
+}
+
+// Frame rate from consecutive decoded frames (muted, off-screen).
+async function detectFps(src: string): Promise<number> {
+  const v = document.createElement("video");
+  v.src = src;
+  v.muted = true;
+  v.playsInline = true;
+  if (!("requestVideoFrameCallback" in v)) return 30;
+  await new Promise<void>((r) => (v.onloadedmetadata = () => r()));
+  return new Promise<number>((resolve) => {
+    const times: number[] = [];
+    const tick = (_: number, m: VideoFrameCallbackMetadata) => {
+      times.push(m.mediaTime);
+      if (times.length < 14) v.requestVideoFrameCallback(tick);
+      else {
+        v.pause();
+        v.src = "";
+        const d = times.slice(1).map((t, i) => t - times[i]).filter((x) => x > 0);
+        const min = Math.min(...d);
+        resolve(isFinite(min) ? Math.round((1 / min) * 1000) / 1000 : 30);
+      }
+    };
+    v.requestVideoFrameCallback(tick);
+    v.play().catch(() => resolve(30));
+    setTimeout(() => resolve(30), 4000);
+  });
+}
+
+async function toJpeg(file: Blob, name: string, max = 2048): Promise<StoredFile> {
+  const bmp = await createImageBitmap(file);
+  const k = Math.min(1, max / Math.max(bmp.width, bmp.height));
+  const c = document.createElement("canvas");
+  c.width = Math.round(bmp.width * k);
+  c.height = Math.round(bmp.height * k);
+  c.getContext("2d")!.drawImage(bmp, 0, 0, c.width, c.height);
+  const blob = await new Promise<Blob>((r) => c.toBlob((b) => r(b!), "image/jpeg", 0.92));
+  return { blob, name: name.replace(/\.[^.]+$/, "") + ".jpg", type: "image/jpeg" };
+}
+
+// One frame per shot from the playable source, for review and for Claude.
+async function grabThumbs(src: string, shots: Shot[], onProgress: (r: number) => void): Promise<Record<string, string>> {
+  const v = document.createElement("video");
+  v.src = src;
+  v.muted = true;
+  v.playsInline = true;
+  v.preload = "auto";
+  await new Promise<void>((res, rej) => {
+    v.onloadedmetadata = () => res();
+    v.onerror = () => rej(new Error("Could not read the video for thumbnails"));
+  });
+  const c = document.createElement("canvas");
+  const w = 480;
+  const h = Math.round((v.videoHeight / v.videoWidth) * w);
+  c.width = w;
+  c.height = h;
+  const out: Record<string, string> = {};
+  for (let i = 0; i < shots.length; i++) {
+    const s = shots[i];
+    await new Promise<void>((res) => {
+      v.onseeked = () => res();
+      v.currentTime = Math.min(s.end - 0.05, s.start + (s.end - s.start) * 0.4);
+    });
+    c.getContext("2d")!.drawImage(v, 0, 0, w, h);
+    out[s.id] = c.toDataURL("image/jpeg", 0.8);
+    onProgress((i + 1) / shots.length);
+  }
+  v.src = "";
+  return out;
+}
+
+export default function Chapters() {
+  const [p, setP] = useState<Project>(emptyProject());
+  const [loaded, setLoaded] = useState(false);
+  const [tasks, setTasks] = useState<Record<string, Task>>({});
+  const [error, setError] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const setTask = (k: string, t: Task | null) =>
+    setTasks((s) => {
+      const n = { ...s };
+      if (t) n[k] = t;
+      else delete n[k];
+      return n;
+    });
+  const update = useCallback((f: (p: Project) => Project) => setP((x) => f(x)), []);
+  const flash = (m: string) => {
+    setToast(m);
+    setTimeout(() => setToast((t) => (t === m ? null : t)), 2200);
+  };
+
+  // ---- persistence ---------------------------------------------------------
+  // Blobs are stored under their own keys so frequent state saves stay cheap.
+  useEffect(() => {
+    (async () => {
+      try {
+        const meta = await kv.get<Project>("chapters.meta");
+        const source = await kv.get<StoredFile>("chapters.source");
+        const prepared = await kv.get<StoredFile>("chapters.prepared");
+        const output = await kv.get<StoredFile>("chapters.output");
+        if (meta) setP({ ...emptyProject(), ...meta, source, prepared, output });
+      } catch {}
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(() => {
+      const { source: _s, prepared: _p, output: _o, ...meta } = p;
+      void _s;
+      void _p;
+      void _o;
+      kv.set("chapters.meta", meta).catch(() => {});
+    }, 400);
+    return () => clearTimeout(t);
+  }, [p, loaded]);
+  useEffect(() => {
+    if (loaded) (p.source ? kv.set("chapters.source", p.source) : kv.del("chapters.source")).catch(() => {});
+  }, [p.source, loaded]);
+  useEffect(() => {
+    if (loaded) (p.prepared ? kv.set("chapters.prepared", p.prepared) : kv.del("chapters.prepared")).catch(() => {});
+  }, [p.prepared, loaded]);
+  useEffect(() => {
+    if (loaded) (p.output ? kv.set("chapters.output", p.output) : kv.del("chapters.output")).catch(() => {});
+  }, [p.output, loaded]);
+
+  useEffect(() => {
+    if (process.env.NODE_ENV === "development") {
+      (window as unknown as { __engine: unknown }).__engine = { buildClip, assembleTimeline, detectCuts };
+    }
+  }, []);
+
+  // Dev only: ?clip=/dev-long.mp4 loads a test file from /public.
+  useEffect(() => {
+    if (!loaded || process.env.NODE_ENV !== "development") return;
+    const name = new URLSearchParams(window.location.search).get("clip");
+    if (!name) return;
+    fetch(name)
+      .then((r) => r.blob())
+      .then((b) => onSource(new File([b], name.split("/").pop() || "clip.mp4", { type: "video/mp4" })));
+  }, [loaded]);
+
+  const srcUrl = useMemo(() => (p.source ? URL.createObjectURL(p.source.blob) : null), [p.source]);
+  const outUrl = useMemo(() => (p.output ? URL.createObjectURL(p.output.blob) : null), [p.output]);
+
+  // ---- background preparation ---------------------------------------------
+  // 1) H.264 copy for cutting (AV1/HEVC re-recorded in real time), 2) audio check,
+  // 3) scene cuts. Each runs once; the user can spot while they run.
+  const running = useRef<Record<string, boolean>>({});
+  useEffect(() => {
+    if (!loaded || !p.source || p.prepared || running.current.prepare) return;
+    running.current.prepare = true;
+    const source = p.source;
+    (async () => {
+      try {
+        warmUp();
+        setTask("prepare", { label: "Checking codec", pct: null });
+        const codec = await probeVideoCodec(source.blob).catch(() => null);
+        if (codec && READABLE.has(codec)) {
+          update((x) => ({ ...x, codec, prepared: source }));
+        } else {
+          setTask("prepare", { label: `Converting ${codec?.toUpperCase() ?? "video"} to H.264 · keep this tab visible`, pct: 0 });
+          const out = await transcodeInBrowser(source.blob, (r) =>
+            setTask("prepare", { label: `Converting ${codec?.toUpperCase() ?? "video"} to H.264 · keep this tab visible`, pct: r }),
+          );
+          update((x) => ({ ...x, codec, prepared: { blob: out, name: out.name, type: out.type } }));
+        }
+      } catch (e) {
+        setError(`Preparing the video failed: ${describe(e)}`);
+      } finally {
+        setTask("prepare", null);
+        running.current.prepare = false;
+      }
+    })();
+  }, [loaded, p.source, p.prepared, update]);
+
+  useEffect(() => {
+    if (!loaded || !p.prepared || p.cuts !== null || running.current.cuts) return;
+    running.current.cuts = true;
+    const prepared = p.prepared;
+    const dur = p.duration;
+    (async () => {
+      try {
+        const audio = await fileHasAudio(prepared.blob).catch(() => true);
+        update((x) => ({ ...x, hasAudio: audio }));
+        setTask("cuts", { label: "Finding scene cuts", pct: 0 });
+        const cuts = await detectCuts(prepared.blob, dur, (r) => setTask("cuts", { label: "Finding scene cuts", pct: r }));
+        update((x) => ({ ...x, cuts }));
+        flash(`${cuts.length} scene cuts found`);
+      } catch (e) {
+        setError(`Scene detection failed: ${describe(e)}`);
+        update((x) => ({ ...x, cuts: [] }));
+      } finally {
+        setTask("cuts", null);
+        running.current.cuts = false;
+      }
+    })();
+  }, [loaded, p.prepared, p.cuts, p.duration, update]);
+
+  // ---- source ----------------------------------------------------------------
+  async function onSource(file: File) {
+    if (!file.type.startsWith("video/")) return;
+    const url = URL.createObjectURL(file);
+    const meta = await new Promise<{ d: number; w: number; h: number }>((res, rej) => {
+      const v = document.createElement("video");
+      v.preload = "metadata";
+      v.onloadedmetadata = () => res({ d: v.duration, w: v.videoWidth, h: v.videoHeight });
+      v.onerror = () => rej(new Error("This browser can't play that file."));
+      v.src = url;
+    }).catch((e) => {
+      setError(String(e));
+      return null;
+    });
+    const fps = meta ? await detectFps(url).catch(() => 30) : 30;
+    URL.revokeObjectURL(url);
+    if (!meta) return;
+    await kv.del("chapters.prepared").catch(() => {});
+    setP({
+      ...emptyProject(),
+      name: file.name.replace(/\.[^.]+$/, ""),
+      source: { blob: file, name: file.name, type: file.type },
+      duration: meta.d,
+      width: meta.w,
+      height: meta.h,
+      fps,
+      step: "spot",
+    });
+  }
+
+  async function newProject() {
+    if (!confirm("Start a new project? This clears the current one from this browser.")) return;
+    await kv.del("chapters.meta").catch(() => {});
+    await kv.del("chapters.source").catch(() => {});
+    await kv.del("chapters.prepared").catch(() => {});
+    await kv.del("chapters.output").catch(() => {});
+    window.location.reload();
+  }
+
+  // ---- derived -----------------------------------------------------------------
+  const present = intervals(p.boundaries, p.duration, true);
+  const absent = notPresent(p.boundaries, p.duration);
+  const presentLen = total(present);
+  const unassigned = p.shots.filter((s) => !s.groupId);
+  const groupedLen = total(p.shots.filter((s) => s.groupId));
+  const partsDone = p.parts.filter((x) => x.status === "done").length;
+  const reach: Record<Step, boolean> = {
+    source: true,
+    spot: !!p.source,
+    scenes: !!p.source && presentLen > 0,
+    render: p.shots.length > 0 && unassigned.length === 0 && p.groups.length > 0,
+    assemble: partsDone > 0,
+  };
+  const go = (s: Step) => reach[s] && update((x) => ({ ...x, step: s }));
+
+  // ---- scenes: shots, thumbs, grouping --------------------------------------
+  async function enterScenes() {
+    setError(null);
+    const shots = buildShots(p);
+    update((x) => ({ ...x, shots, step: "scenes" }));
+    const missing = shots.filter((s) => !s.thumb);
+    let withThumbs = shots;
+    if (missing.length && srcUrl) {
+      setTask("thumbs", { label: "Reading shots", pct: 0 });
+      try {
+        const map = await grabThumbs(srcUrl, missing, (r) => setTask("thumbs", { label: "Reading shots", pct: r }));
+        withThumbs = shots.map((s) => (map[s.id] ? { ...s, thumb: map[s.id] } : s));
+        update((x) => ({ ...x, shots: x.shots.map((s) => (map[s.id] ? { ...s, thumb: map[s.id] } : s)) }));
+      } finally {
+        setTask("thumbs", null);
+      }
+    }
+    if (!p.groups.length || withThumbs.every((s) => !s.groupId)) await autoGroup(withThumbs);
+  }
+
+  async function autoGroup(shots: Shot[]) {
+    setTask("group", { label: "Claude is grouping shots by look", pct: null });
+    try {
+      const res = await fetch("/api/group", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          frames: shots.filter((s) => s.thumb).map((s) => ({ id: s.id, start: s.start, end: s.end, dataUrl: s.thumb })),
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? res.statusText);
+      const groups: Group[] = (json.groups as { name: string; description: string; shotIds: string[] }[]).map((g, i) => ({
+        id: uid(),
+        name: g.name,
+        description: g.description,
+        color: GROUP_COLORS[i % GROUP_COLORS.length],
+        refs: [],
+        notes: "",
+        prompt: "",
+        modelId: "fal-ai/minimax-h3-max-recast",
+      }));
+      const byShot: Record<string, string> = {};
+      (json.groups as { shotIds: string[] }[]).forEach((g, i) => g.shotIds.forEach((id) => (byShot[id] = groups[i].id)));
+      update((x) => ({
+        ...x,
+        groups,
+        parts: [],
+        shots: x.shots.map((s) => ({ ...s, groupId: byShot[s.id] ?? null })),
+      }));
+      setSel(groups[0]?.id ?? "unassigned");
+      flash(`${groups.length} looks found`);
+    } catch (e) {
+      setError(`Auto-grouping failed: ${describe(e)}. Group the shots by hand below.`);
+    } finally {
+      setTask("group", null);
+    }
+  }
+
+  function addGroup(name = "New look"): string {
+    const id = uid();
+    update((x) => ({
+      ...x,
+      groups: [
+        ...x.groups,
+        {
+          id,
+          name,
+          description: "",
+          color: GROUP_COLORS[x.groups.length % GROUP_COLORS.length],
+          refs: [],
+          notes: "",
+          prompt: "",
+          modelId: "fal-ai/minimax-h3-max-recast",
+        },
+      ],
+    }));
+    return id;
+  }
+  const setShotGroup = (shotId: string, groupId: string | null) =>
+    update((x) => ({ ...x, shots: x.shots.map((s) => (s.id === shotId ? { ...s, groupId } : s)) }));
+  const patchGroup = (id: string, patch: Partial<Group>) =>
+    update((x) => ({ ...x, groups: x.groups.map((g) => (g.id === id ? { ...g, ...patch } : g)) }));
+  const deleteGroup = (id: string) =>
+    update((x) => ({
+      ...x,
+      groups: x.groups.filter((g) => g.id !== id),
+      parts: x.parts.filter((pt) => pt.groupId !== id),
+      shots: x.shots.map((s) => (s.groupId === id ? { ...s, groupId: null } : s)),
+    }));
+
+  // Flip a span between "him" and "not him" from the Scenes step, then rebuild shots.
+  async function flipSpan(a: number, b: number, presentNow: boolean) {
+    const frame = 1 / p.fps;
+    const next = { ...p, boundaries: markSpan(p.boundaries, a, b, presentNow, frame) };
+    const shots = buildShots(next);
+    update(() => ({ ...next, shots }));
+    const missing = shots.filter((s) => !s.thumb);
+    if (missing.length && srcUrl) {
+      const map = await grabThumbs(srcUrl, missing, () => {});
+      update((x) => ({ ...x, shots: x.shots.map((s) => (map[s.id] ? { ...s, thumb: map[s.id] } : s)) }));
+    }
+  }
+
+  const [sel, setSel] = useState<string>("unassigned");
+
+  // ---- render ---------------------------------------------------------------
+  function enterRender() {
+    update((x) => {
+      let parts: Part[] = [];
+      for (const g of x.groups) parts = parts.concat(buildParts(x, g.id));
+      return { ...x, parts, step: "render" };
+    });
+  }
+  const patchPart = (id: string, patch: Partial<Part>) =>
+    update((x) => ({ ...x, parts: x.parts.map((pt) => (pt.id === id ? { ...pt, ...patch } : pt)) }));
+
+  async function writeGroupPrompt(g: Group) {
+    setTask(`prompt-${g.id}`, { label: `Writing prompt for ${g.name}`, pct: null });
+    try {
+      const shots = p.shots.filter((s) => s.groupId === g.id && s.thumb).slice(0, 8);
+      const faces = await Promise.all(
+        g.refs.map(async (r) => ({ name: r.name, dataUrl: await blobToDataUrl((await toJpeg(r.blob, r.name, 1280)).blob) })),
+      );
+      const res = await fetch("/api/direct", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          targets: shots.map((s, i) => ({ name: `${g.name} shot ${i + 1}`, dataUrl: s.thumb })),
+          faces,
+          model: RENDER_MODELS.find((m) => m.id === g.modelId)?.name ?? g.modelId,
+          notes: [
+            `This clip contains only one look: "${g.name}". ${g.description}`,
+            "It is a stitched sequence of short shots; the target appears in every single shot of it, often the only person or the one rapping to camera. Replace him in all of them, even with sunglasses, a hat, a side angle or when small in frame.",
+            g.notes,
+          ]
+            .filter(Boolean)
+            .join(" "),
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? res.statusText);
+      patchGroup(g.id, { prompt: json.prompt ?? "" });
+    } catch (e) {
+      setError(`Prompt for ${g.name}: ${describe(e)}`);
+    } finally {
+      setTask(`prompt-${g.id}`, null);
+    }
+  }
+
+  // Build the clip, upload it with the faces, submit. Returns the job so the caller
+  // decides whether to wait; the job id is saved before any waiting happens.
+  async function startPart(part: Part): Promise<PendingJob | null> {
+    const g = p.groups.find((x) => x.id === part.groupId)!;
+    const model = RENDER_MODELS.find((m) => m.id === g.modelId) ?? RENDER_MODELS[0];
+    if (!p.prepared) {
+      setError("The video is still being prepared. Try again in a moment.");
+      return null;
+    }
+    if (!g.refs.length) {
+      setError(`Add a face to "${g.name}" first.`);
+      return null;
+    }
+    try {
+      patchPart(part.id, { status: "building", progress: 0, error: undefined });
+      const h = Math.min(720, p.height);
+      const w = Math.round((p.width / p.height) * h);
+      const clip = await buildClip(
+        p.prepared.blob,
+        [...part.pieces, ...part.pad],
+        { w, h },
+        p.hasAudio,
+        (r) => patchPart(part.id, { progress: r }),
+      );
+      patchPart(part.id, { status: "uploading", progress: undefined });
+      const videoUrl = await fal.storage.upload(clip);
+      const cast = await Promise.all(
+        g.refs.map(async (r) => ({ url: await fal.storage.upload(new File([r.blob], r.name, { type: r.type })), who: "" })),
+      );
+      const input = model.build({
+        videoUrl,
+        maskUrl: null,
+        cast,
+        prompt: "",
+        directed:
+          g.prompt ||
+          `The target appears in every single shot of this clip. Replace him with the man in reference image 1 in all of them, even with sunglasses, a hat, a side angle or when small in frame. ${g.description} Keep his clothing, hats and sunglasses exactly. Everyone else unchanged. Preserve lip-sync and motion.`,
+        duration: part.clipLength,
+        side: "center",
+      });
+      const job =
+        model.provider === "sume" ? await submitSume(model.id, model.name, input) : await submitFal(model.id, model.name, input);
+      patchPart(part.id, {
+        status: "rendering",
+        endpoint: job.endpoint,
+        requestId: job.requestId,
+        signature: signature(part, g),
+      });
+      return job;
+    } catch (e) {
+      patchPart(part.id, { status: "failed", error: describe(e) });
+      return null;
+    }
+  }
+
+  async function waitPart(partId: string, job: PendingJob) {
+    try {
+      const url = await waitFor(job, () => patchPart(partId, { error: undefined }));
+      removeJob(job.requestId);
+      patchPart(partId, { status: "done", resultUrl: url, renderedAt: Date.now() });
+    } catch (e) {
+      patchPart(partId, { status: "failed", error: describe(e) });
+    }
+  }
+
+  async function renderParts(ids: string[]) {
+    setError(null);
+    const waits: Promise<void>[] = [];
+    for (const id of ids) {
+      const part = p.parts.find((x) => x.id === id);
+      if (!part) continue;
+      const job = await startPart(part);
+      if (job) waits.push(waitPart(id, job));
+    }
+    await Promise.all(waits);
+  }
+
+  // Resume renders that were in flight when the page closed.
+  const resumed = useRef(false);
+  useEffect(() => {
+    if (!loaded || resumed.current) return;
+    resumed.current = true;
+    const parts = p.parts;
+    queueMicrotask(() => {
+      for (const pt of parts) {
+        if (pt.status === "rendering" && pt.requestId && pt.endpoint) {
+          const prov = MODELS.find((m) => m.id === pt.endpoint)?.provider ?? "fal";
+          void waitPart(pt.id, { provider: prov, endpoint: pt.endpoint, requestId: pt.requestId, model: pt.endpoint, at: Date.now() });
+        } else if (pt.status === "building" || pt.status === "uploading") {
+          patchPart(pt.id, { status: "idle", progress: undefined });
+        }
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
+
+  // ---- assemble -------------------------------------------------------------
+  const [rangeMode, setRangeMode] = useState<"all" | "span">("all");
+  async function assemble() {
+    if (!p.prepared) return;
+    setError(null);
+    setTask("assemble", { label: "Downloading renders", pct: null });
+    try {
+      const done = p.parts.filter((x) => x.status === "done" && x.resultUrl);
+      const results = await Promise.all(done.map((d) => fetch(d.resultUrl!).then((r) => r.blob())));
+      const files: Blob[] = [p.prepared.blob, ...results];
+      const span = rangeMode === "span" && present.length ? { start: present[0].start, end: present[present.length - 1].end } : { start: 0, end: p.duration };
+      type Rep = { start: number; end: number; file: number; offset: number };
+      const reps: Rep[] = [];
+      done.forEach((d, i) => d.pieces.forEach((pc) => reps.push({ start: pc.start, end: pc.end, file: i + 1, offset: pc.offset })));
+      reps.sort((a, b) => a.start - b.start);
+      const pieces: { file: number; start: number; end: number }[] = [];
+      let t = span.start;
+      for (const r of reps) {
+        if (r.end <= span.start || r.start >= span.end) continue;
+        const a = Math.max(r.start, span.start);
+        const b = Math.min(r.end, span.end);
+        if (a - t > 0.01) pieces.push({ file: 0, start: t, end: a });
+        pieces.push({ file: r.file, start: r.offset + (a - r.start), end: r.offset + (b - r.start) });
+        t = b;
+      }
+      if (span.end - t > 0.01) pieces.push({ file: 0, start: t, end: span.end });
+      const size = await new Promise<{ w: number; h: number }>((res) => {
+        if (!done[0]) return res({ w: Math.round((p.width / p.height) * Math.min(720, p.height)), h: Math.min(720, p.height) });
+        const v = document.createElement("video");
+        v.crossOrigin = "anonymous";
+        v.preload = "metadata";
+        v.onloadedmetadata = () => res({ w: v.videoWidth, h: v.videoHeight });
+        v.onerror = () => res({ w: 1280, h: 720 });
+        v.src = done[0].resultUrl!;
+      });
+      setTask("assemble", { label: "Assembling on the original timeline", pct: 0 });
+      const out = await assembleTimeline(files, pieces, p.hasAudio ? span : null, size, (r) =>
+        setTask("assemble", { label: "Assembling on the original timeline", pct: r }),
+      );
+      update((x) => ({ ...x, output: { blob: out, name: `${x.name}-recast.mp4`, type: "video/mp4" } }));
+      flash("Assembled");
+    } catch (e) {
+      setError(`Assembly failed: ${describe(e)}`);
+    } finally {
+      setTask("assemble", null);
+    }
+  }
+
+  function save(file: StoredFile) {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(file.blob);
+    a.download = file.name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+  }
+
+  // ---- render ------------------------------------------------------------------
+  const taskList = Object.entries(tasks);
+
+  return (
+    <div className="min-h-dvh flex flex-col">
+      {taskList.length > 0 && <div className="sweep fixed top-0 left-0 right-0 h-px z-50 overflow-hidden" />}
+
+      <header className="flex items-center gap-6 px-6 h-16 border-b border-hair">
+        <Link href="/" className="flex items-center shrink-0">
+          <Image src="/logo.png" alt="getmotion.art" width={1700} height={290} priority className="h-[20px] w-auto" />
+        </Link>
+        <nav className="flex items-center gap-1 overflow-x-auto">
+          {STEPS.map((s, i) => {
+            const on = p.step === s.id;
+            const can = reach[s.id];
+            return (
+              <button
+                key={s.id}
+                onClick={() => go(s.id)}
+                disabled={!can}
+                className={`flex items-center gap-2 h-8 pl-1.5 pr-3 rounded-full text-[13px] transition-colors ${
+                  on ? "bg-white text-black" : can ? "text-ink hover:bg-white/[0.06]" : "text-faint cursor-not-allowed"
+                }`}
+                title={s.hint}
+              >
+                <span
+                  className={`w-5 h-5 rounded-full grid place-items-center text-[11px] tabular-nums ${
+                    on ? "bg-black text-white" : "bg-white/10"
+                  }`}
+                >
+                  {i + 1}
+                </span>
+                {s.label}
+              </button>
+            );
+          })}
+        </nav>
+        <span className="flex-1" />
+        <Link href="/" className="btn h-8 px-3 text-[12px]">Single clip</Link>
+        {p.source && (
+          <button className="btn h-8 px-3 text-[12px] text-muted" onClick={newProject}>
+            New project
+          </button>
+        )}
+      </header>
+
+      <main className="flex-1 min-h-0">
+        {p.step === "source" && (
+          <SourceStep onPick={() => fileRef.current?.click()} onDrop={onSource} project={p} onContinue={() => go("spot")} />
+        )}
+        {p.step === "spot" && srcUrl && (
+          <SpotStep
+            p={p}
+            src={srcUrl}
+            update={update}
+            onNext={enterScenes}
+            presentLen={presentLen}
+          />
+        )}
+        {p.step === "scenes" && srcUrl && (
+          <ScenesStep
+            p={p}
+            src={srcUrl}
+            sel={sel}
+            setSel={setSel}
+            present={present}
+            absent={absent}
+            presentLen={presentLen}
+            groupedLen={groupedLen}
+            onAuto={() => autoGroup(p.shots)}
+            onAdd={() => setSel(addGroup())}
+            onSetShot={setShotGroup}
+            onPatch={patchGroup}
+            onDelete={(id) => {
+              deleteGroup(id);
+              setSel("unassigned");
+            }}
+            onFlip={flipSpan}
+            onNewGroupFor={(shotId) => {
+              const id = addGroup();
+              setShotGroup(shotId, id);
+              setSel(id);
+            }}
+            onNext={enterRender}
+            canNext={reach.render}
+          />
+        )}
+        {p.step === "render" && srcUrl && (
+          <RenderStep
+            p={p}
+            src={srcUrl}
+            tasks={tasks}
+            onPatch={patchGroup}
+            onAddRef={async (gid, f) => {
+              const j = await toJpeg(f, f.name || "face.png").catch(() => null);
+              if (!j) return setError(`Can't read ${f.name}. Use a JPEG or PNG.`);
+              update((x) => ({ ...x, groups: x.groups.map((g) => (g.id === gid ? { ...g, refs: [...g.refs, j].slice(0, 4) } : g)) }));
+            }}
+            onRemoveRef={(gid, i) =>
+              update((x) => ({ ...x, groups: x.groups.map((g) => (g.id === gid ? { ...g, refs: g.refs.filter((_, k) => k !== i) } : g)) }))
+            }
+            onWrite={writeGroupPrompt}
+            onRender={renderParts}
+            onNext={() => go("assemble")}
+            onError={setError}
+          />
+        )}
+        {p.step === "assemble" && srcUrl && (
+          <AssembleStep
+            p={p}
+            present={present}
+            rangeMode={rangeMode}
+            setRangeMode={setRangeMode}
+            busy={!!tasks.assemble}
+            onAssemble={assemble}
+            outUrl={outUrl}
+            onSave={() => p.output && save(p.output)}
+            onBack={() => go("render")}
+          />
+        )}
+      </main>
+
+      <input
+        ref={fileRef}
+        type="file"
+        accept="video/*"
+        className="hidden"
+        onChange={(e) => e.target.files?.[0] && onSource(e.target.files[0])}
+      />
+
+      {(taskList.length > 0 || error || toast) && (
+        <div className="fixed bottom-5 right-5 z-40 w-[340px] space-y-2">
+          {taskList.map(([k, t]) => (
+            <div key={k} className="glass rounded-2xl p-3.5 space-y-2">
+              <div className="flex justify-between gap-3 text-[13px]">
+                <span>{t.label}</span>
+                {t.pct !== null && <span className="text-muted tabular-nums">{Math.round(t.pct * 100)}%</span>}
+              </div>
+              <div className="h-1 rounded-full bg-white/10 overflow-hidden relative">
+                {t.pct !== null ? (
+                  <div className="h-full bg-white transition-[width] duration-200" style={{ width: `${Math.round(t.pct * 100)}%` }} />
+                ) : (
+                  <div className="sweep absolute inset-0" />
+                )}
+              </div>
+            </div>
+          ))}
+          {error && (
+            <div className="glass rounded-2xl p-3.5 text-[13px] flex gap-3 items-start">
+              <span className="flex-1 break-words">{error}</span>
+              <button className="text-muted" onClick={() => setError(null)} aria-label="Dismiss">×</button>
+            </div>
+          )}
+          {toast && <div className="glass rounded-2xl px-3.5 py-2.5 text-[13px]">{toast}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function blobToDataUrl(b: Blob) {
+  return new Promise<string>((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result));
+    r.onerror = () => rej(r.error);
+    r.readAsDataURL(b);
+  });
+}
+
+// ============================================================================
+// Step 1: Source
+
+function SourceStep({
+  onPick,
+  onDrop,
+  project,
+  onContinue,
+}: {
+  onPick: () => void;
+  onDrop: (f: File) => void;
+  project: Project;
+  onContinue: () => void;
+}) {
+  const [over, setOver] = useState(false);
+  return (
+    <div className="max-w-3xl mx-auto px-6 py-16 space-y-10">
+      <div className="space-y-3">
+        <h1 className="text-[34px] leading-tight tracking-tight">Recast a whole video, one look at a time.</h1>
+        <p className="text-muted text-[15px] max-w-xl">
+          Mark where he&apos;s on screen, let it group the shots by outfit and place, render each look on its own, and
+          get one video back on the original timeline with the original audio.
+        </p>
+      </div>
+      <button
+        onClick={onPick}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setOver(true);
+        }}
+        onDragLeave={() => setOver(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setOver(false);
+          const f = e.dataTransfer.files?.[0];
+          if (f) onDrop(f);
+        }}
+        className={`w-full aspect-[21/9] rounded-3xl ring-1 transition-all grid place-items-center ${
+          over ? "ring-white bg-white/[0.06]" : "ring-hair bg-white/[0.02] hover:bg-white/[0.04]"
+        }`}
+      >
+        <span className="space-y-2 text-center">
+          <span className="block text-[22px] tracking-tight">Drop the full video</span>
+          <span className="block text-muted text-[13px]">Any length. MP4, MOV, WebM. AV1 and HEVC get converted.</span>
+        </span>
+      </button>
+      {project.source && (
+        <div className="glass rounded-2xl p-4 flex items-center gap-4">
+          <span className="flex-1 text-[13px]">
+            {project.source.name} · {fmt(project.duration)} · {project.width}×{project.height}
+          </span>
+          <button className="btn btn-on" onClick={onContinue}>Continue</button>
+        </div>
+      )}
+      <ol className="grid sm:grid-cols-4 gap-3 text-[13px]">
+        {STEPS.slice(1).map((s, i) => (
+          <li key={s.id} className="glass rounded-2xl p-4 space-y-1">
+            <span className="text-faint text-[11px] tabular-nums">Step {i + 2}</span>
+            <span className="block">{s.label}</span>
+            <span className="block text-muted text-[12px]">{s.hint}</span>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+// ============================================================================
+// Step 2: Spot
+
+function SpotStep({
+  p,
+  src,
+  update,
+  onNext,
+  presentLen,
+}: {
+  p: Project;
+  src: string;
+  update: (f: (p: Project) => Project) => void;
+  onNext: () => void;
+  presentLen: number;
+}) {
+  const v = useRef<HTMLVideoElement>(null);
+  const [time, setTime] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [snap, setSnap] = useState(true);
+  const [, setHistory] = useState<Project["boundaries"][]>([]);
+  const watchedRef = useRef(p.watched);
+  const frame = 1 / p.fps;
+
+  // Smooth playhead + track the furthest point watched.
+  useEffect(() => {
+    if (!playing) return;
+    const el = v.current!;
+    const id = setInterval(() => {
+      setTime(el.currentTime);
+      if (el.currentTime > watchedRef.current + 0.5) {
+        watchedRef.current = el.currentTime;
+        update((x) => ({ ...x, watched: Math.max(x.watched, el.currentTime) }));
+      }
+    }, 40);
+    return () => clearInterval(id);
+  }, [playing, update]);
+
+  const seek = useCallback((t: number) => {
+    const el = v.current;
+    if (!el) return;
+    el.currentTime = Math.max(0, Math.min(p.duration, t));
+    setTime(el.currentTime);
+  }, [p.duration]);
+
+  const toggle = useCallback(() => {
+    const el = v.current;
+    if (!el) return;
+    if (el.paused) el.play();
+    else el.pause();
+  }, []);
+
+  const doMark = useCallback(
+    (present: boolean) => {
+      const el = v.current;
+      if (!el) return;
+      let t = Math.round(el.currentTime * p.fps) / p.fps;
+      const c = snap ? nearest(p.cuts, t, 0.35) : null;
+      if (c !== null) t = c;
+      setHistory((h) => [...h.slice(-50), p.boundaries]);
+      update((x) => ({ ...x, boundaries: mark(x.boundaries, t, present, 1 / x.fps), watched: Math.max(x.watched, t) }));
+    },
+    [p.boundaries, p.cuts, p.fps, snap, update],
+  );
+
+  const undo = useCallback(() => {
+    setHistory((h) => {
+      if (!h.length) return h;
+      const prev = h[h.length - 1];
+      update((x) => ({ ...x, boundaries: prev }));
+      return h.slice(0, -1);
+    });
+  }, [update]);
+
+  // Jump to the previous / next cut or mark.
+  const hop = useCallback(
+    (dir: 1 | -1) => {
+      const pts = [...(p.cuts ?? []), ...p.boundaries.map((b) => b.t), 0, p.duration].sort((a, b) => a - b);
+      const cur = v.current?.currentTime ?? 0;
+      const t = dir > 0 ? pts.find((x) => x > cur + 0.02) : [...pts].reverse().find((x) => x < cur - 0.02);
+      if (t !== undefined) {
+        v.current?.pause();
+        seek(t + 0.001);
+      }
+    },
+    [p.cuts, p.boundaries, p.duration, seek],
+  );
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (e.key === " ") {
+        e.preventDefault();
+        toggle();
+      } else if (e.key === "y" || e.key === "Y" || e.key === "Enter") doMark(true);
+      else if (e.key === "n" || e.key === "N" || e.key === "Backspace") doMark(false);
+      else if ((e.metaKey || e.ctrlKey) && e.key === "z") {
+        e.preventDefault();
+        undo();
+      } else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+        e.preventDefault();
+        const d = e.key === "ArrowRight" ? 1 : -1;
+        if (e.shiftKey) hop(d as 1 | -1);
+        else {
+          v.current?.pause();
+          seek((v.current?.currentTime ?? 0) + d * frame);
+        }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [toggle, doMark, undo, hop, seek, frame]);
+
+  const state = stateAt(p.boundaries, time);
+  const watchedPct = Math.min(100, Math.round((p.watched / (p.duration || 1)) * 100));
+  const unmarked = p.boundaries.length ? p.boundaries[0].t : p.duration;
+
+  return (
+    <div className="grid lg:grid-cols-[minmax(0,1fr)_360px] lg:h-[calc(100dvh-4rem)]">
+      <section className="p-6 space-y-4 min-w-0 overflow-y-auto">
+        <div className="relative mx-auto h-[50vh] max-w-full aspect-video rounded-2xl overflow-hidden bg-black ring-1 ring-hair">
+          <video
+            ref={v}
+            src={src}
+            playsInline
+            className="w-full h-full object-contain cursor-pointer"
+            onClick={toggle}
+            onLoadedMetadata={(e) => {
+              const el = e.currentTarget;
+              el.currentTime = Math.min(p.watched, el.duration);
+              setTime(el.currentTime);
+            }}
+            onPlay={() => setPlaying(true)}
+            onPause={(e) => {
+              setPlaying(false);
+              setTime(e.currentTarget.currentTime);
+            }}
+            onSeeked={(e) => setTime(e.currentTarget.currentTime)}
+          />
+          <span
+            className={`absolute left-3 top-3 text-[12px] rounded-full px-2.5 py-1 backdrop-blur-md ${
+              state === true ? "bg-[rgba(74,222,128,0.85)] text-black" : state === false ? "bg-black/60" : "bg-black/60 text-muted"
+            }`}
+          >
+            {state === true ? "He's in frame" : state === false ? "Not in frame" : "Not marked yet"}
+          </span>
+        </div>
+
+        <SpotTrack
+          duration={p.duration}
+          boundaries={p.boundaries}
+          cuts={p.cuts}
+          time={time}
+          watched={p.watched}
+          onSeek={(t) => seek(t)}
+        />
+
+        <div className="flex flex-wrap items-center gap-2">
+          <button className="btn btn-icon" onClick={toggle} aria-label={playing ? "Pause" : "Play"}>
+            {playing ? "❚❚" : "▶"}
+          </button>
+          <div className="seg glass">
+            <button onClick={() => hop(-1)} title="Previous cut or mark (Shift ←)">⇤ cut</button>
+            <button onClick={() => { v.current?.pause(); seek(time - frame); }} title="Previous frame (←)">‹</button>
+            <button onClick={() => { v.current?.pause(); seek(time + frame); }} title="Next frame (→)">›</button>
+            <button onClick={() => hop(1)} title="Next cut or mark (Shift →)">cut ⇥</button>
+          </div>
+          <span className="text-[13px] tabular-nums">
+            {fmt(time)} <span className="text-faint">/ {fmt(p.duration)} · f{Math.round(time * p.fps)}</span>
+          </span>
+          <span className="flex-1" />
+          <label className="flex items-center gap-2 text-[12px] text-muted cursor-pointer">
+            <input type="checkbox" checked={snap} onChange={(e) => setSnap(e.target.checked)} className="accent-white" />
+            Snap marks to scene cuts
+          </label>
+        </div>
+
+        <FrameStrip
+          src={src}
+          fps={p.fps}
+          duration={p.duration}
+          time={time}
+          range={[-10, -10]}
+          step={1}
+          onSeek={(t) => {
+            v.current?.pause();
+            seek(t);
+          }}
+        />
+      </section>
+
+      <aside className="lg:border-l border-hair flex flex-col min-h-0">
+        <div className="flex-1 min-h-0 p-6 space-y-7 overflow-y-auto">
+          <div className="space-y-4">
+            <div>
+              <p className="text-faint text-[12px]">Play, pause where it changes, answer.</p>
+              <h2 className="text-[22px] tracking-tight mt-1">Is he in frame?</h2>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={() => doMark(true)}
+                className={`h-20 rounded-2xl text-[17px] font-medium transition-all ring-1 ${
+                  state === true ? "bg-[rgba(74,222,128,0.9)] text-black ring-transparent" : "glass hover:bg-white/[0.08]"
+                }`}
+              >
+                Yes
+                <span className="block text-[11px] font-normal opacity-60">Y</span>
+              </button>
+              <button
+                onClick={() => doMark(false)}
+                className={`h-20 rounded-2xl text-[17px] font-medium transition-all ring-1 ${
+                  state === false ? "bg-white text-black ring-transparent" : "glass hover:bg-white/[0.08]"
+                }`}
+              >
+                No
+                <span className="block text-[11px] font-normal opacity-60">N</span>
+              </button>
+            </div>
+            <p className="text-muted text-[12px] leading-relaxed">
+              Each answer applies from this frame until the next change. Start at 0:00 with Yes or No, press play, and
+              pause the moment he appears or leaves. Space plays, ← → steps a frame, Shift ← → jumps to the next cut,
+              ⌘Z undoes.
+            </p>
+          </div>
+
+          <div className="space-y-2">
+            <div className="flex justify-between text-[12px]">
+              <span className="text-muted">Reviewed</span>
+              <span className="tabular-nums">{watchedPct}%</span>
+            </div>
+            <div className="h-1 rounded-full bg-white/10 overflow-hidden">
+              <div className="h-full bg-white" style={{ width: `${watchedPct}%` }} />
+            </div>
+            <div className="grid grid-cols-3 gap-2 pt-2 text-center">
+              <Stat label="in frame" value={fmtShort(presentLen)} />
+              <Stat label="changes" value={String(p.boundaries.length)} />
+              <Stat label="scene cuts" value={p.cuts === null ? "…" : String(p.cuts.length)} />
+            </div>
+          </div>
+
+          {p.boundaries.length > 0 && (
+            <div className="space-y-2">
+              <h3 className="text-[13px]">Changes</h3>
+              <ol className="glass rounded-2xl p-1.5 max-h-64 overflow-y-auto">
+                {p.boundaries.map((b, i) => (
+                  <li key={b.t} className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-white/[0.05]">
+                    <span
+                      className="w-2 h-2 rounded-full"
+                      style={{ background: b.present ? "rgba(74,222,128,0.9)" : "rgba(255,255,255,0.3)" }}
+                    />
+                    <button className="flex-1 text-left text-[12px] tabular-nums" onClick={() => seek(b.t + 0.001)}>
+                      {fmt(b.t)} · {b.present ? "appears" : "leaves"}
+                    </button>
+                    <button
+                      className="text-faint hover:text-ink text-[12px]"
+                      aria-label="Remove change"
+                      onClick={() => {
+                        setHistory((h) => [...h, p.boundaries]);
+                        update((x) => ({ ...x, boundaries: x.boundaries.filter((_, k) => k !== i) }));
+                      }}
+                    >
+                      ×
+                    </button>
+                  </li>
+                ))}
+              </ol>
+            </div>
+          )}
+        </div>
+
+        <div className="p-6 border-t border-hair space-y-2">
+          <button className="btn-primary" disabled={presentLen === 0} onClick={onNext}>
+            Group the shots · {fmtShort(presentLen)}
+          </button>
+          <p className="text-faint text-[12px] text-center">
+            {presentLen === 0
+              ? "Mark at least one Yes"
+              : unmarked > 0.05
+                ? `First ${fmtShort(unmarked)} unmarked counts as not in frame`
+                : watchedPct < 98
+                  ? `Only ${watchedPct}% reviewed; the rest keeps its last answer`
+                  : "Whole video reviewed"}
+          </p>
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="glass rounded-xl py-2">
+      <div className="text-[15px] tabular-nums">{value}</div>
+      <div className="text-faint text-[11px]">{label}</div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Step 3: Scenes
+
+function ScenesStep(props: {
+  p: Project;
+  src: string;
+  sel: string;
+  setSel: (s: string) => void;
+  present: { start: number; end: number }[];
+  absent: { start: number; end: number }[];
+  presentLen: number;
+  groupedLen: number;
+  onAuto: () => void;
+  onAdd: () => void;
+  onSetShot: (shotId: string, groupId: string | null) => void;
+  onPatch: (id: string, patch: Partial<Group>) => void;
+  onDelete: (id: string) => void;
+  onFlip: (a: number, b: number, present: boolean) => void;
+  onNewGroupFor: (shotId: string) => void;
+  onNext: () => void;
+  canNext: boolean;
+}) {
+  const { p, src, sel, setSel } = props;
+  const unassigned = p.shots.filter((s) => !s.groupId);
+  const coverage = props.presentLen ? Math.round((props.groupedLen / props.presentLen) * 100) : 0;
+  const group = p.groups.find((g) => g.id === sel);
+  const shownShots =
+    sel === "absent" ? [] : sel === "unassigned" ? unassigned : p.shots.filter((s) => s.groupId === sel);
+  const reel = sel === "absent" ? props.absent : shownShots.map((s) => ({ start: s.start, end: s.end }));
+
+  return (
+    <div className="grid lg:grid-cols-[280px_minmax(0,1fr)] lg:h-[calc(100dvh-4rem)]">
+      <aside className="lg:border-r border-hair p-5 space-y-5 overflow-y-auto">
+        <div className="space-y-2">
+          <div className="flex justify-between text-[12px]">
+            <span className="text-muted">Footage with him, grouped</span>
+            <span className="tabular-nums">{coverage}%</span>
+          </div>
+          <div className="h-1.5 rounded-full bg-white/10 overflow-hidden flex">
+            {p.groups.map((g) => {
+              const len = total(p.shots.filter((s) => s.groupId === g.id));
+              return <div key={g.id} style={{ width: `${(len / (props.presentLen || 1)) * 100}%`, background: g.color }} />;
+            })}
+          </div>
+          <p className="text-faint text-[11px]">
+            {fmtShort(props.groupedLen)} of {fmtShort(props.presentLen)} · {p.shots.length} shots
+          </p>
+        </div>
+
+        <nav className="space-y-1">
+          {p.groups.map((g) => {
+            const shots = p.shots.filter((s) => s.groupId === g.id);
+            return (
+              <SideItem
+                key={g.id}
+                on={sel === g.id}
+                onClick={() => setSel(g.id)}
+                color={g.color}
+                title={g.name}
+                meta={`${shots.length} shot${shots.length === 1 ? "" : "s"} · ${fmtShort(total(shots))}`}
+              />
+            );
+          })}
+          {unassigned.length > 0 && (
+            <SideItem
+              on={sel === "unassigned"}
+              onClick={() => setSel("unassigned")}
+              color="transparent"
+              ring
+              title="Not grouped yet"
+              meta={`${unassigned.length} shot${unassigned.length === 1 ? "" : "s"} · ${fmtShort(total(unassigned))}`}
+            />
+          )}
+          <div className="pt-3 mt-2 border-t border-hair">
+            <SideItem
+              on={sel === "absent"}
+              onClick={() => setSel("absent")}
+              color="rgba(255,255,255,0.15)"
+              title="Not in frame"
+              meta={`${props.absent.length} spans · ${fmtShort(total(props.absent))} · check he never appears`}
+            />
+          </div>
+        </nav>
+
+        <div className="flex flex-col gap-2">
+          <button className="btn" onClick={props.onAdd}>New look</button>
+          <button className="btn" onClick={props.onAuto}>Regroup with Claude</button>
+        </div>
+      </aside>
+
+      <section className="flex flex-col min-w-0 min-h-0">
+        <div className="flex-1 min-h-0 p-6 space-y-5 overflow-y-auto">
+          <div className="flex items-start gap-4">
+            <div className="flex-1 min-w-0 space-y-1">
+              {group ? (
+                <>
+                  <input
+                    value={group.name}
+                    onChange={(e) => props.onPatch(group.id, { name: e.target.value })}
+                    className="bg-transparent text-[22px] tracking-tight w-full outline-none"
+                  />
+                  <input
+                    value={group.description}
+                    onChange={(e) => props.onPatch(group.id, { description: e.target.value })}
+                    placeholder="How he looks here: outfit, headwear, sunglasses, framing"
+                    className="bg-transparent text-muted text-[13px] w-full outline-none placeholder:text-faint"
+                  />
+                </>
+              ) : (
+                <>
+                  <h2 className="text-[22px] tracking-tight">{sel === "absent" ? "Not in frame" : "Not grouped yet"}</h2>
+                  <p className="text-muted text-[13px]">
+                    {sel === "absent"
+                      ? "Play it through. He should never appear here. If he does, mark that span as him."
+                      : "Put every shot in a look before rendering."}
+                  </p>
+                </>
+              )}
+            </div>
+            {group && (
+              <button className="btn text-muted" onClick={() => props.onDelete(group.id)}>Delete look</button>
+            )}
+          </div>
+
+          <div className="max-w-4xl">
+            <ReelPlayer src={src} spans={reel} className="h-[44vh] max-w-full aspect-video mx-auto" />
+          </div>
+
+          {sel !== "absent" ? (
+            <div className="grid gap-3 grid-cols-2 md:grid-cols-3 xl:grid-cols-4">
+              {shownShots.map((s) => (
+                <figure key={s.id} className="space-y-1.5">
+                  <div className="relative rounded-xl overflow-hidden ring-1 ring-hair bg-black aspect-video">
+                    {s.thumb && (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={s.thumb} alt="" className="w-full h-full object-cover" />
+                    )}
+                    <span className="absolute left-1.5 bottom-1.5 text-[10px] tabular-nums bg-black/60 rounded px-1.5">
+                      {fmt(s.start)} · {fmtShort(s.end - s.start)}
+                    </span>
+                  </div>
+                  <div className="flex gap-1.5">
+                    <select
+                      value={s.groupId ?? ""}
+                      onChange={(e) =>
+                        e.target.value === "__new" ? props.onNewGroupFor(s.id) : props.onSetShot(s.id, e.target.value || null)
+                      }
+                      className="field py-1 px-2 text-[12px] flex-1 min-w-0"
+                    >
+                      <option value="">Not grouped</option>
+                      {p.groups.map((g) => (
+                        <option key={g.id} value={g.id}>{g.name}</option>
+                      ))}
+                      <option value="__new">+ New look</option>
+                    </select>
+                    <button
+                      className="btn h-8 px-2.5 text-[11px]"
+                      title="This isn't him: mark as not in frame"
+                      onClick={() => props.onFlip(s.start, s.end, false)}
+                    >
+                      Not him
+                    </button>
+                  </div>
+                </figure>
+              ))}
+            </div>
+          ) : (
+            <ol className="glass rounded-2xl p-1.5 max-w-2xl">
+              {props.absent.map((a) => (
+                <li key={`${a.start}`} className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-white/[0.04]">
+                  <span className="text-[12px] tabular-nums flex-1">
+                    {fmt(a.start)} – {fmt(a.end)} <span className="text-faint">· {fmtShort(a.end - a.start)}</span>
+                  </span>
+                  <button className="btn h-7 px-3 text-[12px]" onClick={() => props.onFlip(a.start, a.end, true)}>
+                    He&apos;s in this
+                  </button>
+                </li>
+              ))}
+            </ol>
+          )}
+        </div>
+        <div className="p-6 border-t border-hair flex items-center gap-4">
+          <span className="text-faint text-[12px] flex-1">
+            {unassigned.length
+              ? `${unassigned.length} shot${unassigned.length === 1 ? "" : "s"} still need a look`
+              : `${p.groups.length} looks · every shot with him is covered`}
+          </span>
+          <button className="btn-primary w-auto! px-8" disabled={!props.canNext} onClick={props.onNext}>
+            Set up renders
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function SideItem({
+  on,
+  onClick,
+  color,
+  title,
+  meta,
+  ring,
+}: {
+  on: boolean;
+  onClick: () => void;
+  color: string;
+  title: string;
+  meta: string;
+  ring?: boolean;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`w-full text-left px-3 py-2.5 rounded-xl flex gap-3 items-start transition-colors ${
+        on ? "bg-white/[0.09]" : "hover:bg-white/[0.04]"
+      }`}
+    >
+      <span
+        className={`mt-1 w-2.5 h-2.5 rounded-full shrink-0 ${ring ? "ring-1 ring-white/50" : ""}`}
+        style={{ background: color }}
+      />
+      <span className="min-w-0">
+        <span className="block text-[13px] truncate">{title}</span>
+        <span className="block text-faint text-[11px]">{meta}</span>
+      </span>
+    </button>
+  );
+}
+
+// ============================================================================
+// Step 4: Render
+
+function RenderStep(props: {
+  p: Project;
+  src: string;
+  tasks: Record<string, Task>;
+  onPatch: (id: string, patch: Partial<Group>) => void;
+  onAddRef: (gid: string, f: File) => void;
+  onRemoveRef: (gid: string, i: number) => void;
+  onWrite: (g: Group) => void;
+  onRender: (partIds: string[]) => void;
+  onNext: () => void;
+  onError: (m: string) => void;
+}) {
+  const { p } = props;
+  const pending = p.parts.filter((x) => x.status !== "done" && x.status !== "rendering" && x.status !== "building" && x.status !== "uploading");
+  const done = p.parts.filter((x) => x.status === "done").length;
+  const est = p.parts.reduce((s, pt) => {
+    const g = p.groups.find((x) => x.id === pt.groupId);
+    const m = RENDER_MODELS.find((x) => x.id === g?.modelId) ?? RENDER_MODELS[0];
+    return s + m.usdPerSec * pt.clipLength;
+  }, 0);
+  const missingFaces = p.groups.filter((g) => !g.refs.length);
+
+  const paste = async (gid: string) => {
+    try {
+      const items = await navigator.clipboard.read();
+      for (const it of items) {
+        const t = it.types.find((x) => x.startsWith("image/"));
+        if (t) props.onAddRef(gid, new File([await it.getType(t)], `pasted.${t.split("/")[1]}`, { type: t }));
+      }
+    } catch {
+      props.onError("Clipboard blocked. Use Add a face instead.");
+    }
+  };
+
+  return (
+    <div className="max-w-6xl mx-auto p-6 space-y-6">
+      <div className="glass rounded-2xl p-5 flex flex-wrap items-center gap-6">
+        <div className="space-y-1">
+          <h2 className="text-[20px] tracking-tight">Renders</h2>
+          <p className="text-muted text-[13px]">
+            {done} of {p.parts.length} parts done · about ${est.toFixed(2)} for everything
+          </p>
+        </div>
+        <div className="flex-1 min-w-48 h-1.5 rounded-full bg-white/10 overflow-hidden flex">
+          {p.parts.map((pt) => (
+            <div
+              key={pt.id}
+              className="h-full border-r border-black/50"
+              style={{
+                width: `${100 / (p.parts.length || 1)}%`,
+                background:
+                  pt.status === "done" ? "#fff" : pt.status === "failed" ? "rgba(252,165,165,0.8)" : pt.status === "idle" ? "transparent" : "rgba(255,255,255,0.4)",
+              }}
+            />
+          ))}
+        </div>
+        <button
+          className="btn btn-on"
+          disabled={!pending.length || missingFaces.length > 0}
+          title={missingFaces.length ? `Add a face to: ${missingFaces.map((g) => g.name).join(", ")}` : ""}
+          onClick={() => props.onRender(pending.map((x) => x.id))}
+        >
+          Render {pending.length ? `all ${pending.length}` : "all"}
+        </button>
+        <button className="btn" disabled={done === 0} onClick={props.onNext}>Assemble</button>
+      </div>
+
+      {p.groups.map((g) => {
+        const parts = p.parts.filter((x) => x.groupId === g.id);
+        const shots = p.shots.filter((s) => s.groupId === g.id);
+        const len = total(shots);
+        const model = RENDER_MODELS.find((m) => m.id === g.modelId) ?? RENDER_MODELS[0];
+        const writing = !!props.tasks[`prompt-${g.id}`];
+        return (
+          <section key={g.id} className="glass rounded-3xl p-5 space-y-5">
+            <header className="flex items-start gap-3">
+              <span className="mt-2 w-3 h-3 rounded-full" style={{ background: g.color }} />
+              <div className="flex-1 min-w-0">
+                <h3 className="text-[18px] tracking-tight">{g.name}</h3>
+                <p className="text-muted text-[13px]">{g.description}</p>
+                <p className="text-faint text-[12px] mt-0.5">
+                  {shots.length} shots · {fmtShort(len)} · {parts.length} part{parts.length === 1 ? "" : "s"}
+                </p>
+              </div>
+              <div className="flex gap-1.5 overflow-hidden max-w-[40%]">
+                {shots.slice(0, 5).map((s) =>
+                  s.thumb ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img key={s.id} src={s.thumb} alt="" className="h-12 aspect-video object-cover rounded-md ring-1 ring-hair" />
+                  ) : null,
+                )}
+              </div>
+            </header>
+
+            <div className="grid md:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)] gap-5">
+              <div className="space-y-4">
+                <div className="space-y-2">
+                  <span className="text-[13px]">Who goes in</span>
+                  <div className="flex flex-wrap gap-2 items-center">
+                    {g.refs.map((r, i) => (
+                      <RefThumb key={i} file={r} onRemove={() => props.onRemoveRef(g.id, i)} />
+                    ))}
+                    <button className="btn" onClick={() => paste(g.id)}>Paste</button>
+                    <label className="btn cursor-pointer">
+                      Add a face
+                      <input
+                        type="file"
+                        accept="image/*"
+                        multiple
+                        className="hidden"
+                        onChange={(e) => {
+                          Array.from(e.target.files ?? []).forEach((f) => props.onAddRef(g.id, f));
+                          e.target.value = "";
+                        }}
+                      />
+                    </label>
+                  </div>
+                  <p className="text-faint text-[11px]">
+                    Tip: for a sunglasses or hat look, add a second photo of him wearing that.
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <span className="text-[13px]">Model</span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {RENDER_MODELS.map((m) => (
+                      <button
+                        key={m.id}
+                        className={`btn h-8 px-3 text-[12px] ${g.modelId === m.id ? "btn-on" : ""}`}
+                        onClick={() => props.onPatch(g.id, { modelId: m.id })}
+                      >
+                        {m.name.replace(" (fal)", "")}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-faint text-[11px]">{model.note} · ~${model.usdPerSec}/s</p>
+                </div>
+                <textarea
+                  value={g.notes}
+                  onChange={(e) => props.onPatch(g.id, { notes: e.target.value })}
+                  placeholder="Notes for this look: keep the sunglasses, he turns sideways at the end…"
+                  className="field text-[13px] resize-none"
+                  rows={2}
+                />
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-[13px]">Prompt</span>
+                  <button className="btn h-7 px-3 text-[12px]" disabled={writing || !g.refs.length} onClick={() => props.onWrite(g)}>
+                    {writing ? "Writing…" : g.prompt ? "Rewrite with Claude" : "Write with Claude"}
+                  </button>
+                </div>
+                <textarea
+                  value={g.prompt}
+                  onChange={(e) => props.onPatch(g.id, { prompt: e.target.value })}
+                  placeholder="Empty uses a safe default: replace him in every shot, keep wardrobe and sunglasses."
+                  className="field text-[13px] leading-relaxed"
+                  rows={8}
+                />
+              </div>
+            </div>
+
+            <ol className="space-y-2">
+              {parts.map((pt, i) => (
+                <PartRow
+                  key={pt.id}
+                  part={pt}
+                  index={i}
+                  stale={!!pt.signature && pt.status === "done" && pt.signature !== signature(pt, g)}
+                  cost={model.usdPerSec * pt.clipLength}
+                  canRender={g.refs.length > 0}
+                  onRender={() => props.onRender([pt.id])}
+                />
+              ))}
+            </ol>
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
+function RefThumb({ file, onRemove }: { file: StoredFile; onRemove: () => void }) {
+  const url = useMemo(() => URL.createObjectURL(file.blob), [file.blob]);
+  return (
+    <span className="relative group">
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img src={url} alt="" className="h-12 w-12 rounded-full object-cover ring-1 ring-hair" />
+      <button
+        onClick={onRemove}
+        className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-white text-black text-[11px] opacity-0 group-hover:opacity-100"
+        aria-label="Remove face"
+      >
+        ×
+      </button>
+    </span>
+  );
+}
+
+function PartRow({
+  part,
+  index,
+  stale,
+  cost,
+  canRender,
+  onRender,
+}: {
+  part: Part;
+  index: number;
+  stale: boolean;
+  cost: number;
+  canRender: boolean;
+  onRender: () => void;
+}) {
+  const label: Record<Part["status"], string> = {
+    idle: "Ready",
+    building: "Building clip",
+    uploading: "Uploading",
+    rendering: "Rendering",
+    done: stale ? "Done · settings changed" : "Done",
+    failed: "Failed",
+  };
+  const busy = part.status === "building" || part.status === "uploading" || part.status === "rendering";
+  const padLen = part.clipLength - part.duration;
+  return (
+    <li className="rounded-2xl ring-1 ring-hair p-3 flex flex-wrap items-center gap-4">
+      <span className="text-[13px] w-16">Part {index + 1}</span>
+      <span className="text-muted text-[12px] tabular-nums w-48">
+        {part.pieces.length} pieces · {fmtShort(part.duration)}
+        {padLen > 0.05 ? ` + ${fmtShort(padLen)} loop` : ""}
+      </span>
+      <span className="flex items-center gap-2 text-[12px] min-w-40">
+        <span
+          className={`w-2 h-2 rounded-full ${busy ? "animate-pulse" : ""}`}
+          style={{
+            background:
+              part.status === "done" ? (stale ? "#fcd34d" : "#86efac") : part.status === "failed" ? "#fca5a5" : busy ? "#fff" : "rgba(255,255,255,0.3)",
+          }}
+        />
+        {label[part.status]}
+        {part.progress !== undefined && busy && <span className="text-faint tabular-nums">{Math.round(part.progress * 100)}%</span>}
+      </span>
+      {part.error && <span className="text-[12px] text-[#fca5a5] break-all flex-1 min-w-48">{part.error}</span>}
+      <span className="flex-1" />
+      {part.resultUrl && (
+        <video src={part.resultUrl} controls playsInline className="h-20 rounded-lg ring-1 ring-hair bg-black" />
+      )}
+      <span className="text-faint text-[12px] tabular-nums">~${cost.toFixed(2)}</span>
+      <button className={`btn ${part.status === "idle" ? "btn-on" : ""}`} disabled={busy || !canRender} onClick={onRender}>
+        {part.status === "done" || part.status === "failed" ? "Re-roll" : "Render"}
+      </button>
+    </li>
+  );
+}
+
+// ============================================================================
+// Step 5: Assemble
+
+function AssembleStep(props: {
+  p: Project;
+  present: { start: number; end: number }[];
+  rangeMode: "all" | "span";
+  setRangeMode: (m: "all" | "span") => void;
+  busy: boolean;
+  onAssemble: () => void;
+  outUrl: string | null;
+  onSave: () => void;
+  onBack: () => void;
+}) {
+  const { p } = props;
+  const span = props.present.length ? { start: props.present[0].start, end: props.present[props.present.length - 1].end } : null;
+  const doneShots = new Set(p.parts.filter((x) => x.status === "done").flatMap((x) => x.pieces.map((pc) => pc.shotId)));
+  const missingShots = p.shots.filter((s) => !doneShots.has(s.id));
+
+  return (
+    <div className="max-w-5xl mx-auto p-6 space-y-6">
+      <div className="grid md:grid-cols-[minmax(0,1fr)_320px] gap-6">
+        <div className="space-y-4">
+          {props.outUrl ? (
+            <video src={props.outUrl} controls playsInline className="w-full rounded-2xl ring-1 ring-hair bg-black" />
+          ) : (
+            <div className="aspect-video rounded-2xl ring-1 ring-hair bg-white/[0.02] grid place-items-center text-muted text-[13px]">
+              The assembled video shows up here
+            </div>
+          )}
+          <SpotTrack
+            duration={p.duration}
+            boundaries={p.boundaries}
+            cuts={null}
+            time={0}
+            watched={p.duration}
+            onSeek={() => {}}
+            groups={p.parts
+              .filter((x) => x.status === "done")
+              .flatMap((x) =>
+                x.pieces.map((pc) => ({ start: pc.start, end: pc.end, color: p.groups.find((g) => g.id === x.groupId)?.color ?? "#fff" })),
+              )}
+          />
+          <p className="text-faint text-[12px]">Colored marks under the bar are the rendered pieces that go back in.</p>
+        </div>
+
+        <aside className="space-y-5">
+          <div className="glass rounded-2xl p-4 space-y-3">
+            <h3 className="text-[14px]">Checklist</h3>
+            <ul className="space-y-2">
+              {p.groups.map((g) => {
+                const parts = p.parts.filter((x) => x.groupId === g.id);
+                const d = parts.filter((x) => x.status === "done").length;
+                return (
+                  <li key={g.id} className="flex items-center gap-2 text-[13px]">
+                    <span className="w-2.5 h-2.5 rounded-full" style={{ background: g.color }} />
+                    <span className="flex-1 truncate">{g.name}</span>
+                    <span className={`tabular-nums text-[12px] ${d === parts.length ? "" : "text-muted"}`}>
+                      {d === parts.length ? "✓" : `${d}/${parts.length}`}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+            {missingShots.length > 0 && (
+              <p className="text-[12px] text-muted">
+                {missingShots.length} shot{missingShots.length === 1 ? "" : "s"} ({fmtShort(total(missingShots))}) not rendered yet will
+                stay original.
+              </p>
+            )}
+          </div>
+
+          <div className="glass rounded-2xl p-4 space-y-3">
+            <h3 className="text-[14px]">Length</h3>
+            <label className="flex items-center gap-2 text-[13px] cursor-pointer">
+              <input type="radio" checked={props.rangeMode === "all"} onChange={() => props.setRangeMode("all")} className="accent-white" />
+              Whole video · {fmt(p.duration)}
+            </label>
+            {span && (
+              <label className="flex items-center gap-2 text-[13px] cursor-pointer">
+                <input type="radio" checked={props.rangeMode === "span"} onChange={() => props.setRangeMode("span")} className="accent-white" />
+                First to last appearance · {fmt(span.start)} – {fmt(span.end)}
+              </label>
+            )}
+            <p className="text-faint text-[11px]">Original audio throughout. Output at the render resolution.</p>
+          </div>
+
+          <button className="btn-primary" disabled={props.busy} onClick={props.onAssemble}>
+            {props.busy ? "Assembling…" : props.outUrl ? "Assemble again" : "Assemble"}
+          </button>
+          {props.outUrl && (
+            <button className="btn w-full h-10" onClick={props.onSave}>Save video</button>
+          )}
+          <button className="btn w-full" onClick={props.onBack}>Back to renders</button>
+        </aside>
+      </div>
+    </div>
+  );
+}

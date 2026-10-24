@@ -206,3 +206,179 @@ export async function probeVideoCodec(file: Blob): Promise<string | null> {
   }
   return codec;
 }
+
+// ---------------------------------------------------------------------------
+// Chapters engine. One ffmpeg instance is shared, so long jobs (scene detection
+// in the background, clip builds, assembly) run one at a time through a lock.
+
+let chain: Promise<unknown> = Promise.resolve();
+function exclusive<T>(fn: () => Promise<T>): Promise<T> {
+  const run = chain.then(fn, fn);
+  chain = run.catch(() => {});
+  return run;
+}
+
+let seq = 0;
+const tmp = (ext: string) => `t${++seq}.${ext}`;
+
+// Run ffmpeg and report progress from its "time=" log lines against an expected length.
+async function execTimed(ff: FFmpegLike, args: string[], total: number, onProgress?: (r: number) => void) {
+  const onLog = ({ message }: { message: string }) => {
+    const m = /time=(\d+):(\d+):([\d.]+)/.exec(message);
+    if (m && total > 0) onProgress?.(Math.min(1, (+m[1] * 3600 + +m[2] * 60 + +m[3]) / total));
+  };
+  ff.on("log", onLog);
+  try {
+    return await ff.exec(args);
+  } finally {
+    ff.off("log", onLog);
+  }
+}
+
+export async function fileHasAudio(blob: Blob): Promise<boolean> {
+  return exclusive(async () => {
+    const ff = await load();
+    const name = tmp("bin");
+    await ff.writeFile(name, await fetchFile(blob));
+    try {
+      return await hasAudio(ff, name);
+    } finally {
+      await ff.deleteFile(name).catch(() => {});
+    }
+  });
+}
+
+// Scene cuts (seconds) via ffmpeg's scene score on a downscaled decode.
+export async function detectCuts(
+  blob: Blob,
+  duration: number,
+  onProgress?: (r: number) => void,
+  threshold = 0.3,
+): Promise<number[]> {
+  return exclusive(async () => {
+    const ff = await load();
+    const name = tmp("mp4");
+    await ff.writeFile(name, await fetchFile(blob));
+    const cuts: number[] = [];
+    const onLog = ({ message }: { message: string }) => {
+      const m = /pts_time:([\d.]+)/.exec(message);
+      if (m) cuts.push(+m[1]);
+    };
+    ff.on("log", onLog);
+    try {
+      await execTimed(
+        ff,
+        ["-i", name, "-an", "-vf", `scale=160:-2,select='gt(scene,${threshold})',showinfo`, "-f", "null", "-"],
+        duration,
+        onProgress,
+      );
+    } finally {
+      ff.off("log", onLog);
+      await ff.deleteFile(name).catch(() => {});
+    }
+    return [...new Set(cuts.map((c) => Math.round(c * 1000) / 1000))].sort((a, b) => a - b);
+  });
+}
+
+type Span = { start: number; end: number };
+
+// Build one clip from several spans of the same source, back to back, conformed
+// to w x h. Spans are cut with input seeking so late spans don't decode the whole file.
+export async function buildClip(
+  source: Blob,
+  spans: Span[],
+  size: { w: number; h: number },
+  withAudio: boolean,
+  onProgress?: (r: number) => void,
+): Promise<File> {
+  return exclusive(async () => {
+    const ff = await load();
+    const src = tmp("mp4");
+    const out = tmp("mp4");
+    await ff.writeFile(src, await fetchFile(source));
+    const w = size.w - (size.w % 2);
+    const h = size.h - (size.h % 2);
+    const args: string[] = [];
+    spans.forEach((s) => args.push("-ss", s.start.toFixed(3), "-t", (s.end - s.start).toFixed(3), "-i", src));
+    const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24,format=yuv420p`;
+    let graph = "";
+    let ins = "";
+    spans.forEach((_, i) => {
+      graph += `[${i}:v]setpts=PTS-STARTPTS,${vf}[v${i}];`;
+      if (withAudio) graph += `[${i}:a]asetpts=PTS-STARTPTS,aresample=48000[a${i}];`;
+      ins += withAudio ? `[v${i}][a${i}]` : `[v${i}]`;
+    });
+    graph += `${ins}concat=n=${spans.length}:v=1:a=${withAudio ? 1 : 0}[v]${withAudio ? "[a]" : ""}`;
+    const total = spans.reduce((t, s) => t + s.end - s.start, 0);
+    const code = await execTimed(
+      ff,
+      [
+        ...args,
+        "-filter_complex", graph,
+        "-map", "[v]",
+        ...(withAudio ? ["-map", "[a]", "-c:a", "aac", "-ac", "2"] : []),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-movflags", "+faststart", "-y", out,
+      ],
+      total,
+      onProgress,
+    );
+    try {
+      if (code !== 0) throw new Error("Building the clip failed (ffmpeg exit " + code + ")");
+      const data = (await ff.readFile(out)) as Uint8Array;
+      return new File([data.slice().buffer as ArrayBuffer], "group-clip.mp4", { type: "video/mp4" });
+    } finally {
+      await ff.deleteFile(src).catch(() => {});
+      await ff.deleteFile(out).catch(() => {});
+    }
+  });
+}
+
+export type TimelinePiece = { file: number; start: number; end: number }; // file 0 = source
+
+// Lay pieces end to end, conform every piece to w x h, and put the source's own
+// audio for [audioStart, audioEnd] underneath.
+export async function assembleTimeline(
+  files: Blob[],
+  pieces: TimelinePiece[],
+  audio: { start: number; end: number } | null,
+  size: { w: number; h: number },
+  onProgress?: (r: number) => void,
+): Promise<File> {
+  return exclusive(async () => {
+    const ff = await load();
+    const names = files.map(() => tmp("mp4"));
+    for (let i = 0; i < files.length; i++) await ff.writeFile(names[i], await fetchFile(files[i]));
+    const out = tmp("mp4");
+    const w = size.w - (size.w % 2);
+    const h = size.h - (size.h % 2);
+    const args: string[] = [];
+    pieces.forEach((p) => args.push("-ss", p.start.toFixed(3), "-t", (p.end - p.start).toFixed(3), "-i", names[p.file]));
+    if (audio) args.push("-ss", audio.start.toFixed(3), "-t", (audio.end - audio.start).toFixed(3), "-i", names[0]);
+    const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24,format=yuv420p`;
+    let graph = "";
+    pieces.forEach((_, i) => (graph += `[${i}:v]setpts=PTS-STARTPTS,${vf}[v${i}];`));
+    graph += pieces.map((_, i) => `[v${i}]`).join("") + `concat=n=${pieces.length}:v=1:a=0[v]`;
+    const total = pieces.reduce((t, p) => t + p.end - p.start, 0);
+    const code = await execTimed(
+      ff,
+      [
+        ...args,
+        "-filter_complex", graph,
+        "-map", "[v]",
+        ...(audio ? ["-map", `${pieces.length}:a:0?`, "-c:a", "aac", "-b:a", "192k", "-shortest"] : []),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-movflags", "+faststart", "-y", out,
+      ],
+      total,
+      onProgress,
+    );
+    try {
+      if (code !== 0) throw new Error("Assembly failed (ffmpeg exit " + code + ")");
+      const data = (await ff.readFile(out)) as Uint8Array;
+      return new File([data.slice().buffer as ArrayBuffer], "assembled.mp4", { type: "video/mp4" });
+    } finally {
+      for (const n of [...names, out]) await ff.deleteFile(n).catch(() => {});
+    }
+  });
+}
