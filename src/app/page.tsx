@@ -104,6 +104,7 @@ export default function Home() {
   const [direction, setDirection] = useState<Direction | null>(null);
   const [directed, setDirected] = useState("");
   const [directing, setDirecting] = useState(false);
+  const pasteTarget = useRef<"face" | "shot">("face");
 
   // Dev only: ?clip=/dev-long.mp4 loads a clip from /public for quick checks.
   useEffect(() => {
@@ -148,18 +149,45 @@ export default function Home() {
     return () => window.removeEventListener("keydown", onKey);
   });
 
-  // Paste a face straight from the clipboard.
+  function addPastedImage(f: File) {
+    if (pasteTarget.current === "shot") addShot(f.name || "pasted.png", f);
+    else setCast((c) => (c.length >= 4 ? c : [...c, { file: f, preview: URL.createObjectURL(f), who: "" }]));
+  }
+
+  // ⌘V anywhere drops the image into whichever list you last pasted into (faces by default).
   useEffect(() => {
     const onPaste = (e: ClipboardEvent) => {
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
       const item = Array.from(e.clipboardData?.items ?? []).find((i) => i.type.startsWith("image/"));
       const f = item?.getAsFile();
       if (!f) return;
       e.preventDefault();
-      setCast((c) => (c.length >= 4 ? c : [...c, { file: f, preview: URL.createObjectURL(f), who: "" }]));
+      addPastedImage(f);
     };
     window.addEventListener("paste", onPaste);
     return () => window.removeEventListener("paste", onPaste);
-  }, []);
+  });
+
+  // Paste button: read the clipboard directly.
+  async function pasteFromClipboard(target: "face" | "shot") {
+    pasteTarget.current = target;
+    setError(null);
+    try {
+      const items = await navigator.clipboard.read();
+      let found = false;
+      for (const it of items) {
+        const type = it.types.find((t) => t.startsWith("image/"));
+        if (!type) continue;
+        const blob = await it.getType(type);
+        addPastedImage(new File([blob], `pasted-${Date.now()}.${type.split("/")[1]}`, { type }));
+        found = true;
+      }
+      if (!found) setError("No image on the clipboard.");
+    } catch {
+      setError("Clipboard blocked by the browser. Click the page and press ⌘V instead.");
+    }
+  }
 
   const model = MODELS.find((m) => m.id === modelId)!;
   // What will actually be sent: the selected window while trimming, else the clip.
@@ -590,9 +618,9 @@ export default function Home() {
         {/* Stage */}
         <section className="px-6 pb-8 flex flex-col gap-4 min-w-0">
           <div
-            className={`relative rounded-2xl overflow-hidden bg-black aspect-video ring-1 transition-shadow ${
-              dragging ? "ring-white shadow-[0_0_0_8px_rgba(255,255,255,0.08)]" : "ring-hair"
-            }`}
+            className={`relative mx-auto max-w-full aspect-video rounded-2xl overflow-hidden bg-black ring-1 transition-shadow ${
+              mode === "trim" && localVideo ? "h-[42vh]" : "h-[52vh]"
+            } ${dragging ? "ring-white shadow-[0_0_0_8px_rgba(255,255,255,0.08)]" : "ring-hair"}`}
             onDragOver={(e) => {
               e.preventDefault();
               setDragging(true);
@@ -974,6 +1002,8 @@ export default function Home() {
                 </div>
               ))}
               {cast.length < 4 && (
+                <div className="flex gap-2">
+                <button className="btn" onClick={() => pasteFromClipboard("face")}>Paste face</button>
                 <label className="btn cursor-pointer">
                   {cast.length ? "Add another" : "Add a face"}
                   <input
@@ -988,9 +1018,10 @@ export default function Home() {
                     }}
                   />
                 </label>
+                </div>
               )}
               <p className="text-faint text-[12px] leading-relaxed">
-                One photo per person, or paste with ⌘V. Say who each one replaces by look and position.
+                One photo per person. Say who each one replaces by look and position.
               </p>
             </div>
 
@@ -1021,6 +1052,8 @@ export default function Home() {
                   ))}
                 </div>
               )}
+              <div className="flex gap-2">
+              <button className="btn" onClick={() => pasteFromClipboard("shot")}>Paste shot</button>
               <label className="btn cursor-pointer">
                 {shots.length ? "Add more shots" : "Add target shots"}
                 <input
@@ -1034,6 +1067,7 @@ export default function Home() {
                   }}
                 />
               </label>
+              </div>
               <textarea
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}
