@@ -1042,8 +1042,28 @@ export default function Chapters() {
     setError(null);
     const waits: Promise<void>[] = [];
     for (const id of ids) {
-      const part = p.parts.find((x) => x.id === id);
+      let part = p.parts.find((x) => x.id === id);
       if (!part) continue;
+      // Re-rolling a finished part renders a copy, so the existing take stays saved.
+      if (part.status === "done") {
+        const copy: Part = {
+          ...part,
+          id: uid(),
+          status: "idle",
+          resultUrl: undefined,
+          requestId: undefined,
+          renderedAt: undefined,
+          measuredOffsets: undefined,
+          calibrated: false,
+          trims: undefined,
+          rejected: undefined,
+          reviewed: undefined,
+          unused: undefined,
+          issues: undefined,
+        };
+        update((x) => ({ ...x, parts: [...x.parts, copy] }));
+        part = copy;
+      }
       const job = await startPart(part);
       if (job) waits.push(waitPart(id, job));
     }
