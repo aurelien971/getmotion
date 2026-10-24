@@ -23,6 +23,8 @@ import {
   findIssues,
   partKey,
   keptRange,
+  pieceLive,
+  takesFor,
   type Issue,
   pending as pendingFor,
   emptyProject,
@@ -800,6 +802,50 @@ export default function Chapters() {
     }
   }
 
+  // Review decisions. Using a take parks every other take of the same shot (kept, not
+  // deleted); Redo marks all of them unwanted so the shot is queued again.
+  function useTake(shotRange: { start: number; end: number }, partId: string, j: number) {
+    update((x) => {
+      const others = takesFor(x, shotRange).filter((t) => !(t.part.id === partId && t.j === j));
+      return {
+        ...x,
+        parts: x.parts.map((pt) => {
+          let next = pt;
+          if (pt.id === partId) {
+            next = {
+              ...next,
+              reviewed: [...new Set([...(pt.reviewed ?? []), j])],
+              rejected: (pt.rejected ?? []).filter((k) => k !== j),
+              unused: (pt.unused ?? []).filter((k) => k !== j),
+            };
+          }
+          const mine = others.filter((t) => t.part.id === pt.id).map((t) => t.j);
+          if (mine.length) next = { ...next, unused: [...new Set([...(next.unused ?? []), ...mine])] };
+          return next;
+        }),
+      };
+    });
+  }
+  function redoShot(shotRange: { start: number; end: number }) {
+    update((x) => {
+      const takes = takesFor(x, shotRange);
+      return {
+        ...x,
+        parts: x.parts.map((pt) => {
+          const mine = takes.filter((t) => t.part.id === pt.id).map((t) => t.j);
+          return mine.length
+            ? {
+                ...pt,
+                rejected: [...new Set([...(pt.rejected ?? []), ...mine])],
+                unused: (pt.unused ?? []).filter((k) => !mine.includes(k)),
+                reviewed: (pt.reviewed ?? []).filter((k) => !mine.includes(k)),
+              }
+            : pt;
+        }),
+      };
+    });
+  }
+
   // Keep only the frames picked in a rendered piece. Cut-off frames that sit across a
   // hard cut in the original are another scene's: the shot edge moves so they belong
   // there. The rest stay in this look and go into its next render.
@@ -1066,7 +1112,7 @@ export default function Chapters() {
   // What's already covered: finished/running renders with their trims and redos.
   const coverKey = p.parts
     .filter((x) => x.status !== "idle" && x.status !== "failed")
-    .map((x) => `${x.id}:${x.status}:${JSON.stringify(x.trims ?? {})}:${(x.rejected ?? []).join(",")}`)
+    .map((x) => `${x.id}:${x.status}:${JSON.stringify(x.trims ?? {})}:${(x.rejected ?? []).join(",")}:${(x.unused ?? []).join(",")}`)
     .join("|");
   useEffect(() => {
     if (!loaded || !p.groups.length) return;
@@ -1141,7 +1187,7 @@ export default function Chapters() {
       let reps: Rep[] = [];
       done.forEach((d, i) =>
         d.pieces.forEach((pc, j) => {
-          if (d.rejected?.includes(j)) return;
+          if (!pieceLive(d, j)) return;
           const kept = keptRange(d, j);
           const at = (d.measuredOffsets?.[j] ?? pc.offset) + (kept.start - pc.start);
           pc = { ...pc, start: kept.start, end: kept.end };
@@ -1376,6 +1422,8 @@ export default function Chapters() {
             onAnalyze={analyzeWardrobe}
             onRender={renderParts}
             onCheck={checkParts}
+            onUseTake={useTake}
+            onRedoShot={redoShot}
             onTrimPiece={(id, j) => setTrimmingRender({ partId: id, j })}
             onFix={fixIssues}
             onReject={(id, j, rejected) =>
@@ -1384,7 +1432,13 @@ export default function Chapters() {
                 parts: x.parts.map((pt) =>
                   pt.id !== id
                     ? pt
-                    : { ...pt, rejected: rejected ? [...new Set([...(pt.rejected ?? []), j])] : (pt.rejected ?? []).filter((k) => k !== j) },
+                    : {
+                        ...pt,
+                        rejected: rejected ? [...new Set([...(pt.rejected ?? []), j])] : (pt.rejected ?? []).filter((k) => k !== j),
+                        // Keep in the part's own review counts as reviewed.
+                        reviewed: rejected ? (pt.reviewed ?? []).filter((k) => k !== j) : [...new Set([...(pt.reviewed ?? []), j])],
+                        unused: (pt.unused ?? []).filter((k) => k !== j),
+                      },
                 ),
               }))
             }
@@ -2188,6 +2242,8 @@ function RenderStep(props: {
   onAnalyze: (g: Group) => void;
   onRender: (partIds: string[]) => void;
   onCheck: (partIds: string[]) => void;
+  onUseTake: (shot: { start: number; end: number }, partId: string, j: number) => void;
+  onRedoShot: (shot: { start: number; end: number }) => void;
   onTrimPiece: (partId: string, piece: number) => void;
   onFix: (part: Part) => void;
   onReject: (partId: string, piece: number, rejected: boolean) => void;
@@ -2269,7 +2325,7 @@ function RenderStep(props: {
                     const k = keptRange(x, j);
                     return { start: k.start, end: k.end, offset: (x.measuredOffsets?.[j] ?? pc.offset) + (k.start - pc.start), url: x.resultUrl!, j };
                   })
-                  .filter((r) => !x.rejected?.includes(r.j)),
+                  .filter((r) => pieceLive(x, r.j)),
               )
               .reverse()}
             className="h-[34vh] max-w-full aspect-video mx-auto"
@@ -2324,6 +2380,14 @@ function RenderStep(props: {
           <p className="text-[12px] text-muted">Add a face to {missingFaces.map((g) => g.name).join(", ")} to render.</p>
         )}
       </section>
+
+      <ReviewPanel
+        p={p}
+        range={range}
+        onUse={props.onUseTake}
+        onRedo={props.onRedoShot}
+        onTrim={(partId, j) => props.onTrimPiece(partId, j)}
+      />
 
       <section className="glass rounded-3xl p-5 space-y-3">
         <div className="flex flex-wrap items-center gap-3">
@@ -2618,6 +2682,166 @@ function WardrobePanel({
         {group.promptEdited ? "Rebuild prompt (replaces your edits)" : "Rebuild prompt from checklist"}
       </button>
     </div>
+  );
+}
+
+type ShotState = "done" | "review" | "missing" | "queued";
+
+function ReviewPanel({
+  p,
+  range,
+  onUse,
+  onRedo,
+  onTrim,
+}: {
+  p: Project;
+  range: { start: number; end: number };
+  onUse: (shot: { start: number; end: number }, partId: string, j: number) => void;
+  onRedo: (shot: { start: number; end: number }) => void;
+  onTrim: (partId: string, j: number) => void;
+}) {
+  const [open, setOpen] = useState<string | null>(null);
+  const [playing, setPlaying] = useState<{ shot: string; take: string } | null>(null);
+  const rows = p.shots
+    .filter((s) => s.groupId && s.end > range.start + 1e-3 && s.start < range.end - 1e-3)
+    .sort((a, b) => a.start - b.start)
+    .map((s) => {
+      const r = { start: Math.max(s.start, range.start), end: Math.min(s.end, range.end) };
+      const takes = takesFor(p, r);
+      const live = takes.filter((t) => t.live);
+      const chosen = live[live.length - 1];
+      const inFlight = p.parts.some(
+        (pt) => (pt.status === "rendering" || pt.status === "building" || pt.status === "uploading") && pt.pieces.some((pc) => pc.end > r.start && pc.start < r.end),
+      );
+      const state: ShotState = chosen ? (live.every((t) => t.reviewed) ? "done" : "review") : inFlight ? "queued" : "missing";
+      return { shot: s, r, takes, chosen, state };
+    });
+  const len = (range.end - range.start) || 1;
+  const pct = (t: number) => `${((t - range.start) / len) * 100}%`;
+  const count = (st: ShotState) => rows.filter((x) => x.state === st).length;
+  const color: Record<ShotState, string> = {
+    done: "#ffffff",
+    review: "#fcd34d",
+    missing: "#fca5a5",
+    queued: "rgba(255,255,255,0.35)",
+  };
+  const label: Record<ShotState, string> = { done: "Reviewed", review: "To review", missing: "Needs a render", queued: "Rendering" };
+  const nextUp = rows.find((x) => x.state === "review");
+
+  return (
+    <section className="glass rounded-3xl p-5 space-y-4">
+      <div className="flex flex-wrap items-end gap-3">
+        <div className="flex-1 min-w-60">
+          <h2 className="text-[17px] tracking-tight">Review</h2>
+          <p className="text-muted text-[13px]">
+            Every shot with him in the span, with every take ever rendered for it. Pick the take to use; old takes are kept.
+          </p>
+        </div>
+        <div className="flex gap-3 text-[12px] tabular-nums">
+          {(["done", "review", "missing", "queued"] as ShotState[]).map((st) => (
+            <span key={st} className="inline-flex items-center gap-1.5">
+              <span className="w-2.5 h-2.5 rounded-sm" style={{ background: color[st] }} /> {count(st)} {label[st].toLowerCase()}
+            </span>
+          ))}
+        </div>
+        <button className="btn btn-on" disabled={!nextUp} onClick={() => nextUp && setOpen(nextUp.shot.id)}>
+          {nextUp ? "Next to review" : "All reviewed"}
+        </button>
+      </div>
+
+      <div className="relative h-6 rounded-lg overflow-hidden bg-white/[0.04] ring-1 ring-hair">
+        {rows.map((x) => (
+          <button
+            key={x.shot.id}
+            onClick={() => setOpen(x.shot.id)}
+            className={`absolute inset-y-0 border-r border-black/50 ${open === x.shot.id ? "ring-2 ring-inset ring-white" : ""}`}
+            style={{ left: pct(x.r.start), width: pct(range.start + x.r.end - x.r.start), background: color[x.state], opacity: x.state === "done" ? 0.85 : 0.75 }}
+            title={`${fmt(x.r.start)} · ${label[x.state]}`}
+          />
+        ))}
+      </div>
+
+      <ol className="max-h-[60vh] overflow-y-auto space-y-1.5 pr-1">
+        {rows.map((x, idx) => {
+          const g = p.groups.find((gg) => gg.id === x.shot.groupId);
+          const isOpen = open === x.shot.id;
+          return (
+            <li key={x.shot.id} className={`rounded-2xl ring-1 ${isOpen ? "ring-white/40 bg-white/[0.03]" : "ring-hair"} p-2.5`}>
+              <button className="w-full flex items-center gap-3 text-left" onClick={() => setOpen(isOpen ? null : x.shot.id)}>
+                <span className="w-2 h-2 rounded-full shrink-0" style={{ background: color[x.state] }} />
+                <span className="text-faint text-[11px] tabular-nums w-6">{idx + 1}</span>
+                {x.shot.thumb && (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={x.shot.thumb} alt="" className="h-9 aspect-video object-cover rounded-md ring-1 ring-hair" />
+                )}
+                <span className="flex-1 min-w-0">
+                  <span className="block text-[12px] tabular-nums">
+                    {fmt(x.r.start)} – {fmt(x.r.end)} <span className="text-faint">· {Math.round((x.r.end - x.r.start) * p.fps)}f</span>
+                  </span>
+                  <span className="block text-[11px] text-muted truncate">
+                    <span className="inline-block w-1.5 h-1.5 rounded-full mr-1.5 align-middle" style={{ background: g?.color }} />
+                    {g?.name} · {x.takes.length} take{x.takes.length === 1 ? "" : "s"}
+                  </span>
+                </span>
+                <span className="text-[11px] text-muted">{label[x.state]}</span>
+              </button>
+
+              {isOpen && (
+                <div className="mt-3 space-y-3">
+                  {x.takes.length === 0 ? (
+                    <p className="text-[12px] text-muted">
+                      No take yet. {x.state === "queued" ? "It's rendering." : "It's in a Ready part below; render it."}
+                    </p>
+                  ) : (
+                    <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                      {x.takes.map((t, n) => {
+                        const key = `${t.part.id}:${t.j}`;
+                        const off = (t.part.measuredOffsets?.[t.j] ?? t.part.pieces[t.j].offset) + (t.range.start - t.part.pieces[t.j].start);
+                        const isChosen = x.chosen && x.chosen.part.id === t.part.id && x.chosen.j === t.j;
+                        return (
+                          <div key={key} className={`rounded-xl p-2 space-y-2 ring-1 ${isChosen ? "ring-white" : "ring-hair"} ${t.rejected ? "opacity-50" : ""}`}>
+                            {playing?.shot === x.shot.id && playing.take === key ? (
+                              <ReelPlayer src={t.part.resultUrl!} fps={24} spans={[{ start: off, end: off + (t.range.end - t.range.start) }]} className="aspect-video" />
+                            ) : (
+                              <button
+                                className="w-full aspect-video rounded-lg bg-black ring-1 ring-hair grid place-items-center text-[12px] text-muted hover:text-ink"
+                                onClick={() => setPlaying({ shot: x.shot.id, take: key })}
+                              >
+                                ▶ Play take {n + 1}
+                              </button>
+                            )}
+                            <div className="flex items-center gap-2 text-[11px]">
+                              <span className="flex-1 text-muted tabular-nums">
+                                Take {n + 1} · {new Date(t.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                                {isChosen ? (t.reviewed ? " · in use ✓" : " · in use, not reviewed") : t.rejected ? " · redo" : " · alternative"}
+                              </span>
+                              <button className="btn h-7 px-2.5 text-[11px]" onClick={() => onTrim(t.part.id, t.j)}>Trim</button>
+                              <button
+                                className={`btn h-7 px-2.5 text-[11px] ${isChosen && t.reviewed ? "btn-on" : ""}`}
+                                onClick={() => onUse(x.r, t.part.id, t.j)}
+                              >
+                                Use this take
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {x.takes.length > 0 && (
+                    <div className="flex justify-end">
+                      <button className="btn h-8 px-3 text-[12px]" onClick={() => onRedo(x.r)}>
+                        None of these: redo this shot
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ol>
+    </section>
   );
 }
 

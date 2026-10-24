@@ -162,7 +162,36 @@ export type Part = {
   checkedKey?: string; // pieces the last clean check was for
   rejected?: number[]; // piece indices marked Redo after review
   trims?: Record<number, { start: number; end: number }>; // kept source range of a piece after review
+  reviewed?: number[]; // pieces confirmed in review ("Use this take")
+  unused?: number[]; // pieces parked because another take of the same footage is used
 };
+
+// A piece counts toward the video unless it was redone or parked for another take.
+export const pieceLive = (pt: Part, j: number) => !pt.rejected?.includes(j) && !pt.unused?.includes(j);
+
+export type Take = { part: Part; j: number; range: Interval; at: number; live: boolean; reviewed: boolean; rejected: boolean };
+
+// Every rendered take that overlaps a span of source footage, oldest first.
+export function takesFor(p: Project, r: Interval): Take[] {
+  const out: Take[] = [];
+  for (const pt of p.parts) {
+    if (pt.status !== "done" || !pt.resultUrl) continue;
+    pt.pieces.forEach((_, j) => {
+      const k = keptRange(pt, j);
+      if (k.end <= r.start + 1e-3 || k.start >= r.end - 1e-3) return;
+      out.push({
+        part: pt,
+        j,
+        range: k,
+        at: pt.renderedAt ?? 0,
+        live: pieceLive(pt, j),
+        reviewed: !!pt.reviewed?.includes(j),
+        rejected: !!pt.rejected?.includes(j),
+      });
+    });
+  }
+  return out.sort((a, b) => a.at - b.at);
+}
 
 // The source range a piece actually contributes (its trim, if reviewed).
 export const keptRange = (pt: Part, j: number) => pt.trims?.[j] ?? { start: pt.pieces[j].start, end: pt.pieces[j].end };
@@ -391,7 +420,7 @@ export function covered(p: Project, groupId?: string): Interval[] {
     // A render whose shot edges changed no longer counts: its footage gets a fresh part.
     .filter((x) => !(x.status === "done" && renderOutdated(p, x)))
     .flatMap((x) =>
-      x.pieces.flatMap((_, j) => (x.rejected?.includes(j) ? [] : [keptRange(x, j)])),
+      x.pieces.flatMap((_, j) => (pieceLive(x, j) ? [keptRange(x, j)] : [])),
     );
   return merge(xs);
 }
@@ -551,7 +580,7 @@ export function renderOutdated(p: Project, part: Part): boolean {
   const shots = p.shots.filter((s) => s.groupId === part.groupId);
   const tol = 0.5 / p.fps;
   return part.pieces.some((_, j) => {
-    if (part.rejected?.includes(j)) return false;
+    if (!pieceLive(part, j)) return false;
     const r = keptRange(part, j);
     return !shots.some((s) => r.start >= s.start - tol && r.end <= s.end + tol);
   });
