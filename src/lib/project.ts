@@ -60,7 +60,8 @@ export type Project = {
   hasAudio: boolean;
   boundaries: Boundary[];
   watched: number; // furthest point reviewed while spotting
-  cuts: number[] | null; // null = not detected yet
+  cuts: number[] | null; // null = not detected yet; times on the original file
+  preparedOffset?: number; // copy time = original time + offset (converted copies drift a couple of frames)
   shots: Shot[];
   groups: Group[];
   parts: Part[];
@@ -270,3 +271,20 @@ export const fmt = (s: number) => {
   return `${m}:${(s % 60).toFixed(1).padStart(4, "0")}`;
 };
 export const fmtShort = (s: number) => `${s.toFixed(1)}s`;
+
+// Move an edge (a spotting mark and/or a scene cut sitting at `from`) to `to`.
+export function moveEdge(
+  boundaries: Boundary[],
+  cuts: number[],
+  from: number,
+  to: number,
+  tol: number,
+): { boundaries: Boundary[]; cuts: number[] } {
+  if (Math.abs(from - to) < 1e-6) return { boundaries, cuts };
+  let hit = false;
+  const b = boundaries.map((x) => (Math.abs(x.t - from) < tol ? ((hit = true), { ...x, t: to }) : x));
+  const c = cuts.map((x) => (Math.abs(x - from) < tol ? ((hit = true), to) : x));
+  if (!hit) c.push(to);
+  b.sort((x, y) => x.t - y.t);
+  return { boundaries: b, cuts: [...new Set(c)].sort((x, y) => x - y) };
+}

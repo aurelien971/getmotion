@@ -20,6 +20,7 @@ import {
   intervals,
   mark,
   markSpan,
+  moveEdge,
   nearest,
   notPresent,
   signature,
@@ -34,6 +35,7 @@ import {
   type StoredFile,
 } from "@/lib/project";
 import { kv } from "@/lib/store";
+import { measureOffset, openReader, refineEdge } from "@/lib/sync";
 import { assembleTimeline, buildClip, detectCuts, fileHasAudio, probeVideo, warmUp } from "@/lib/trim";
 import { transcodeInBrowser } from "@/lib/transcode";
 
@@ -190,7 +192,7 @@ export default function Chapters() {
 
   useEffect(() => {
     if (process.env.NODE_ENV === "development") {
-      (window as unknown as { __engine: unknown }).__engine = { buildClip, assembleTimeline, detectCuts };
+      (window as unknown as { __engine: unknown }).__engine = { buildClip, assembleTimeline, detectCuts, measureOffset };
     }
   }, []);
 
@@ -255,13 +257,29 @@ export default function Chapters() {
     if (!loaded || !p.prepared || p.cuts !== null || running.current.cuts) return;
     running.current.cuts = true;
     const prepared = p.prepared;
+    const source = p.source;
     const dur = p.duration;
+    const fps = p.fps;
     (async () => {
       try {
         const audio = await fileHasAudio(prepared.blob).catch(() => true);
         update((x) => ({ ...x, hasAudio: audio }));
+        let offset = 0;
+        if (source && prepared.blob !== source.blob) {
+          setTask("cuts", { label: "Aligning the converted copy", pct: null });
+          const a = URL.createObjectURL(source.blob);
+          const b = URL.createObjectURL(prepared.blob);
+          try {
+            offset = (await measureOffset(a, b, fps, dur)) ?? 0;
+          } finally {
+            URL.revokeObjectURL(a);
+            URL.revokeObjectURL(b);
+          }
+        }
+        update((x) => ({ ...x, preparedOffset: offset }));
         setTask("cuts", { label: "Finding scene cuts", pct: 0 });
-        const cuts = await detectCuts(prepared.blob, dur, (r) => setTask("cuts", { label: "Finding scene cuts", pct: r }));
+        const raw = await detectCuts(prepared.blob, dur, (r) => setTask("cuts", { label: "Finding scene cuts", pct: r }));
+        const cuts = raw.map((c) => Math.round((c - offset) * 1000) / 1000).filter((c) => c > 0);
         update((x) => ({ ...x, cuts }));
         flash(`${cuts.length} scene cuts found`);
       } catch (e) {
@@ -272,7 +290,25 @@ export default function Chapters() {
         running.current.cuts = false;
       }
     })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded, p.prepared, p.cuts, p.duration, update]);
+
+  // Older projects: measure the copy's offset once (cuts stay as they are; use Resync).
+  useEffect(() => {
+    if (!loaded || !p.source || !p.prepared || p.preparedOffset !== undefined || running.current.offset || p.cuts === null) return;
+    running.current.offset = true;
+    const a = URL.createObjectURL(p.source.blob);
+    const b = URL.createObjectURL(p.prepared.blob);
+    const same = p.source.blob === p.prepared.blob;
+    (same ? Promise.resolve(0) : measureOffset(a, b, p.fps, p.duration))
+      .then((off) => update((x) => ({ ...x, preparedOffset: off ?? 0 })))
+      .catch(() => update((x) => ({ ...x, preparedOffset: 0 })))
+      .finally(() => {
+        URL.revokeObjectURL(a);
+        URL.revokeObjectURL(b);
+        running.current.offset = false;
+      });
+  }, [loaded, p.source, p.prepared, p.preparedOffset, p.cuts, p.fps, p.duration, update]);
 
   // ---- source ----------------------------------------------------------------
   async function onSource(file: File) {
@@ -439,38 +475,74 @@ export default function Chapters() {
     const shot = p.shots.find((s) => s.id === shotId);
     if (!shot) return;
     const tol = 0.6 / p.fps;
-    const moveIn = (xs: number[], from: number, to: number) => {
-      let hit = false;
-      const out = xs.map((x) => (Math.abs(x - from) < tol ? ((hit = true), to) : x));
-      return { out, hit };
-    };
-    let boundaries = p.boundaries.map((b) => ({ ...b }));
-    let cuts = [...(p.cuts ?? [])];
-    for (const [from, to] of [
-      [shot.start, newStart],
-      [shot.end, newEnd],
-    ] as const) {
-      if (Math.abs(from - to) < 1e-6) continue;
-      const b = moveIn(boundaries.map((x) => x.t), from, to);
-      if (b.hit) boundaries = boundaries.map((x, i) => ({ ...x, t: b.out[i] }));
-      const c = moveIn(cuts, from, to);
-      if (c.hit) cuts = c.out;
-      if (!b.hit && !c.hit) cuts.push(to); // edge came from nowhere we track: add a cut
-    }
-    boundaries.sort((a, b) => a.t - b.t);
-    cuts = [...new Set(cuts)].sort((a, b) => a - b);
-    const next = { ...p, boundaries, cuts };
+    let st = { boundaries: p.boundaries, cuts: p.cuts ?? [] };
+    st = moveEdge(st.boundaries, st.cuts, shot.start, newStart, tol);
+    st = moveEdge(st.boundaries, st.cuts, shot.end, newEnd, tol);
+    const next = { ...p, ...st };
     const shots = buildShots(next);
-    // The trimmed shot keeps its group even if its id changed.
     const trimmed = shots.find((s) => Math.abs(s.start - newStart) < tol);
     if (trimmed) trimmed.groupId = shot.groupId;
     update(() => ({ ...next, shots }));
+    await refreshThumbs(shots);
+    flash("Edges saved");
+  }
+
+  async function refreshThumbs(shots: Shot[]) {
     const missing = shots.filter((s) => !s.thumb);
     if (missing.length && srcUrl) {
       const map = await grabThumbs(srcUrl, missing, () => {});
       update((x) => ({ ...x, shots: x.shots.map((s) => (map[s.id] ? { ...s, thumb: map[s.id] } : s)) }));
     }
-    flash("Edges saved");
+  }
+
+  // Re-find every edge on the original file: each edge snaps to the hard cut
+  // within ±6 frames, if there is one. Edges already on a cut stay put.
+  // groupId null = everything (all shot edges plus every detected cut).
+  async function resync(groupId: string | null) {
+    if (!srcUrl) return;
+    const key = `resync-${groupId ?? "all"}`;
+    const label = groupId ? `Resyncing ${p.groups.find((g) => g.id === groupId)?.name}` : "Resyncing every edge";
+    setTask(key, { label, pct: 0 });
+    try {
+      const fps = p.fps;
+      const tol = 0.6 / fps;
+      const totalFrames = Math.floor(p.duration * fps);
+      const shots = p.shots.filter((s) => (groupId ? s.groupId === groupId : true));
+      const edges = new Set<number>();
+      for (const s of shots) {
+        if (s.start > tol) edges.add(s.start);
+        if (s.end < p.duration - tol) edges.add(s.end);
+      }
+      if (!groupId) for (const c of p.cuts ?? []) edges.add(c);
+      const list = [...edges].sort((a, b) => a - b);
+      const reader = await openReader(srcUrl, fps);
+      const moves: [number, number][] = [];
+      try {
+        for (let i = 0; i < list.length; i++) {
+          const f = await refineEdge(reader, fps, list[i], totalFrames);
+          if (f !== null && Math.abs(f / fps - list[i]) > tol) moves.push([list[i], f / fps]);
+          setTask(key, { label, pct: (i + 1) / list.length });
+        }
+      } finally {
+        reader.close();
+      }
+      let st = { boundaries: p.boundaries, cuts: p.cuts ?? [] };
+      for (const [from, to] of moves) st = moveEdge(st.boundaries, st.cuts, from, to, tol);
+      const next = { ...p, ...st };
+      const rebuilt = buildShots(next);
+      update(() => ({ ...next, shots: rebuilt }));
+      await refreshThumbs(rebuilt);
+      const avg = moves.length ? moves.reduce((s, [a, b]) => s + (b - a), 0) / moves.length : 0;
+      flash(
+        moves.length
+          ? `${moves.length} of ${list.length} edges moved (avg ${avg > 0 ? "+" : ""}${Math.round(avg * fps)} frames)`
+          : `All ${list.length} edges already on the cut`,
+      );
+    } catch (e) {
+      setError(`Resync failed: ${describe(e)}`);
+    } finally {
+      setTask(key, null);
+    }
   }
 
   const [sel, setSel] = useState<string>("unassigned");
@@ -537,9 +609,10 @@ export default function Chapters() {
       patchPart(part.id, { status: "building", progress: 0, error: undefined });
       const h = Math.min(720, p.height);
       const w = Math.round((p.width / p.height) * h);
+      const off = p.preparedOffset ?? 0;
       const clip = await buildClip(
         p.prepared.blob,
-        [...part.pieces, ...part.pad],
+        [...part.pieces, ...part.pad].map((x) => ({ start: Math.max(0, x.start + off), end: x.end + off })),
         { w, h },
         p.hasAudio,
         (r) => patchPart(part.id, { progress: r }),
@@ -652,7 +725,10 @@ export default function Chapters() {
         v.src = done[0].resultUrl!;
       });
       setTask("assemble", { label: "Assembling on the original timeline", pct: 0 });
-      const out = await assembleTimeline(files, pieces, p.hasAudio ? span : null, size, (r) =>
+      const off = p.preparedOffset ?? 0;
+      const shifted = pieces.map((x) => (x.file === 0 ? { ...x, start: Math.max(0, x.start + off), end: x.end + off } : x));
+      const audioSpan = { start: Math.max(0, span.start + off), end: span.end + off };
+      const out = await assembleTimeline(files, shifted, p.hasAudio ? audioSpan : null, size, (r) =>
         setTask("assemble", { label: "Assembling on the original timeline", pct: r }),
       );
       update((x) => ({ ...x, output: { blob: out, name: `${x.name}-recast.mp4`, type: "video/mp4" } }));
@@ -758,6 +834,8 @@ export default function Chapters() {
             onNext={enterRender}
             canNext={reach.render}
             onTrim={setTrimming}
+            onResync={resync}
+            resyncing={Object.keys(tasks).some((k) => k.startsWith("resync"))}
           />
         )}
         {p.step === "render" && srcUrl && (
@@ -1251,6 +1329,8 @@ function ScenesStep(props: {
   onNext: () => void;
   canNext: boolean;
   onTrim: (shotId: string) => void;
+  onResync: (groupId: string | null) => void;
+  resyncing: boolean;
 }) {
   const { p, src, sel, setSel } = props;
   const [reelIdx, setReelIdx] = useState(0);
@@ -1317,6 +1397,14 @@ function ScenesStep(props: {
 
         <div className="flex flex-col gap-2">
           <button className="btn" onClick={props.onAdd}>New look</button>
+          <button
+            className="btn"
+            disabled={props.resyncing}
+            title="Snap every edge and scene cut to the real cut on the original video"
+            onClick={() => props.onResync(null)}
+          >
+            Resync all edges
+          </button>
           <button className="btn" onClick={props.onAuto}>Regroup with Claude</button>
         </div>
       </aside>
@@ -1351,7 +1439,17 @@ function ScenesStep(props: {
               )}
             </div>
             {group && (
-              <button className="btn text-muted" onClick={() => props.onDelete(group.id)}>Delete look</button>
+              <>
+                <button
+                  className="btn"
+                  disabled={props.resyncing}
+                  title="Snap every edge in this look to the real cut on the original video"
+                  onClick={() => props.onResync(group.id)}
+                >
+                  Resync edges
+                </button>
+                <button className="btn text-muted" onClick={() => props.onDelete(group.id)}>Delete look</button>
+              </>
             )}
           </div>
 
