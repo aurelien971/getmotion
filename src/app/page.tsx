@@ -4,6 +4,8 @@ import { fal } from "@fal-ai/client";
 import Image from "next/image";
 import { useEffect, useRef, useState } from "react";
 import { MODELS, SAM2_VIDEO } from "@/lib/models";
+import { trimVideo } from "@/lib/trim";
+import { Trimmer } from "@/components/Trimmer";
 
 fal.config({ proxyUrl: "/api/fal/proxy" });
 
@@ -74,6 +76,10 @@ export default function Home() {
   const [maskUrl, setMaskUrl] = useState<string | null>(null);
   const [maskOk, setMaskOk] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [mode, setMode] = useState<"trim" | "mask">("mask");
+  const [maxLen, setMaxLen] = useState<15 | 30>(15);
+  const [range, setRange] = useState<[number, number]>([0, 15]);
+  const [trimPct, setTrimPct] = useState<number | null>(null);
 
   const [cast, setCast] = useState<CastSlot[]>([]);
   const [prompt, setPrompt] = useState("");
@@ -83,6 +89,16 @@ export default function Home() {
   const [log, setLog] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<Result[]>([]);
+
+  // Dev only: ?clip=/dev-long.mp4 loads a clip from /public for quick checks.
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "development") return;
+    const name = new URLSearchParams(window.location.search).get("clip");
+    if (!name) return;
+    fetch(name)
+      .then((r) => r.blob())
+      .then((b) => onVideo(new File([b], name.split("/").pop() || "clip.mp4", { type: "video/mp4" })));
+  }, []);
 
   useEffect(() => {
     // Hydrate saved takes after mount so server and client markup match.
@@ -103,6 +119,23 @@ export default function Home() {
     setMaskOk(false);
     setError(null);
     setTime(0);
+    setMode("mask");
+  }
+
+  async function applyTrim() {
+    if (!videoFile) return;
+    setError(null);
+    setBusy("Cutting clip in your browser");
+    setTrimPct(0);
+    try {
+      const cut = await trimVideo(videoFile, range[0], range[1], setTrimPct);
+      onVideo(cut);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+      setTrimPct(null);
+    }
   }
 
   // Estimate fps from consecutive decoded frames so frame_index is accurate.
@@ -111,6 +144,10 @@ export default function Home() {
     if (!v) return;
     setDuration(v.duration);
     setDims({ w: v.videoWidth, h: v.videoHeight });
+    if (v.duration > 30) {
+      setMode("trim");
+      setRange([0, Math.min(maxLen, v.duration)]);
+    }
     if (!("requestVideoFrameCallback" in v)) return;
     const times: number[] = [];
     const tick = (_: number, meta: VideoFrameCallbackMetadata) => {
@@ -132,6 +169,11 @@ export default function Home() {
   function onClickFrame(e: React.MouseEvent<HTMLDivElement>) {
     const v = videoRef.current;
     if (!v) return;
+    if (mode === "trim") {
+      if (v.paused) v.play();
+      else v.pause();
+      return;
+    }
     v.pause();
     const rect = v.getBoundingClientRect();
     const x = Math.round(((e.clientX - rect.left) / rect.width) * v.videoWidth);
@@ -236,6 +278,10 @@ export default function Home() {
     const v = videoRef.current;
     const m = maskRef.current;
     if (!v) return;
+    if (mode === "trim" && !v.paused && v.currentTime >= range[1]) {
+      v.pause();
+      v.currentTime = range[0];
+    }
     setTime(v.currentTime);
     setPlaying(!v.paused);
     if (!m) return;
@@ -254,6 +300,10 @@ export default function Home() {
   const needsFaces = model.maxCast > 0;
   const missing = !videoFile
     ? "Add a clip to start"
+    : mode === "trim"
+      ? duration > 30
+        ? "Cut the clip to 30 seconds or less"
+        : "Finish trimming or use the whole clip"
     : model.usesMask && !(maskUrl && maskOk)
       ? "Build and approve a mask first"
       : needsFaces && cast.length === 0
@@ -314,7 +364,7 @@ export default function Home() {
                 <span className="text-muted">or click to choose one. Up to 30 seconds.</span>
               </button>
             ) : (
-              <div className="absolute inset-0 cursor-crosshair" onClick={onClickFrame}>
+              <div className={`absolute inset-0 ${mode === "mask" ? "cursor-crosshair" : "cursor-pointer"}`} onClick={onClickFrame}>
                 <video
                   ref={videoRef}
                   src={localVideo}
@@ -361,7 +411,66 @@ export default function Home() {
             onChange={(e) => e.target.files?.[0] && onVideo(e.target.files[0])}
           />
 
-          {localVideo && (
+          {localVideo && mode === "trim" && (
+            <>
+              <Trimmer
+                src={localVideo}
+                duration={duration}
+                time={time}
+                maxLen={maxLen}
+                range={range}
+                onRange={setRange}
+                onSeek={seek}
+              />
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  className="btn w-9 px-0 justify-center"
+                  aria-label={playing ? "Pause" : "Play"}
+                  onClick={() => {
+                    const el = videoRef.current;
+                    if (!el) return;
+                    if (el.paused) {
+                      if (el.currentTime < range[0] || el.currentTime >= range[1]) el.currentTime = range[0];
+                      el.play();
+                    } else el.pause();
+                  }}
+                >
+                  {playing ? "❚❚" : "▶"}
+                </button>
+                <div className="flex rounded-[10px] border border-line overflow-hidden">
+                  {([15, 30] as const).map((n) => (
+                    <button
+                      key={n}
+                      className={`h-9 px-3 text-sm ${maxLen === n ? "bg-raise" : "text-muted hover:text-ink"}`}
+                      onClick={() => {
+                        setMaxLen(n);
+                        setRange(([s]) => [s, Math.min(duration, s + n)]);
+                      }}
+                    >
+                      {n}s max
+                    </button>
+                  ))}
+                </div>
+                <span className="text-muted text-sm tabular-nums">
+                  {fmtTime(range[0])} to {fmtTime(range[1])}, {(range[1] - range[0]).toFixed(1)}s of {fmtTime(duration)}
+                </span>
+                <span className="flex-1" />
+                {duration <= 30 && (
+                  <button className="btn" onClick={() => setMode("mask")}>
+                    Use whole clip
+                  </button>
+                )}
+                <button className="btn" onClick={() => fileRef.current?.click()}>
+                  Replace clip
+                </button>
+                <button className="btn border-tally text-tally" disabled={!!busy} onClick={applyTrim}>
+                  {trimPct === null ? "Cut this part" : `Cutting ${Math.round(trimPct * 100)}%`}
+                </button>
+              </div>
+            </>
+          )}
+
+          {localVideo && mode === "mask" && (
             <>
               <div className="flex items-center gap-3">
                 <button
@@ -419,6 +528,15 @@ export default function Home() {
                     {maskOk ? "Mask approved" : "Approve mask"}
                   </button>
                 )}
+                <button
+                  className="btn"
+                  onClick={() => {
+                    setRange([0, Math.min(maxLen, duration)]);
+                    setMode("trim");
+                  }}
+                >
+                  Trim
+                </button>
                 <button className="btn" onClick={() => fileRef.current?.click()}>
                   Replace clip
                 </button>
