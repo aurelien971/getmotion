@@ -397,7 +397,8 @@ export default function Chapters() {
     source: true,
     spot: !!p.source,
     scenes: !!p.source && presentLen > 0,
-    render: p.shots.length > 0 && unassigned.length === 0 && p.groups.length > 0,
+    // Ungrouped shots don't block rendering; they just aren't rendered until given a look.
+    render: p.shots.length > 0 && p.groups.length > 0,
     assemble: partsDone > 0,
   };
   const go = (s: Step) => {
@@ -1541,19 +1542,67 @@ export default function Chapters() {
         const s = p.shots.find((x) => x.id === trimming);
         if (!s) return null;
         const g = p.groups.find((x) => x.id === s.groupId);
+        // Step through the shots of the same look (or the ungrouped ones), in time order.
+        const seq = p.shots.filter((x) => x.groupId === s.groupId).sort((a, b) => a.start - b.start);
+        const at = seq.findIndex((x) => x.id === s.id);
+        const go = (d: number, save?: { start: number; end: number }) => {
+          const target = seq[at + d];
+          if (save) void moveEdges(s.id, save.start, save.end);
+          setTrimming(target ? target.id : null);
+        };
+        // After removing this shot from the look, open the one that followed it.
+        const after = seq[at + 1] ?? seq[at - 1];
         return (
           <EdgeEditor
+            key={s.id}
             src={srcUrl}
             fps={p.fps}
             duration={p.duration}
             start={s.start}
             end={s.end}
-            title={`${g?.name ?? "Shot"} · ${fmt(s.start)}`}
+            title={`${g?.name ?? "Not grouped"} · ${fmt(s.start)}`}
+            position={`${at + 1} / ${seq.length}`}
+            onPrev={at > 0 ? (save) => go(-1, save) : undefined}
+            onNext={at < seq.length - 1 ? (save) => go(1, save) : undefined}
             onClose={() => setTrimming(null)}
             onSave={(a, b) => {
               setTrimming(null);
               void moveEdges(s.id, a, b);
             }}
+            extra={
+              <>
+                <button
+                  className="btn"
+                  title="He isn't in this shot: mark it as not in frame"
+                  onClick={() => {
+                    setTrimming(after && after.id !== s.id ? after.id : null);
+                    void flipSpan(s.start, s.end, false);
+                  }}
+                >
+                  Not him
+                </button>
+                <select
+                  value=""
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (!v) return;
+                    if (v === "__new") {
+                      const id = addGroup();
+                      setShotGroup(s.id, id);
+                    } else setShotGroup(s.id, v);
+                    setTrimming(after && after.id !== s.id ? after.id : null);
+                  }}
+                  className="field py-1.5 px-3 text-[13px] w-auto"
+                  title="This shot belongs to a different look"
+                >
+                  <option value="">Wrong look: move to…</option>
+                  {p.groups.filter((x) => x.id !== s.groupId).map((x) => (
+                    <option key={x.id} value={x.id}>{x.name}</option>
+                  ))}
+                  <option value="__new">+ New look</option>
+                </select>
+              </>
+            }
           />
         );
       })()}
@@ -2246,11 +2295,11 @@ function ScenesStep(props: {
         <div className="p-6 border-t border-hair flex items-center gap-4">
           <span className="text-faint text-[12px] flex-1">
             {unassigned.length
-              ? `${unassigned.length} shot${unassigned.length === 1 ? "" : "s"} still need a look`
+              ? `${unassigned.length} shot${unassigned.length === 1 ? "" : "s"} still need a look (they won't be rendered until they have one)`
               : `${p.groups.length} looks · every shot with him is covered`}
           </span>
           <button className="btn-primary w-auto! px-8" disabled={!props.canNext} onClick={props.onNext}>
-            Set up renders
+            {unassigned.length ? "Go to renders anyway" : "Set up renders"}
           </button>
         </div>
       </section>

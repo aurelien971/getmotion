@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ReelPlayer } from "@/components/ReelPlayer";
 
 const SPAN = 9; // frames shown either side of an edge
@@ -14,11 +14,16 @@ type Props = {
   title: string;
   onSave: (start: number, end: number) => void;
   onClose: () => void;
+  // Optional: step through a list of shots. Changed edges are saved before moving.
+  onPrev?: (save?: { start: number; end: number }) => void;
+  onNext?: (save?: { start: number; end: number }) => void;
+  position?: string; // e.g. "3 / 12"
+  extra?: React.ReactNode; // more actions in the header (Not him, Move to…)
 };
 
 // Frame-accurate trim for one shot: pick the exact first and last frame, with the
 // frames from the neighbouring scenes visible on either side.
-export function EdgeEditor({ src, fps, duration, start, end, title, onSave, onClose }: Props) {
+export function EdgeEditor({ src, fps, duration, start, end, title, onSave, onClose, onPrev, onNext, position, extra }: Props) {
   const totalFrames = Math.floor(duration * fps);
   const [first, setFirst] = useState(Math.round(start * fps));
   const [last, setLast] = useState(Math.max(Math.round(start * fps), Math.round(end * fps) - 1));
@@ -75,26 +80,55 @@ export function EdgeEditor({ src, fps, duration, start, end, title, onSave, onCl
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wantKey, fps]);
 
+  const changed = first !== Math.round(start * fps) || last + 1 !== Math.round(end * fps);
+  const pending = useMemo(() => (changed ? { start: first / fps, end: (last + 1) / fps } : undefined), [changed, first, last, fps]);
+
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.target as HTMLElement).tagName === "SELECT") return;
+      if (e.key === "Escape") onClose();
+      else if (e.key === "]" && onNext) onNext(pending);
+      else if (e.key === "[" && onPrev) onPrev(pending);
+    };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  const changed = first !== Math.round(start * fps) || last + 1 !== Math.round(end * fps);
+  }, [onClose, onNext, onPrev, pending]);
   const len = (last + 1 - first) / fps;
 
   return (
     <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-xl overflow-y-auto">
-      <div className="max-w-6xl mx-auto px-6 py-8 space-y-6">
+      {onPrev && (
+        <button
+          onClick={() => onPrev(pending)}
+          className="fixed left-3 top-1/2 -translate-y-1/2 z-10 w-14 h-28 rounded-2xl glass grid place-items-center text-[28px] hover:bg-white/10"
+          aria-label="Previous shot ([)"
+          title="Previous shot ( [ )"
+        >
+          ‹
+        </button>
+      )}
+      {onNext && (
+        <button
+          onClick={() => onNext(pending)}
+          className="fixed right-3 top-1/2 -translate-y-1/2 z-10 w-14 h-28 rounded-2xl glass grid place-items-center text-[28px] hover:bg-white/10"
+          aria-label="Next shot (])"
+          title="Next shot ( ] )"
+        >
+          ›
+        </button>
+      )}
+      <div className="max-w-6xl mx-auto px-20 py-8 space-y-6">
         <header className="flex items-center gap-4">
           <div className="flex-1">
-            <h2 className="text-[20px] tracking-tight">Trim · {title}</h2>
+            <h2 className="text-[20px] tracking-tight">
+              Trim · {title} {position && <span className="text-muted text-[14px] tabular-nums">· {position}</span>}
+            </h2>
             <p className="text-muted text-[13px]">
               Click the exact first and last frame of this shot. Dimmed frames are outside it. Moving an edge moves the
               neighbouring shot&apos;s edge too.
             </p>
           </div>
+          {extra}
           <button className="btn" onClick={onClose}>Cancel</button>
           <button className="btn btn-on" disabled={!changed} onClick={() => onSave(first / fps, (last + 1) / fps)}>
             Save edges
