@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { MODELS, SAM2_VIDEO } from "@/lib/models";
 import { muxAudio, stitchVideos, trimVideo, warmUp } from "@/lib/trim";
 import { Trimmer } from "@/components/Trimmer";
+import { FrameStrip } from "@/components/FrameStrip";
 
 fal.config({ proxyUrl: "/api/fal/proxy" });
 
@@ -95,6 +96,7 @@ export default function Home() {
   const [frames, setFrames] = useState<Frame[]>([]);
   const [cutStage, setCutStage] = useState<string | null>(null);
   const [zoomed, setZoomed] = useState<Frame | null>(null);
+  const [stripStep, setStripStep] = useState(1); // frames per thumbnail in the frame strip
 
   // Dev only: ?clip=/dev-long.mp4 loads a clip from /public for quick checks.
   useEffect(() => {
@@ -111,6 +113,33 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setHistory(loadHistory());
   }, []);
+
+  // I / O set In and Out at the playhead while trimming; space toggles play.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (mode !== "trim" || !localVideo) return;
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      const v = videoRef.current;
+      if (!v) return;
+      if (e.key === "i" || e.key === "I") {
+        setRange(([, b]) => {
+          const a = Math.min(v.currentTime, b - 1 / fps);
+          return [a, Math.min(b, a + maxLen)];
+        });
+      } else if (e.key === "o" || e.key === "O") {
+        setRange(([a]) => {
+          const b = Math.max(v.currentTime, a + 1 / fps);
+          return [Math.max(a, b - maxLen), b];
+        });
+      } else if (e.key === " ") {
+        e.preventDefault();
+        togglePlay();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
 
   // Paste a face straight from the clipboard.
   useEffect(() => {
@@ -625,6 +654,27 @@ export default function Home() {
                 </div>
               </div>
 
+              <FrameStrip
+                src={localVideo}
+                fps={fps}
+                duration={duration}
+                time={time}
+                range={range}
+                step={stripStep}
+                onSeek={(t) => { videoRef.current?.pause(); seek(t); }}
+              />
+              <div className="flex flex-wrap items-center gap-2 -mt-1">
+                <span className="text-faint text-[12px]">Frame strip</span>
+                <div className="seg glass">
+                  {[1, 2, 5, 15, 30].map((n) => (
+                    <button key={n} className={stripStep === n ? "on" : ""} onClick={() => setStripStep(n)}>
+                      {n === 1 ? "every frame" : `every ${n}`}
+                    </button>
+                  ))}
+                </div>
+                <span className="text-faint text-[12px]">Click a frame to land on it. Keys: I sets In, O sets Out, space plays.</span>
+              </div>
+
               {/* Frame-accurate edges */}
               <div className="glass rounded-2xl px-4 py-3 flex flex-wrap items-center gap-x-6 gap-y-3">
                 <Edge label="In" t={range[0]} frame={frameOf(range[0])} onNudge={(n) => nudge(0, n)} onGo={() => seek(range[0])} />
@@ -965,7 +1015,7 @@ function Lightbox({ frame, onClose, onSave }: { frame: Frame; onClose: () => voi
       className="fixed inset-0 z-50 bg-black/92 backdrop-blur-xl flex flex-col"
       onWheel={(e) => {
         e.preventDefault();
-        setScale((z) => Math.min(8, Math.max(1, z * (e.deltaY < 0 ? 1.12 : 0.89))));
+        setScale((z) => Math.min(4, Math.max(1, z * (e.deltaY < 0 ? 1.06 : 0.94))));
       }}
     >
       <div className="flex items-center justify-between px-6 h-16 shrink-0">
@@ -990,7 +1040,7 @@ function Lightbox({ frame, onClose, onSave }: { frame: Frame; onClose: () => voi
         }}
         onPointerUp={() => (drag.current = null)}
         onDoubleClick={() => {
-          if (scale > 1) { setScale(1); setPan({ x: 0, y: 0 }); } else setScale(3);
+          if (scale > 1) { setScale(1); setPan({ x: 0, y: 0 }); } else setScale(2);
         }}
         onClick={(e) => e.target === e.currentTarget && scale === 1 && onClose()}
       >
@@ -999,7 +1049,7 @@ function Lightbox({ frame, onClose, onSave }: { frame: Frame; onClose: () => voi
           src={frame.url}
           alt=""
           draggable={false}
-          className="max-w-[92vw] max-h-[82vh] select-none"
+          className="max-w-[78vw] max-h-[70vh] rounded-xl ring-1 ring-hair select-none"
           style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})`, transition: "transform 60ms linear", imageRendering: scale > 2 ? "pixelated" : "auto" }}
         />
       </div>
