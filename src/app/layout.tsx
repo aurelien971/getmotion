@@ -1,25 +1,25 @@
 import type { Metadata, Viewport } from "next";
-import { Instrument_Sans } from "next/font/google";
+import { Onest } from "next/font/google";
 import "./globals.css";
 
-const instrument = Instrument_Sans({
-  variable: "--font-instrument",
+const onest = Onest({
+  variable: "--font-onest",
   subsets: ["latin"],
   weight: ["400", "500", "600"],
 });
 
 export const metadata: Metadata = {
   title: "getmotion",
-  description: "Private video recast engine",
+  description: "Private video recast studio",
 };
 
 export const viewport: Viewport = {
-  themeColor: "#0b0b0c",
+  themeColor: "#000000",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en" className={instrument.variable}>
+    <html lang="en" className={onest.variable}>
       <body>{children}</body>
     </html>
   );
