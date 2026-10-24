@@ -4,7 +4,7 @@ import { fal } from "@fal-ai/client";
 import Image from "next/image";
 import { useEffect, useRef, useState } from "react";
 import { MODELS, SAM2_VIDEO } from "@/lib/models";
-import { muxAudio, trimVideo } from "@/lib/trim";
+import { muxAudio, stitchVideos, trimVideo } from "@/lib/trim";
 import { Trimmer } from "@/components/Trimmer";
 
 fal.config({ proxyUrl: "/api/fal/proxy" });
@@ -12,6 +12,7 @@ fal.config({ proxyUrl: "/api/fal/proxy" });
 type Point = { x: number; y: number; label: 0 | 1 };
 type Result = { url: string; model: string; at: number; localUrl?: string };
 type CastSlot = { file: File; preview: string; who: string };
+type StitchItem = { id: number; name: string; url: string };
 
 const HISTORY_KEY = "getmotion.history";
 
@@ -88,6 +89,7 @@ export default function Home() {
   const [log, setLog] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<Result[]>([]);
+  const [stitch, setStitch] = useState<StitchItem[]>([]);
 
   // Dev only: ?clip=/dev-long.mp4 loads a clip from /public for quick checks.
   useEffect(() => {
@@ -149,6 +151,60 @@ export default function Home() {
     a.download = `getmotion-${new Date(r.at).toISOString().slice(0, 19).replace(/[:T]/g, "-")}.mp4`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+  }
+
+  // Save a single frame of the current clip as PNG.
+  async function saveFrame(t: number) {
+    const v = videoRef.current;
+    if (!v) return;
+    v.pause();
+    if (Math.abs(v.currentTime - t) > 0.01) {
+      await new Promise<void>((res) => {
+        v.addEventListener("seeked", () => res(), { once: true });
+        v.currentTime = t;
+      });
+    }
+    const c = document.createElement("canvas");
+    c.width = v.videoWidth;
+    c.height = v.videoHeight;
+    c.getContext("2d")!.drawImage(v, 0, 0);
+    const blob = await new Promise<Blob | null>((r) => c.toBlob(r, "image/png"));
+    if (!blob) return;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `frame-${t.toFixed(2)}s.png`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+  }
+
+  function addToStitch(name: string, url: string) {
+    setStitch((s) => [...s, { id: Date.now() + Math.random(), name, url }]);
+  }
+
+  async function runStitch() {
+    if (stitch.length < 2) return;
+    setError(null);
+    setBusy("Stitching clips");
+    try {
+      const blobs = await Promise.all(stitch.map((i) => fetch(i.url).then((r) => r.blob())));
+      // Conform everything to the first clip's frame size.
+      const size = await new Promise<{ w: number; h: number }>((res, rej) => {
+        const v = document.createElement("video");
+        v.preload = "metadata";
+        v.onloadedmetadata = () => res({ w: v.videoWidth, h: v.videoHeight });
+        v.onerror = () => rej(new Error("Could not read the first clip"));
+        v.src = stitch[0].url;
+      });
+      const out = await stitchVideos(blobs, size, (p) => setLog(`${Math.round(p * 100)}%`));
+      const localUrl = URL.createObjectURL(out);
+      setHistory((h) => [{ url: localUrl, model: `Stitched ${stitch.length} clips`, at: Date.now(), localUrl }, ...h]);
+      setStitch([]);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+      setLog("");
+    }
   }
 
   // Cut the selected window in the browser; returns the new file and loads it.
@@ -499,6 +555,7 @@ export default function Home() {
                   {fmtTime(range[0])} – {fmtTime(range[1])}
                 </span>
                 <span className="flex-1" />
+                <FrameSaver onSave={saveFrame} first={range[0]} current={time} last={Math.max(range[0], range[1] - 1 / fps)} />
                 {duration <= 30 && (
                   <button className="btn" onClick={() => setMode("mask")}>
                     Use whole clip
@@ -551,6 +608,7 @@ export default function Home() {
                     : `${points.length} point${points.length > 1 ? "s" : ""} on frame ${frameIndex}`}
                 </span>
                 <span className="flex-1" />
+                <FrameSaver onSave={saveFrame} first={0} current={time} last={Math.max(0, duration - 1 / fps)} />
                 {points.length > 0 && (
                   <button className="btn" onClick={() => setPoints([])}>
                     Clear
@@ -584,6 +642,67 @@ export default function Home() {
             <p className="glass text-[13px] text-ink/90 break-all rounded-xl px-4 py-3">{error}</p>
           )}
 
+          {(stitch.length > 0 || history.length > 0 || videoFile) && (
+            <div className="pt-8 space-y-3">
+              <div className="flex items-center gap-3 flex-wrap">
+                <h2 className="text-[15px]">Stitch</h2>
+                <span className="text-faint text-[12px]">Joins clips back to back, in this order.</span>
+                <span className="flex-1" />
+                {videoFile && localVideo && (
+                  <button className="btn" onClick={() => addToStitch(videoFile.name, localVideo)}>
+                    Add current clip
+                  </button>
+                )}
+                <label className="btn cursor-pointer">
+                  Add a file
+                  <input
+                    type="file"
+                    accept="video/*"
+                    className="hidden"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) addToStitch(f.name, URL.createObjectURL(f));
+                      e.target.value = "";
+                    }}
+                  />
+                </label>
+                <button className="btn btn-on" disabled={stitch.length < 2 || !!busy} onClick={runStitch}>
+                  Stitch {stitch.length > 1 ? stitch.length : ""}
+                </button>
+              </div>
+              {stitch.length > 0 && (
+                <ol className="glass rounded-2xl p-1.5 space-y-0.5">
+                  {stitch.map((it, i) => (
+                    <li key={it.id} className="flex items-center gap-3 px-3.5 py-2 rounded-xl">
+                      <span className="text-faint text-[12px] tabular-nums w-4">{i + 1}</span>
+                      <video src={it.url} muted playsInline className="h-9 w-16 object-cover rounded-md bg-black" />
+                      <span className="text-[13px] truncate flex-1">{it.name}</span>
+                      <div className="seg glass">
+                        <button
+                          disabled={i === 0}
+                          onClick={() => setStitch((s) => { const c = [...s]; [c[i - 1], c[i]] = [c[i], c[i - 1]]; return c; })}
+                          aria-label="Move up"
+                        >
+                          ↑
+                        </button>
+                        <button
+                          disabled={i === stitch.length - 1}
+                          onClick={() => setStitch((s) => { const c = [...s]; [c[i + 1], c[i]] = [c[i], c[i + 1]]; return c; })}
+                          aria-label="Move down"
+                        >
+                          ↓
+                        </button>
+                      </div>
+                      <button className="btn btn-icon text-muted" aria-label="Remove" onClick={() => setStitch((s) => s.filter((x) => x.id !== it.id))}>
+                        ×
+                      </button>
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </div>
+          )}
+
           {history.length > 0 && (
             <div className="pt-8 space-y-3">
               <h2 className="text-[15px]">Takes</h2>
@@ -600,9 +719,14 @@ export default function Home() {
                       <span>
                         {r.model} · {new Date(r.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                       </span>
-                      <button className="btn h-7 px-3 text-[12px]" onClick={() => saveTake(r)}>
-                        Save
-                      </button>
+                      <span className="flex gap-1.5">
+                        <button className="btn h-7 px-3 text-[12px]" onClick={() => addToStitch(r.model, r.localUrl ?? r.url)}>
+                          Stitch
+                        </button>
+                        <button className="btn h-7 px-3 text-[12px]" onClick={() => saveTake(r)}>
+                          Save
+                        </button>
+                      </span>
                     </figcaption>
                   </figure>
                 ))}
@@ -707,6 +831,27 @@ export default function Home() {
           </div>
         </aside>
       </main>
+    </div>
+  );
+}
+
+function FrameSaver({
+  onSave,
+  first,
+  current,
+  last,
+}: {
+  onSave: (t: number) => void;
+  first: number;
+  current: number;
+  last: number;
+}) {
+  return (
+    <div className="seg glass" aria-label="Save a frame as PNG">
+      <span className="px-2 text-faint text-[12px]">Frame</span>
+      <button onClick={() => onSave(first)}>First</button>
+      <button onClick={() => onSave(current)}>Now</button>
+      <button onClick={() => onSave(last)}>Last</button>
     </div>
   );
 }

@@ -188,7 +188,11 @@ button {
   gap: 4px;
   transition: background 160ms ease, color 160ms ease;
 }
-.seg > button:hover {
+.seg > button:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+.seg > button:hover:not(:disabled) {
   color: var(--text);
 }
 .seg > .on {

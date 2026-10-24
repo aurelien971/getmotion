@@ -14,7 +14,9 @@ type FFmpegLike = {
   readFile(path: string): Promise<Uint8Array | string>;
   deleteFile(path: string): Promise<boolean>;
   on(ev: "progress", cb: (p: Progress) => void): void;
+  on(ev: "log", cb: (l: { message: string }) => void): void;
   off(ev: "progress", cb: (p: Progress) => void): void;
+  off(ev: "log", cb: (l: { message: string }) => void): void;
 };
 declare global {
   interface Window {
@@ -109,5 +111,59 @@ export async function muxAudio(video: Blob, source: File): Promise<File> {
     return new File([data.slice().buffer as ArrayBuffer], "take.mp4", { type: "video/mp4" });
   } finally {
     for (const f of ["v.mp4", "src", "muxed.mp4"]) await ff.deleteFile(f).catch(() => {});
+  }
+}
+
+// Does this file carry an audio stream? Parsed from ffmpeg's own probe output.
+async function hasAudio(ff: FFmpegLike, path: string) {
+  let found = false;
+  const onLog = ({ message }: { message: string }) => {
+    if (/Stream #\d+:\d+.*Audio:/.test(message)) found = true;
+  };
+  ff.on("log", onLog);
+  try {
+    await ff.exec(["-i", path, "-f", "null", "-t", "0.1", "-"]).catch(() => {});
+  } finally {
+    ff.off("log", onLog);
+  }
+  return found;
+}
+
+// Join clips back to back. Every input is conformed to the first clip's frame size at
+// 30fps with stereo AAC (silence where a clip has none), then concatenated.
+export async function stitchVideos(
+  files: Blob[],
+  size: { w: number; h: number },
+  onProgress?: (ratio: number) => void,
+): Promise<File> {
+  const ff = await load();
+  const w = size.w - (size.w % 2);
+  const h = size.h - (size.h % 2);
+  const names: string[] = [];
+  try {
+    for (let i = 0; i < files.length; i++) {
+      onProgress?.(i / (files.length + 1));
+      const input = `in${i}`;
+      const seg = `seg${i}.mp4`;
+      await ff.writeFile(input, await fetchFile(files[i]));
+      const audio = await hasAudio(ff, input);
+      const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p`;
+      const args = audio
+        ? ["-i", input, "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+           "-c:a", "aac", "-ar", "48000", "-ac", "2", "-y", seg]
+        : ["-i", input, "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+           "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
+           "-c:a", "aac", "-shortest", "-map", "0:v:0", "-map", "1:a:0", "-y", seg];
+      await ff.exec(args);
+      await ff.deleteFile(input).catch(() => {});
+      names.push(seg);
+    }
+    await ff.writeFile("list.txt", new TextEncoder().encode(names.map((n) => `file '${n}'`).join("\n")));
+    await ff.exec(["-f", "concat", "-safe", "0", "-i", "list.txt", "-c", "copy", "-movflags", "+faststart", "-y", "stitched.mp4"]);
+    onProgress?.(1);
+    const data = (await ff.readFile("stitched.mp4")) as Uint8Array;
+    return new File([data.slice().buffer as ArrayBuffer], "stitched.mp4", { type: "video/mp4" });
+  } finally {
+    for (const n of [...names, "list.txt", "stitched.mp4"]) await ff.deleteFile(n).catch(() => {});
   }
 }
