@@ -20,6 +20,9 @@ import {
   partsInRange,
   renderOutdated,
   measureOffsets,
+  findIssues,
+  partKey,
+  type Issue,
   pending as pendingFor,
   emptyProject,
   fmt,
@@ -221,7 +224,7 @@ export default function Chapters() {
 
   useEffect(() => {
     if (process.env.NODE_ENV === "development") {
-      (window as unknown as { __engine: unknown }).__engine = { buildClip, assembleTimeline, detectCuts, measureOffset, fpsExpr, measureOffsets };
+      (window as unknown as { __engine: unknown }).__engine = { buildClip, assembleTimeline, detectCuts, measureOffset, fpsExpr, measureOffsets, findIssues };
     }
   }, []);
 
@@ -739,6 +742,73 @@ export default function Chapters() {
 
   // Build the clip, upload it with the faces, submit. Returns the job so the caller
   // decides whether to wait; the job id is saved before any waiting happens.
+  // The exact clip a part sends, built locally (cached until its pieces change).
+  const clipCache = useRef(new Map<string, File>());
+  async function buildPartClip(part: Part): Promise<File> {
+    const key = partKey(part) + `#${part.pad.length}`;
+    const hit = clipCache.current.get(key);
+    if (hit) return hit;
+    const h = Math.min(720, p.height);
+    const w = Math.round((p.width / p.height) * h);
+    const off = p.preparedOffset ?? 0;
+    const clip = await buildClip(
+      p.prepared!.blob,
+      [...part.pieces, ...part.pad].map((x) => ({ start: Math.max(0, x.start + off), end: x.end + off })),
+      { w, h },
+      p.hasAudio,
+      (r) => patchPart(part.id, { progress: r }),
+      fpsExpr(p.fps),
+    );
+    clipCache.current.set(key, clip);
+    return clip;
+  }
+
+  // Pre-flight: build the clip, find its cuts, and flag any cut the plan doesn't expect.
+  async function checkPart(part: Part): Promise<Issue[]> {
+    if (!p.prepared) throw new Error("The video is still being prepared.");
+    patchPart(part.id, { status: "building", progress: 0, error: undefined });
+    try {
+      const clip = await buildPartClip(part);
+      const cuts = await detectCuts(clip, part.clipLength, undefined, 0.25);
+      const issues = findIssues(part, cuts, p.fps);
+      patchPart(part.id, { status: "idle", progress: undefined, issues, checkedKey: issues.length ? undefined : partKey(part) });
+      return issues;
+    } catch (e) {
+      patchPart(part.id, { status: "idle", progress: undefined, error: describe(e) });
+      throw e;
+    }
+  }
+
+  async function checkParts(ids: string[]) {
+    let found = 0;
+    for (const id of ids) {
+      const part = p.parts.find((x) => x.id === id);
+      if (part) found += (await checkPart(part).catch(() => [])).length;
+    }
+    flash(found ? `Found ${found} stray-frame spot${found === 1 ? "" : "s"}. Fix them before rendering.` : "All clips clean");
+  }
+
+  // Trim slivers onto the neighbouring shot; split shots where a cut was missed.
+  async function fixIssues(part: Part) {
+    if (!part.issues?.length) return;
+    const tol = 0.6 / p.fps;
+    let st = { boundaries: p.boundaries, cuts: p.cuts ?? [] };
+    for (const is of part.issues) {
+      const shot = p.shots.find((x) => x.id === is.shotId);
+      if (!shot) continue;
+      if (is.kind === "start") st = moveEdge(st.boundaries, st.cuts, shot.start, is.at, tol);
+      else if (is.kind === "end") st = moveEdge(st.boundaries, st.cuts, shot.end, is.at, tol);
+      else st = { ...st, cuts: [...new Set([...st.cuts, is.at])].sort((a, b) => a - b) };
+    }
+    const next = { ...p, ...st };
+    const shots = buildShots(next);
+    update(() => ({ ...next, shots }));
+    await refreshThumbs(shots);
+    flash("Fixed. The parts were rebuilt; check again before rendering.");
+  }
+
+  // Build the clip, upload it with the faces, submit. Returns the job so the caller
+  // decides whether to wait; the job id is saved before any waiting happens.
   async function startPart(part: Part): Promise<PendingJob | null> {
     const g = p.groups.find((x) => x.id === part.groupId)!;
     const model = RENDER_MODELS.find((m) => m.id === g.modelId) ?? RENDER_MODELS[0];
@@ -752,18 +822,15 @@ export default function Chapters() {
       return null;
     }
     try {
+      if (part.checkedKey !== partKey(part)) {
+        const issues = await checkPart(part);
+        if (issues.length) {
+          patchPart(part.id, { error: `${issues.length} stray-frame spot${issues.length === 1 ? "" : "s"} in this clip. Fix before rendering.` });
+          return null;
+        }
+      }
       patchPart(part.id, { status: "building", progress: 0, error: undefined });
-      const h = Math.min(720, p.height);
-      const w = Math.round((p.width / p.height) * h);
-      const off = p.preparedOffset ?? 0;
-      const clip = await buildClip(
-        p.prepared.blob,
-        [...part.pieces, ...part.pad].map((x) => ({ start: Math.max(0, x.start + off), end: x.end + off })),
-        { w, h },
-        p.hasAudio,
-        (r) => patchPart(part.id, { progress: r }),
-        fpsExpr(p.fps),
-      );
+      const clip = await buildPartClip(part);
       patchPart(part.id, { status: "uploading", progress: undefined });
       const videoUrl = await fal.storage.upload(clip);
       const cast = await Promise.all(
@@ -952,6 +1019,7 @@ export default function Chapters() {
       let reps: Rep[] = [];
       done.forEach((d, i) =>
         d.pieces.forEach((pc, j) => {
+          if (d.rejected?.includes(j)) return;
           const at = d.measuredOffsets?.[j] ?? pc.offset;
           // Newer renders replace older ones where they overlap.
           reps = reps.flatMap((r) => {
@@ -1182,6 +1250,18 @@ export default function Chapters() {
             onWrite={writeGroupPrompt}
             onAnalyze={analyzeWardrobe}
             onRender={renderParts}
+            onCheck={checkParts}
+            onFix={fixIssues}
+            onReject={(id, j, rejected) =>
+              update((x) => ({
+                ...x,
+                parts: x.parts.map((pt) =>
+                  pt.id !== id
+                    ? pt
+                    : { ...pt, rejected: rejected ? [...new Set([...(pt.rejected ?? []), j])] : (pt.rejected ?? []).filter((k) => k !== j) },
+                ),
+              }))
+            }
             onNext={() => go("assemble")}
             onError={setError}
             onRange={setRange}
@@ -1933,6 +2013,9 @@ function RenderStep(props: {
   onWrite: (g: Group) => void;
   onAnalyze: (g: Group) => void;
   onRender: (partIds: string[]) => void;
+  onCheck: (partIds: string[]) => void;
+  onFix: (part: Part) => void;
+  onReject: (partId: string, piece: number, rejected: boolean) => void;
   onNext: () => void;
   onError: (m: string) => void;
   onRange: (r: { start: number; end: number }) => void;
@@ -1952,6 +2035,8 @@ function RenderStep(props: {
   const himInRange = total(clipTo(p.shots.map((s) => ({ start: s.start, end: s.end })), range));
   const renderedAll = covered(p);
   const renderedIn = total(clipTo(renderedAll, range));
+  const acceptedPct = himInRange ? Math.min(100, Math.round((renderedIn / himInRange) * 100)) : 0;
+  const issueCount = toRender.reduce((n, x) => n + (x.issues?.length ?? 0), 0);
   const activeGroups = p.groups.filter((g) => partsInRange(p, g.id).length > 0);
   const idleGroups = p.groups.filter((g) => !activeGroups.includes(g));
   const missingFaces = activeGroups.filter((g) => !refsOf(p, g).length && partsInRange(p, g.id).some((x) => x.status === "idle" || x.status === "failed"));
@@ -2003,7 +2088,11 @@ function RenderStep(props: {
             renders={p.parts
               .filter((x) => x.status === "done" && x.resultUrl)
               .sort((a, b) => (a.renderedAt ?? 0) - (b.renderedAt ?? 0))
-              .flatMap((x) => x.pieces.map((pc, j) => ({ start: pc.start, end: pc.end, offset: x.measuredOffsets?.[j] ?? pc.offset, url: x.resultUrl! })))
+              .flatMap((x) =>
+                x.pieces
+                  .map((pc, j) => ({ start: pc.start, end: pc.end, offset: x.measuredOffsets?.[j] ?? pc.offset, url: x.resultUrl!, j }))
+                  .filter((r) => !x.rejected?.includes(r.j)),
+              )
               .reverse()}
             className="h-[34vh] max-w-full aspect-video mx-auto"
           />
@@ -2020,7 +2109,7 @@ function RenderStep(props: {
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
           <Stat label="span" value={fmtShort(range.end - range.start)} />
           <Stat label="him in span" value={fmtShort(himInRange)} />
-          <Stat label="already rendered" value={fmtShort(renderedIn)} />
+          <Stat label={`kept · ${acceptedPct}% of him`} value={fmtShort(renderedIn)} />
           <Stat label={`to render · ${toRender.length} parts`} value={`$${est.toFixed(2)}`} />
         </div>
         <div className="flex items-center gap-3 flex-wrap">
@@ -2040,6 +2129,9 @@ function RenderStep(props: {
           <span className="text-muted text-[12px] tabular-nums">
             {doneIn} of {inRange.length} parts done
           </span>
+          <button className="btn" disabled={!toRender.length} onClick={() => props.onCheck(toRender.map((x) => x.id))}>
+            Check clips{issueCount ? ` · ${issueCount} issues` : ""}
+          </button>
           <button
             className="btn btn-on"
             disabled={!toRender.length || missingFaces.length > 0}
@@ -2223,6 +2315,9 @@ function RenderStep(props: {
               {parts.map((pt, i) => (
                 <PartRow
                   key={pt.id}
+                  onCheck={() => props.onCheck([pt.id])}
+                  onFix={() => props.onFix(pt)}
+                  onReject={(j, r) => props.onReject(pt.id, j, r)}
                   src={props.src}
                   fps={p.fps}
                   part={pt}
@@ -2440,6 +2535,9 @@ function FaceTile({
 }
 
 function PartRow({
+  onCheck,
+  onFix,
+  onReject,
   src,
   fps,
   part,
@@ -2450,6 +2548,9 @@ function PartRow({
   canRender,
   onRender,
 }: {
+  onCheck: () => void;
+  onFix: () => void;
+  onReject: (piece: number, rejected: boolean) => void;
   src: string;
   fps: number;
   part: Part;
@@ -2496,11 +2597,63 @@ function PartRow({
         <video src={part.resultUrl} muted playsInline className="h-12 rounded-md ring-1 ring-hair bg-black" />
       )}
       <span className="text-faint text-[12px] tabular-nums">~${cost.toFixed(2)}</span>
-      <button className="btn" onClick={() => setOpen((o) => !o)}>{open ? "Hide" : "Preview"}</button>
+      {(part.status === "idle" || part.status === "failed") && (
+        <button className="btn" onClick={onCheck} title="Build the clip locally and look for frames from other scenes">
+          {part.checkedKey ? "Checked ✓" : "Check"}
+        </button>
+      )}
+      <button className="btn" onClick={() => setOpen((o) => !o)}>{open ? "Hide" : part.status === "done" ? "Review" : "Preview"}</button>
       <button className={`btn ${part.status === "idle" ? "btn-on" : ""}`} disabled={busy || !canRender || outdated} onClick={onRender}>
         {outdated ? "Superseded" : part.status === "done" || part.status === "failed" ? "Re-roll" : "Render"}
       </button>
       </div>
+      {!!part.issues?.length && part.status !== "done" && (
+        <div className="rounded-xl bg-[rgba(252,211,77,0.08)] ring-1 ring-[rgba(252,211,77,0.3)] p-3 space-y-2">
+          <div className="flex items-center gap-3">
+            <span className="text-[13px] flex-1">Frames from another scene in this clip</span>
+            <button className="btn btn-on h-8 px-3 text-[12px]" onClick={onFix}>Fix all</button>
+          </div>
+          <ul className="text-[12px] text-muted space-y-0.5 tabular-nums">
+            {part.issues.map((is, k) => (
+              <li key={k}>
+                {fmt(is.at)} ·{" "}
+                {is.kind === "start"
+                  ? `${is.frames} frame${is.frames === 1 ? "" : "s"} at the start of a shot: trim onto the previous shot`
+                  : is.kind === "end"
+                    ? `${is.frames} frame${is.frames === 1 ? "" : "s"} at the end of a shot: trim onto the next shot`
+                    : "a cut inside a shot that wasn't marked: split the shot here"}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {open && part.status === "done" && part.resultUrl && (
+        <div className="space-y-2">
+          <span className="text-[12px] text-muted">
+            Review each piece. Redo frees just that footage; it comes back as a new part to render.
+          </span>
+          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {part.pieces.map((pc, j) => {
+              const off = part.measuredOffsets?.[j] ?? pc.offset;
+              const rej = part.rejected?.includes(j);
+              return (
+                <div key={j} className={`space-y-1.5 ${rej ? "opacity-50" : ""}`}>
+                  <ReelPlayer src={part.resultUrl!} fps={fps} spans={[{ start: off, end: off + (pc.end - pc.start) }]} className="aspect-video" />
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] text-muted tabular-nums flex-1">
+                      {j + 1} · {fmt(pc.start)} · {Math.round((pc.end - pc.start) * fps)}f
+                    </span>
+                    <div className="seg glass">
+                      <button className={!rej ? "on" : ""} onClick={() => onReject(j, false)}>Keep</button>
+                      <button className={rej ? "on" : ""} onClick={() => onReject(j, true)}>Redo</button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
       {open && (
         <div className="grid md:grid-cols-2 gap-4">
           <div className="space-y-1.5">

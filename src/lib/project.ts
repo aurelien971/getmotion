@@ -130,7 +130,44 @@ export type Part = {
   // scene cuts. Corrects clips that carried a stray frame. Undefined = not measured.
   measuredOffsets?: number[];
   calibrated?: boolean;
+  issues?: Issue[]; // stray footage found by the pre-flight check
+  checkedKey?: string; // pieces the last clean check was for
+  rejected?: number[]; // piece indices marked Redo after review
 };
+
+// Footage from another scene inside a piece, found as an unplanned cut in the built clip.
+export type Issue = { shotId: string; at: number; kind: "start" | "end" | "mid"; frames: number };
+
+export const partKey = (pt: Part) => pt.pieces.map((x) => `${x.start.toFixed(4)}-${x.end.toFixed(4)}`).join("|");
+
+// Compare the cuts found in a built clip with the cuts the plan expects (between
+// non-contiguous pieces). Any other cut means foreign frames inside a piece.
+export function findIssues(part: Part, cuts: number[], fps: number): Issue[] {
+  const f = 1 / fps;
+  const expected: number[] = [];
+  part.pieces.forEach((pc, i) => {
+    if (i > 0 && Math.abs(part.pieces[i - 1].end - pc.start) > 1e-3) expected.push(pc.offset);
+  });
+  const issues: Issue[] = [];
+  for (const c of cuts) {
+    if (c < 0.5 * f || c > part.duration - 0.5 * f) continue; // clip start, or loop filler
+    if (expected.some((e) => Math.abs(e - c) <= 1.5 * f)) continue;
+    const j = part.pieces.findIndex((pc) => c > pc.offset && c < pc.offset + (pc.end - pc.start));
+    if (j < 0) continue;
+    const pc = part.pieces[j];
+    const toStart = Math.round((c - pc.offset) * fps);
+    const toEnd = Math.round((pc.offset + (pc.end - pc.start) - c) * fps);
+    const at = Math.round((pc.start + (c - pc.offset)) * fps) / fps;
+    issues.push(
+      toStart <= 4
+        ? { shotId: pc.shotId, at, kind: "start", frames: toStart }
+        : toEnd <= 4
+          ? { shotId: pc.shotId, at, kind: "end", frames: toEnd }
+          : { shotId: pc.shotId, at, kind: "mid", frames: 0 },
+    );
+  }
+  return issues;
+}
 
 // Line pieces up with the cuts found in the render. A piece that follows a hard cut
 // starts on the detected cut nearest its planned offset (within ±4 frames); a piece
@@ -321,7 +358,7 @@ export function covered(p: Project, groupId?: string): Interval[] {
     .filter((x) => x.status === "done" || x.status === "rendering" || x.status === "building" || x.status === "uploading")
     // A render whose shot edges changed no longer counts: its footage gets a fresh part.
     .filter((x) => !(x.status === "done" && renderOutdated(p, x)))
-    .flatMap((x) => x.pieces.map((pc) => ({ start: pc.start, end: pc.end })));
+    .flatMap((x) => x.pieces.filter((_, j) => !x.rejected?.includes(j)).map((pc) => ({ start: pc.start, end: pc.end })));
   return merge(xs);
 }
 
