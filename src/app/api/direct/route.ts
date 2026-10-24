@@ -57,10 +57,18 @@ export async function POST(req: Request) {
     return Response.json({ error: "ANTHROPIC_API_KEY not set" }, { status: 500 });
   }
   const body = (await req.json()) as Body;
-  if (!body.targets?.length) return Response.json({ error: "Add at least one target shot" }, { status: 400 });
+  const refining = !!(body.previousPrompt?.trim() && (body.results?.length || body.feedback?.trim()));
+  if (!body.targets?.length && !refining) {
+    return Response.json({ error: "Add at least one target shot" }, { status: 400 });
+  }
 
   const content: Anthropic.ContentBlockParam[] = [];
-  content.push({ type: "text", text: `TARGET SHOTS (${body.targets.length}):` });
+  content.push({
+    type: "text",
+    text: body.targets.length
+      ? `TARGET SHOTS (${body.targets.length}):`
+      : "TARGET SHOTS: none provided this time; rely on the previous prompt's shot list and the result shots.",
+  });
   body.targets.forEach((t, i) => {
     content.push({ type: "text", text: `Shot ${i + 1} — file "${t.name}"` });
     content.push(toImage(t));

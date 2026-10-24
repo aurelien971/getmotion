@@ -137,6 +137,8 @@ export default function Home() {
   const [results, setResults] = useState<Shot[]>([]);
   const [feedback, setFeedback] = useState("");
   const [extracting, setExtracting] = useState<number | null>(null);
+  const [previousPrompt, setPreviousPrompt] = useState<string | null>(null);
+  const promptBoxRef = useRef<HTMLTextAreaElement>(null);
   const pasteTarget = useRef<"face" | "shot">("face");
 
   // Dev only: ?clip=/dev-long.mp4 loads a clip from /public for quick checks.
@@ -457,8 +459,10 @@ export default function Home() {
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? res.statusText);
+      if (refine) setPreviousPrompt(directed);
       setDirection(json);
       setDirected(json.prompt ?? "");
+      setTimeout(() => promptBoxRef.current?.scrollIntoView({ behavior: "smooth", block: "center" }), 50);
     } catch (e) {
       setError(describeError(e));
     } finally {
@@ -1276,6 +1280,7 @@ export default function Home() {
                 className="btn btn-on w-full"
                 disabled={directing || shots.length === 0 || cast.length === 0}
                 onClick={() => direct(false)}
+                title={shots.length === 0 ? "Add at least one target shot" : cast.length === 0 ? "Add a face" : ""}
               >
                 {directing ? "Writing prompt…" : "Write the prompt"}
               </button>
@@ -1286,6 +1291,7 @@ export default function Home() {
                 </div>
                 {direction?.target && <p className="text-muted text-[12px]">Target: {direction.target}</p>}
                 <textarea
+                  ref={promptBoxRef}
                   value={directed}
                   onChange={(e) => setDirected(e.target.value)}
                   placeholder="Paste a saved prompt here, or press Write the prompt."
@@ -1298,8 +1304,16 @@ export default function Home() {
                   </ul>
                 ) : null}
                 {directed.trim() && (
-                  <div className="flex justify-end">
-                    <button className="btn" onClick={() => { setDirected(""); setDirection(null); }}>Clear prompt</button>
+                  <div className="flex justify-between items-center gap-2">
+                    {previousPrompt !== null ? (
+                      <span className="text-[12px] text-ink inline-flex items-center gap-2">
+                        <span className="w-1.5 h-1.5 rounded-full bg-white" /> Prompt rewritten
+                        <button className="underline text-muted" onClick={() => { setDirected(previousPrompt); setPreviousPrompt(null); }}>
+                          undo
+                        </button>
+                      </span>
+                    ) : <span />}
+                    <button className="btn" onClick={() => { setDirected(""); setDirection(null); setPreviousPrompt(null); }}>Clear prompt</button>
                   </div>
                 )}
               </div>
@@ -1332,6 +1346,7 @@ export default function Home() {
                     className="btn btn-on w-full"
                     disabled={directing || (!feedback.trim() && results.length === 0)}
                     onClick={() => direct(true)}
+                    title="Uses the previous prompt + result shots + feedback. Target shots are optional here."
                   >
                     {directing ? "Rewriting…" : "Refine the prompt"}
                   </button>
