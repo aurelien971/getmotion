@@ -2459,6 +2459,7 @@ function RenderStep(props: {
 }) {
   const { p } = props;
   const [snap, setSnap] = useState(true);
+  const [openLooks, setOpenLooks] = useState<Record<string, boolean>>({});
   const range = p.range ?? { start: 0, end: p.duration };
   const inRange = partsInRange(p);
   const toRender = inRange.filter((x) => x.status === "idle" || x.status === "failed");
@@ -2650,18 +2651,40 @@ function RenderStep(props: {
         const left = total(pendingFor(p, g.id));
         const model = RENDER_MODELS.find((m) => m.id === g.modelId) ?? RENDER_MODELS[0];
         const writing = !!props.tasks[`prompt-${g.id}`];
+        const running = parts.some((x) => x.status === "building" || x.status === "uploading" || x.status === "rendering");
+        const doneAll = left <= 0.01 && !running;
+        const ready = parts.filter((x) => x.status === "idle" || x.status === "failed").length;
+        const isOpen = openLooks[g.id] ?? !doneAll;
         return (
-          <section key={g.id} className="glass rounded-3xl p-5 space-y-5">
-            <header className="flex items-start gap-3">
-              <span className="mt-2 w-3 h-3 rounded-full" style={{ background: g.color }} />
-              <div className="flex-1 min-w-0">
-                <h3 className="text-[18px] tracking-tight">{g.name}</h3>
-                <p className="text-muted text-[13px]">{g.description}</p>
-                <p className="text-faint text-[12px] mt-0.5">
-                  {shots.length} shots in span · {fmtShort(len)} · {left > 0.01 ? `${fmtShort(left)} to render` : "all rendered"}
-                </p>
-              </div>
+          <section key={g.id} className={`glass rounded-3xl ${isOpen ? "p-5 space-y-5" : "px-5 py-3.5"}`}>
+            <header>
+              <button className="w-full flex items-center gap-3 text-left" onClick={() => setOpenLooks((o) => ({ ...o, [g.id]: !isOpen }))}>
+                <span className="w-3 h-3 rounded-full shrink-0" style={{ background: g.color }} />
+                <span className="flex-1 min-w-0">
+                  <span className="block text-[17px] tracking-tight truncate">{g.name}</span>
+                  <span className="block text-faint text-[12px]">
+                    {shots.length} shots in span · {fmtShort(len)}
+                  </span>
+                </span>
+                {doneAll ? (
+                  <span className="inline-flex items-center gap-1.5 text-[12px] text-[#86efac]">
+                    <span className="w-5 h-5 rounded-full bg-[#86efac] text-black grid place-items-center text-[11px] font-semibold">✓</span>
+                    Rendered
+                  </span>
+                ) : running ? (
+                  <span className="inline-flex items-center gap-1.5 text-[12px] text-muted">
+                    <span className="w-2 h-2 rounded-full bg-white animate-pulse" /> Rendering
+                  </span>
+                ) : (
+                  <span className="text-[12px] text-muted">
+                    {fmtShort(left)} to render{ready ? ` · ${ready} part${ready === 1 ? "" : "s"} ready` : ""}
+                  </span>
+                )}
+                <span className={`text-muted transition-transform ${isOpen ? "rotate-90" : ""}`}>›</span>
+              </button>
+              {isOpen && <p className="text-muted text-[13px] mt-2 pl-6">{g.description}</p>}
             </header>
+            {isOpen && (<>
 
             <div className="space-y-1.5">
               <ReelPlayer
@@ -2802,6 +2825,7 @@ function RenderStep(props: {
                 />
               ))}
             </ol>
+            </>)}
           </section>
         );
       })}
