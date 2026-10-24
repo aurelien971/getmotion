@@ -60,6 +60,13 @@ function load() {
   return instance;
 }
 
+export class NoDecoderError extends Error {
+  constructor() {
+    super("No decoder for this codec in the browser engine");
+    this.name = "NoDecoderError";
+  }
+}
+
 // Cut [start, end] out of a video. Re-encodes video for frame-accurate edges,
 // keeps the audio. Returns an MP4 file.
 export async function trimVideo(
@@ -67,7 +74,7 @@ export async function trimVideo(
   start: number,
   end: number,
   onProgress?: (ratio: number) => void,
-  onStage?: (stage: "engine" | "cut" | "copy") => void,
+  onStage?: (stage: "engine" | "cut") => void,
 ): Promise<File> {
   onStage?.("engine");
   const ff = await load();
@@ -89,18 +96,9 @@ export async function trimVideo(
       "-y", "out.mp4",
     ]);
     if (code !== 0) {
-      // The wasm build has no HEVC decoder (iPhone footage). Fall back to a stream
-      // copy, which needs no decoding; edges land on the nearest keyframes.
-      onStage?.("copy");
-      const copy = await ff.exec([
-        "-ss", start.toFixed(3),
-        "-to", end.toFixed(3),
-        "-i", "in",
-        "-c", "copy",
-        "-movflags", "+faststart",
-        "-y", "out.mp4",
-      ]);
-      if (copy !== 0) throw new Error("This clip's codec can't be cut in the browser. Export it as H.264 MP4 and try again.");
+      // The wasm build has no HEVC or AV1 decoder (iPhone footage, YouTube rips).
+      // The caller re-records the window through the browser's decoder instead.
+      throw new NoDecoderError();
     }
     const data = (await ff.readFile("out.mp4")) as Uint8Array;
     const name = file.name.replace(/\.[^.]+$/, "") + `-${start.toFixed(1)}-${end.toFixed(1)}.mp4`;
@@ -188,4 +186,23 @@ export async function stitchVideos(
   } finally {
     for (const n of [...names, "list.txt", "stitched.mp4"]) await ff.deleteFile(n).catch(() => {});
   }
+}
+
+// Video codec name as ffmpeg reports it ("h264", "hevc", "vp9", ...), or null if unknown.
+export async function probeVideoCodec(file: Blob): Promise<string | null> {
+  const ff = await load();
+  let codec: string | null = null;
+  const onLog = ({ message }: { message: string }) => {
+    const m = /Stream #\d+:\d+.*Video: ([a-z0-9_]+)/i.exec(message);
+    if (m && !codec) codec = m[1].toLowerCase();
+  };
+  ff.on("log", onLog);
+  try {
+    await ff.writeFile("probe", await fetchFile(file));
+    await ff.exec(["-i", "probe", "-f", "null", "-t", "0.1", "-"]).catch(() => {});
+  } finally {
+    ff.off("log", onLog);
+    await ff.deleteFile("probe").catch(() => {});
+  }
+  return codec;
 }

@@ -4,7 +4,8 @@ import { fal } from "@fal-ai/client";
 import Image from "next/image";
 import { useEffect, useRef, useState } from "react";
 import { MODELS, SAM2_VIDEO } from "@/lib/models";
-import { muxAudio, stitchVideos, trimVideo, warmUp } from "@/lib/trim";
+import { muxAudio, NoDecoderError, probeVideoCodec, stitchVideos, trimVideo, warmUp } from "@/lib/trim";
+import { transcodeInBrowser } from "@/lib/transcode";
 import { Trimmer } from "@/components/Trimmer";
 import { FrameStrip } from "@/components/FrameStrip";
 import { kv, type SavedSession } from "@/lib/store";
@@ -239,9 +240,31 @@ export default function Home() {
     window.location.reload();
   }
 
+  // fal reads JPEG/PNG/WebP only; AVIF/HEIC and friends get redrawn as JPEG.
+  async function normalizeImage(f: File): Promise<File> {
+    if (["image/jpeg", "image/png", "image/webp"].includes(f.type)) return f;
+    const bmp = await createImageBitmap(f).catch(() => null);
+    if (!bmp) {
+      setError(`Can't read ${f.name}. Use a JPEG or PNG.`);
+      throw new Error("unreadable image");
+    }
+    const c = document.createElement("canvas");
+    c.width = bmp.width;
+    c.height = bmp.height;
+    c.getContext("2d")!.drawImage(bmp, 0, 0);
+    const blob = await new Promise<Blob | null>((r) => c.toBlob(r, "image/jpeg", 0.92));
+    return new File([blob!], f.name.replace(/\.[^.]+$/, "") + ".jpg", { type: "image/jpeg" });
+  }
+
+  async function addFace(f: File) {
+    const file = await normalizeImage(f).catch(() => null);
+    if (!file) return;
+    setCast((c) => (c.length >= 4 ? c : [...c, { file, preview: URL.createObjectURL(file), who: "" }]));
+  }
+
   function addPastedImage(f: File) {
     if (pasteTarget.current === "shot") addShot(f.name || "pasted.png", f);
-    else setCast((c) => (c.length >= 4 ? c : [...c, { file: f, preview: URL.createObjectURL(f), who: "" }]));
+    else void addFace(f);
   }
 
   // ⌘V anywhere drops the image into whichever list you last pasted into (faces by default).
@@ -436,22 +459,26 @@ export default function Home() {
   async function cutSelection(): Promise<File> {
     setBusy("Cutting the clip");
     setCutStage("Loading engine");
-    const stages = { engine: "Loading engine", cut: "Cutting", copy: "Cutting (keyframes)" };
+    const stages = { engine: "Loading engine", cut: "Cutting" };
     let stage = "Cutting";
-    const cut = await trimVideo(
-      videoFile!,
-      range[0],
-      range[1],
-      (p) => {
-        const pct = `${Math.round(p * 100)}%`;
-        setLog(pct);
-        setCutStage(`${stage} ${pct}`);
-      },
-      (st) => {
+    const report = (p: number) => {
+      const pct = `${Math.round(p * 100)}%`;
+      setLog(pct);
+      setCutStage(`${stage} ${pct}`);
+    };
+    let cut: File;
+    try {
+      cut = await trimVideo(videoFile!, range[0], range[1], report, (st) => {
         stage = stages[st];
         setCutStage(stage);
-      },
-    );
+      });
+    } catch (e) {
+      if (!(e instanceof NoDecoderError)) throw e;
+      // AV1 / HEVC: play the window through the browser and record it as H.264.
+      stage = "Converting (real time)";
+      setCutStage(stage);
+      cut = await transcodeInBrowser(videoFile!, report, { start: range[0], end: range[1] });
+    }
     setLog("");
     setCutStage(null);
     onVideo(cut);
@@ -529,6 +556,21 @@ export default function Home() {
     setMaskOk(false);
   }
 
+  const FAL_OK = new Set(["h264", "vp8", "vp9"]);
+
+  // fal can't read HEVC (iPhone) and some other codecs; convert through the
+  // browser's decoder first. Replaces the loaded clip with the converted one.
+  async function ensureReadable(file: File): Promise<File> {
+    setBusy("Checking clip codec");
+    const codec = await probeVideoCodec(file).catch(() => null);
+    if (!codec || FAL_OK.has(codec)) return file;
+    setBusy(`Converting ${codec.toUpperCase()} clip to H.264 (real time)`);
+    const out = await transcodeInBrowser(file, (p) => setLog(`${Math.round(p * 100)}%`));
+    setLog("");
+    onVideo(out);
+    return out;
+  }
+
   async function ensureUploaded(file: File) {
     if (videoUrl && file === videoFile) return videoUrl;
     setBusy("Uploading clip");
@@ -540,7 +582,7 @@ export default function Home() {
   async function runMask() {
     setError(null);
     try {
-      const url = await ensureUploaded(videoFile!);
+      const url = await ensureUploaded(await ensureReadable(videoFile!));
       setBusy("Tracking the person through every frame");
       const res = await fal.subscribe(SAM2_VIDEO, {
         input: {
@@ -581,6 +623,7 @@ export default function Home() {
         file = await cutSelection();
         len = range[1] - range[0];
       }
+      file = await ensureReadable(file);
       const url = await ensureUploaded(file);
       setBusy("Uploading faces");
       const slots = cast.slice(0, model.maxCast);
@@ -1118,7 +1161,7 @@ export default function Home() {
                     onChange={(e) => {
                       const f = e.target.files?.[0];
                       if (!f) return;
-                      setCast((s) => [...s, { file: f, preview: URL.createObjectURL(f), who: "" }]);
+                      void addFace(f);
                       e.target.value = "";
                     }}
                   />
