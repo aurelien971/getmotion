@@ -3,7 +3,7 @@ import Anthropic from "@anthropic-ai/sdk";
 export const maxDuration = 120;
 
 type Img = { name: string; dataUrl: string };
-type Body = { targets: Img[]; faces: Img[]; notes: string; model: string };
+type Body = { targets: Img[]; faces: Img[]; notes: string; model: string; previousPrompt?: string; results?: Img[]; feedback?: string };
 
 const SYSTEM = `You are the director for an AI video "recast" tool. The user will swap a person in a
 music video or film clip with a new person, using a video-to-video model (MiniMax H3 Max Recast or
@@ -25,7 +25,15 @@ Write ONE prompt the video model will execute well. Rules:
 - Say what carries over from the target (wardrobe, sunglasses, jewelry, hair under a hat...) and
   what comes from the reference (face, identity, skin tone, hairstyle unless covered), per the notes.
 - Preserve performance: lip-sync, expressions, body motion, camera, lighting, color grade.
-- Plain, concrete, present tense. No markdown. Under 220 words.
+- The subject must be replaced in EVERY shot he appears in, including wide shots where he is small,
+  shots where sunglasses, a cap or a hood hide his features, back/profile angles, and shots where he
+  is the only person in frame. Say this explicitly, and list each such shot by its cues.
+- Plain, concrete, present tense. No markdown. Under 260 words.
+
+REFINEMENT: when a PREVIOUS PROMPT, RESULT SHOTS (frames from the render it produced) and FEEDBACK are
+provided, compare result shots against target shots, name the shots the render missed or got wrong,
+and rewrite the prompt so those shots are called out first and unambiguously (clothing, framing,
+position, "even though he wears sunglasses / is far from camera"). Keep what worked.
 
 Respond with JSON only, no prose around it:
 {
@@ -62,6 +70,19 @@ export async function POST(req: Request) {
     content.push({ type: "text", text: `Reference image ${i + 1} — file "${f.name}"` });
     content.push(toImage(f));
   });
+  if (body.previousPrompt?.trim()) {
+    content.push({ type: "text", text: `PREVIOUS PROMPT:\n${body.previousPrompt.trim()}` });
+  }
+  if (body.results?.length) {
+    content.push({ type: "text", text: `RESULT SHOTS from the render that prompt produced (${body.results.length}):` });
+    body.results.forEach((r, i) => {
+      content.push({ type: "text", text: `Result ${i + 1} — "${r.name}"` });
+      content.push(toImage(r));
+    });
+  }
+  if (body.feedback?.trim()) {
+    content.push({ type: "text", text: `FEEDBACK on that render: ${body.feedback.trim()}` });
+  }
   content.push({
     type: "text",
     text: `NOTES: ${body.notes?.trim() || "(none)"}\n\nVIDEO MODEL: ${body.model}\n\nWrite the JSON now.`,

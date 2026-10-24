@@ -134,6 +134,9 @@ export default function Home() {
   };
   const [directing, setDirecting] = useState(false);
   const [restored, setRestored] = useState(false);
+  const [results, setResults] = useState<Shot[]>([]);
+  const [feedback, setFeedback] = useState("");
+  const [extracting, setExtracting] = useState<number | null>(null);
   const pasteTarget = useRef<"face" | "shot">("face");
 
   // Dev only: ?clip=/dev-long.mp4 loads a clip from /public for quick checks.
@@ -394,7 +397,43 @@ export default function Home() {
     return c.toDataURL("image/jpeg", 0.85);
   }
 
-  async function direct() {
+  // Pull N evenly spaced frames out of a rendered take, for the refine loop.
+  async function shotsFromTake(r: Result, n = 8) {
+    setExtracting(r.at);
+    try {
+      const v = document.createElement("video");
+      v.crossOrigin = "anonymous";
+      v.muted = true;
+      v.playsInline = true;
+      v.preload = "auto";
+      v.src = r.localUrl ?? r.url;
+      await new Promise<void>((res, rej) => {
+        v.onloadedmetadata = () => res();
+        v.onerror = () => rej(new Error("Could not load the take"));
+      });
+      const c = document.createElement("canvas");
+      c.width = v.videoWidth;
+      c.height = v.videoHeight;
+      const out: Shot[] = [];
+      for (let i = 0; i < n; i++) {
+        const t = ((i + 0.5) / n) * v.duration;
+        await new Promise<void>((res) => {
+          v.onseeked = () => res();
+          v.currentTime = t;
+        });
+        c.getContext("2d")!.drawImage(v, 0, 0);
+        const blob = await new Promise<Blob | null>((ok) => c.toBlob(ok, "image/jpeg", 0.85));
+        if (blob) out.push({ id: Date.now() + Math.random(), name: `result-${t.toFixed(1)}s.jpg`, url: URL.createObjectURL(blob), blob });
+      }
+      setResults(out);
+    } catch (e) {
+      setError(describeError(e));
+    } finally {
+      setExtracting(null);
+    }
+  }
+
+  async function direct(refine = false) {
     setError(null);
     setDirecting(true);
     try {
@@ -403,6 +442,13 @@ export default function Home() {
         faces: await Promise.all(cast.map(async (c) => ({ name: c.file.name, dataUrl: await shrink(c.file) }))),
         notes,
         model: model.name,
+        ...(refine
+          ? {
+              previousPrompt: directed,
+              results: await Promise.all(results.map(async (x) => ({ name: x.name, dataUrl: await shrink(x.blob, 1024) }))),
+              feedback,
+            }
+          : {}),
       };
       const res = await fetch("/api/direct", {
         method: "POST",
@@ -1107,6 +1153,9 @@ export default function Home() {
                         {r.model} · {new Date(r.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
                       </span>
                       <span className="flex gap-1.5">
+                        <button className="btn h-7 px-3 text-[12px]" disabled={extracting === r.at} onClick={() => shotsFromTake(r)}>
+                          {extracting === r.at ? "Reading…" : "Shots"}
+                        </button>
                         <button className="btn h-7 px-3 text-[12px]" onClick={() => addToStitch(r.model, r.localUrl ?? r.url)}>
                           Stitch
                         </button>
@@ -1226,7 +1275,7 @@ export default function Home() {
               <button
                 className="btn btn-on w-full"
                 disabled={directing || shots.length === 0 || cast.length === 0}
-                onClick={direct}
+                onClick={() => direct(false)}
               >
                 {directing ? "Writing prompt…" : "Write the prompt"}
               </button>
@@ -1254,6 +1303,40 @@ export default function Home() {
                   </div>
                 )}
               </div>
+
+              {directed.trim() && (
+                <div className="space-y-2 pt-2">
+                  <div className="flex items-baseline justify-between">
+                    <span className="text-[13px]">Refine from a take</span>
+                    <span className="text-faint text-[12px]">press Shots on a take below</span>
+                  </div>
+                  {results.length > 0 && (
+                    <div className="grid grid-cols-4 gap-1.5">
+                      {results.map((x, i) => (
+                        <div key={x.id} className="relative">
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img src={x.url} alt="" className="w-full aspect-video object-cover rounded-md ring-1 ring-hair" />
+                          <span className="absolute left-1 bottom-1 text-[10px] bg-black/60 rounded px-1 tabular-nums">{i + 1}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <textarea
+                    value={feedback}
+                    onChange={(e) => setFeedback(e.target.value)}
+                    placeholder="What the render missed: the loft dance wide shot (yellow cap, sunglasses) still shows the original; last crowd shot not replaced…"
+                    className="field text-[13px] resize-none"
+                    rows={3}
+                  />
+                  <button
+                    className="btn btn-on w-full"
+                    disabled={directing || (!feedback.trim() && results.length === 0)}
+                    onClick={() => direct(true)}
+                  >
+                    {directing ? "Rewriting…" : "Refine the prompt"}
+                  </button>
+                </div>
+              )}
             </div>
 
             <div className="space-y-3">
