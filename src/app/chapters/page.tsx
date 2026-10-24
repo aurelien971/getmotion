@@ -497,22 +497,34 @@ export default function Chapters() {
 
   // Re-find every edge on the original file: each edge snaps to the hard cut
   // within ±6 frames, if there is one. Edges already on a cut stay put.
-  // groupId null = everything (all shot edges plus every detected cut).
+  // groupId null = everything (all shot edges plus every detected cut);
+  // "unassigned" = shots not in a look; "absent" = the edges of the not-in-frame spans.
   async function resync(groupId: string | null) {
     if (!srcUrl) return;
     const key = `resync-${groupId ?? "all"}`;
-    const label = groupId ? `Resyncing ${p.groups.find((g) => g.id === groupId)?.name}` : "Resyncing every edge";
+    const label =
+      groupId === "absent"
+        ? "Resyncing not-in-frame edges"
+        : groupId === "unassigned"
+          ? "Resyncing ungrouped shots"
+          : groupId
+            ? `Resyncing ${p.groups.find((g) => g.id === groupId)?.name}`
+            : "Resyncing every edge";
     setTask(key, { label, pct: 0 });
     try {
       const fps = p.fps;
       const tol = 0.6 / fps;
       const totalFrames = Math.floor(p.duration * fps);
-      const shots = p.shots.filter((s) => (groupId ? s.groupId === groupId : true));
+      const shots =
+        groupId === "absent"
+          ? []
+          : p.shots.filter((s) => (groupId === "unassigned" ? !s.groupId : groupId ? s.groupId === groupId : true));
       const edges = new Set<number>();
       for (const s of shots) {
         if (s.start > tol) edges.add(s.start);
         if (s.end < p.duration - tol) edges.add(s.end);
       }
+      if (groupId === "absent") for (const b of p.boundaries) if (b.t > tol && b.t < p.duration - tol) edges.add(b.t);
       if (!groupId) for (const c of p.cuts ?? []) edges.add(c);
       const list = [...edges].sort((a, b) => a - b);
       const reader = await openReader(srcUrl, fps);
@@ -1358,6 +1370,11 @@ function ScenesStep(props: {
           <p className="text-faint text-[11px]">
             {fmtShort(props.groupedLen)} of {fmtShort(props.presentLen)} · {p.shots.length} shots
           </p>
+          <p className="text-faint text-[11px] tabular-nums leading-relaxed">
+            Looks {fmtShort(props.groupedLen)} + not grouped {fmtShort(total(unassigned))} + not in frame{" "}
+            {fmtShort(total(props.absent))} = {fmtShort(props.groupedLen + total(unassigned) + total(props.absent))} of{" "}
+            {fmtShort(p.duration)}
+          </p>
         </div>
 
         <nav className="space-y-1">
@@ -1438,6 +1455,16 @@ function ScenesStep(props: {
                 </>
               )}
             </div>
+            {!group && (sel === "absent" ? props.absent.length > 0 : unassigned.length > 0) && (
+              <button
+                className="btn"
+                disabled={props.resyncing}
+                title="Snap these edges to the real cut on the original video"
+                onClick={() => props.onResync(sel)}
+              >
+                Resync edges
+              </button>
+            )}
             {group && (
               <>
                 <button
