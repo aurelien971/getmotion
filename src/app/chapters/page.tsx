@@ -48,6 +48,7 @@ import {
   defaultTicks,
   refKey,
   refsOf,
+  otherRefsOf,
   wardrobeClashes,
   wardrobePrompt,
 } from "@/lib/project";
@@ -688,6 +689,10 @@ export default function Chapters() {
         eyewear: !!json.eyewear,
         performance: typeof json.performance === "string" ? json.performance : undefined,
         refKey: refKey(photos),
+        others: (Array.isArray(json.others) ? (json.others as string[]) : []).map((label) => ({
+          label,
+          faceId: prev?.others?.find((o) => o.label === label)?.faceId,
+        })),
       };
       update((x) => ({
         ...x,
@@ -833,8 +838,12 @@ export default function Chapters() {
       const clip = await buildPartClip(part);
       patchPart(part.id, { status: "uploading", progress: undefined });
       const videoUrl = await fal.storage.upload(clip);
+      const extra = otherRefsOf(p, g);
+      if (photos.length + extra.length > 4) {
+        throw new Error(`H3 takes at most 4 photos; this look uses ${photos.length} for him and ${extra.length} for others.`);
+      }
       const cast = await Promise.all(
-        photos.map(async (r) => ({ url: await fal.storage.upload(new File([r.blob], r.name, { type: r.type })), who: "" })),
+        [...photos, ...extra].map(async (r) => ({ url: await fal.storage.upload(new File([r.blob], r.name, { type: r.type })), who: "" })),
       );
       const input = model.build({
         videoUrl,
@@ -2257,6 +2266,7 @@ function RenderStep(props: {
                 </div>
                 <WardrobePanel
                   group={g}
+                  library={lib}
                   hasFaces={refsOf(p, g).length > 0}
                   busy={!!props.tasks[`wardrobe-${g.id}`]}
                   onAnalyze={() => props.onAnalyze(g)}
@@ -2345,6 +2355,7 @@ function RenderStep(props: {
 
 function WardrobePanel({
   group,
+  library,
   hasFaces,
   busy,
   onAnalyze,
@@ -2352,6 +2363,7 @@ function WardrobePanel({
   onBuild,
 }: {
   group: Group;
+  library: { id: string; label: string }[];
   hasFaces: boolean;
   busy: boolean;
   onAnalyze: () => void;
@@ -2415,6 +2427,43 @@ function WardrobePanel({
         <p key={c} className="text-[11px] text-[#fcd34d]">{c}</p>
       ))}
       {w && (
+        <div className="rounded-xl ring-1 ring-hair p-2.5 space-y-1.5">
+          <span className="block text-[11px] text-muted">Other people in this look</span>
+          {(w.others ?? []).length === 0 && <span className="block text-[12px] text-faint">Nobody else detected.</span>}
+          {(w.others ?? []).map((o, i) => (
+            <div key={`${o.label}-${i}`} className="flex items-center gap-2 group">
+              <span className="text-[12px] flex-1 min-w-0">{o.label}</span>
+              <select
+                value={o.faceId ?? ""}
+                onChange={(e) =>
+                  onChange({
+                    ...w,
+                    others: (w.others ?? []).map((x, k) => (k === i ? { ...x, faceId: e.target.value || undefined } : x)),
+                  })
+                }
+                className="field py-1 px-2 text-[12px] w-36"
+              >
+                <option value="">Keep as is</option>
+                {library.map((f) => (
+                  <option key={f.id} value={f.id}>Replace with {f.label}</option>
+                ))}
+              </select>
+              <button
+                className="text-faint opacity-0 group-hover:opacity-100 text-[12px]"
+                onClick={() => onChange({ ...w, others: (w.others ?? []).filter((_, k) => k !== i) })}
+                aria-label="Remove person"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+          <OtherAdd onAdd={(label) => onChange({ ...w, others: [...(w.others ?? []), { label }] })} />
+          {(w.others ?? []).some((o) => o.faceId) && (
+            <span className="block text-[11px] text-faint">Upload their face in Faces above; it is sent after his photos.</span>
+          )}
+        </div>
+      )}
+      {w && (
         <p className="text-faint text-[11px]">
           {w.alone ? "Alone in this look · " : ""}
           {w.faceHidden ? "face hidden in some frames · " : ""}
@@ -2425,6 +2474,26 @@ function WardrobePanel({
         {group.promptEdited ? "Rebuild prompt (replaces your edits)" : "Rebuild prompt from checklist"}
       </button>
     </div>
+  );
+}
+
+function OtherAdd({ onAdd }: { onAdd: (label: string) => void }) {
+  const [draft, setDraft] = useState("");
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (draft.trim()) onAdd(draft.trim());
+        setDraft("");
+      }}
+    >
+      <input
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        placeholder="+ add a person (e.g. man in yellow cap on the right)"
+        className="w-full bg-transparent text-[12px] outline-none placeholder:text-faint"
+      />
+    </form>
   );
 }
 

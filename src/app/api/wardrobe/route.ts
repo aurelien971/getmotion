@@ -21,9 +21,12 @@ Also judge the target shots:
 - "faceHidden": true if in some frames his face is hard to see (looking down, cap brim, turned away, motion blur).
 - "eyewear": true if he wears sunglasses or glasses in any target shot.
 - "performance": a few words on what he does, e.g. "raps to camera with hand gestures, leans in".
+- "others": every other clearly visible person who appears in several target shots (not a blurred
+  crowd), each described so a video model can find them: clothing, headwear, position relative to
+  the target, e.g. "man in yellow cap and black NEW tee, behind him on the right". Empty if none.
 
 Reply with JSON only:
-{"target":["..."],"reference":["Face","..."],"alone":true,"faceHidden":false,"eyewear":false,"performance":"..."}`;
+{"target":["..."],"reference":["Face","..."],"alone":true,"faceHidden":false,"eyewear":false,"performance":"...","others":["..."]}`;
 
 function toImage(img: Img): Anthropic.ImageBlockParam | null {
   const m = /^data:(image\/(?:png|jpeg|webp));base64,(.+)$/.exec(img.dataUrl);

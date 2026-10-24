@@ -39,7 +39,10 @@ export type Wardrobe = {
   eyewear?: boolean; // sunglasses/glasses in this look
   performance?: string; // what he does: "raps to camera with hand gestures"
   refKey?: string; // which photos this analysis was made with
+  others?: OtherPerson[]; // other people in this look; faceId set = replace them too
 };
+
+export type OtherPerson = { label: string; faceId?: string };
 
 const TOPS = /hoodie|tee|t-shirt|shirt|sweatshirt|jacket|coat|suit|top|jersey|vest|sweater|blazer/i;
 
@@ -65,6 +68,8 @@ export function defaultTicks(target: string[], reference: string[]): Wardrobe {
 }
 
 export function wardrobePrompt(description: string, w: Wardrobe | undefined, refCount: number): string {
+  const swaps = (w?.others ?? []).filter((o) => o.faceId);
+  const alone = !!w?.alone && !(w?.others ?? []).length;
   const take = (w?.reference ?? []).filter((x) => x.on && !/^face$/i.test(x.label)).map((x) => x.label.toLowerCase());
   const hair = take.filter((x) => HAIR_OR_FACE.test(x));
   const outfit = take.filter((x) => !HAIR_OR_FACE.test(x));
@@ -76,7 +81,7 @@ export function wardrobePrompt(description: string, w: Wardrobe | undefined, ref
   const list = (xs: string[], and = "and") => (xs.length < 2 ? xs.join("") : `${xs.slice(0, -1).join(", ")} ${and} ${xs[xs.length - 1]}`);
 
   const lines: string[] = [];
-  if (w?.alone) lines.push("He is the only person in every shot of this clip.");
+  if (alone) lines.push("He is the only person in every shot of this clip.");
   else
     lines.push(
       `The man to replace appears in every single shot of this clip. ${description}`.trim(),
@@ -99,10 +104,15 @@ export function wardrobePrompt(description: string, w: Wardrobe | undefined, ref
       w?.faceHidden ? ", including the frames where he looks down or turns away" : ""
     }${w?.performance ? ` (${w.performance})` : ""}.`,
   );
+  swaps.forEach((o, k) =>
+    lines.push(
+      `Also replace one other person (${o.label.replace(/^(a|an|the) /i, "")}) with the man in reference image ${refCount + k + 1}, keeping that person's clothing, position and movements.`,
+    ),
+  );
   lines.push(
-    w?.alone
+    alone
       ? "Keep the background, camera motion, framing, lighting and color grade unchanged."
-      : "Everyone else, the background, camera motion, framing, lighting and color grade stay unchanged.",
+      : `${swaps.length ? "Everyone else" : "Everyone else, including the other people,"} the background, camera motion, framing, lighting and color grade stay unchanged.`,
   );
   return lines.join(" ");
 }
@@ -475,6 +485,7 @@ export function signature(part: Part, group: Group, refs: StoredFile[]) {
     group.prompt,
     group.modelId,
     refKey(refs),
+    (group.wardrobe?.others ?? []).map((o) => o.faceId ?? "-").join(","),
   ].join("#");
 }
 
@@ -516,4 +527,12 @@ export function renderOutdated(p: Project, part: Part): boolean {
   const shots = p.shots.filter((s) => s.groupId === part.groupId);
   const tol = 0.5 / p.fps;
   return part.pieces.some((pc) => !shots.some((s) => pc.start >= s.start - tol && pc.end <= s.end + tol));
+}
+
+// Photos for the other people this look replaces, in prompt order (after the target's).
+export function otherRefsOf(p: Project, g: Group): StoredFile[] {
+  return (g.wardrobe?.others ?? [])
+    .filter((o) => o.faceId)
+    .map((o) => p.library?.find((f) => f.id === o.faceId)?.file)
+    .filter((f): f is StoredFile => !!f);
 }
