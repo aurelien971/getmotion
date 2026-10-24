@@ -521,19 +521,29 @@ export default function Home() {
         });
         out = (res.data as { video: { url: string } }).video.url;
       }
-      let localUrl: string | undefined;
+      // Save the paid result the moment it exists, before any post-processing.
+      const take: Result = { url: out, model: model.name, at: Date.now() };
+      const persist = (list: Result[]) => {
+        try {
+          // Blob URLs don't survive a reload; keep only the provider URL.
+          localStorage.setItem(HISTORY_KEY, JSON.stringify(list.map((r) => ({ url: r.url, model: r.model, at: r.at }))));
+        } catch {}
+      };
+      setHistory((h) => {
+        const next = [take, ...h];
+        persist(next);
+        return next;
+      });
       if (!model.keepsAudio) {
-        setBusy("Adding the original audio");
-        const silent = await fetch(out).then((r) => r.blob());
-        localUrl = URL.createObjectURL(await muxAudio(silent, file));
+        try {
+          setBusy("Adding the original audio");
+          const silent = await fetch(out).then((r) => r.blob());
+          const localUrl = URL.createObjectURL(await muxAudio(silent, file));
+          setHistory((h) => h.map((r) => (r.at === take.at ? { ...r, localUrl } : r)));
+        } catch (e) {
+          setError(`Video saved (silent). Adding audio failed: ${String(e)}`);
+        }
       }
-      const take: Result = { url: out, model: model.name, at: Date.now(), localUrl };
-      const next = [take, ...history];
-      setHistory(next);
-      try {
-        // Blob URLs don't survive a reload; keep only the provider URL.
-        localStorage.setItem(HISTORY_KEY, JSON.stringify(next.map((r) => ({ url: r.url, model: r.model, at: r.at }))));
-      } catch {}
     } catch (e) {
       setError(String(e));
     } finally {
