@@ -57,6 +57,25 @@ async function runSume(model: string, input: Record<string, unknown>, onStatus: 
   return url as string;
 }
 
+// fal's ApiError hides the useful part in .body; pull it out.
+function describeError(e: unknown): string {
+  if (e && typeof e === "object") {
+    const o = e as { message?: string; status?: number; body?: unknown };
+    const body = o.body as { detail?: unknown } | undefined;
+    const detail = body?.detail;
+    const text =
+      typeof detail === "string"
+        ? detail
+        : detail
+          ? JSON.stringify(detail)
+          : o.body
+            ? JSON.stringify(o.body)
+            : o.message;
+    return `${o.status ? `HTTP ${o.status}: ` : ""}${text ?? String(e)}`;
+  }
+  return String(e);
+}
+
 const fmtTime = (s: number) => {
   const m = Math.floor(s / 60);
   const sec = (s % 60).toFixed(1).padStart(4, "0");
@@ -301,7 +320,7 @@ export default function Home() {
       setDirection(json);
       setDirected(json.prompt ?? "");
     } catch (e) {
-      setError(String(e));
+      setError(describeError(e));
     } finally {
       setDirecting(false);
     }
@@ -335,7 +354,7 @@ export default function Home() {
       setHistory((h) => [{ url: localUrl, model: `Stitched ${stitch.length} clips`, at: Date.now(), localUrl }, ...h]);
       setStitch([]);
     } catch (e) {
-      setError(String(e));
+      setError(describeError(e));
     } finally {
       setBusy(null);
       setLog("");
@@ -373,7 +392,7 @@ export default function Home() {
     try {
       await cutSelection();
     } catch (e) {
-      setError(String(e));
+      setError(describeError(e));
     } finally {
       setBusy(null);
       setCutStage(null);
@@ -467,7 +486,7 @@ export default function Home() {
       });
       setMaskUrl((res.data as { video: { url: string } }).video.url);
     } catch (e) {
-      setError(String(e));
+      setError(describeError(e));
     } finally {
       setBusy(null);
       setLog("");
@@ -545,7 +564,7 @@ export default function Home() {
         }
       }
     } catch (e) {
-      setError(String(e));
+      setError(describeError(e));
     } finally {
       setBusy(null);
       setLog("");
