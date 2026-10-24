@@ -1389,6 +1389,7 @@ export default function Chapters() {
   // rebuilds the not-yet-rendered parts, wherever you navigate from.
   const shotsKey = p.shots.map((s) => `${s.id}:${s.start.toFixed(4)}-${s.end.toFixed(4)}:${s.groupId}`).join("|");
   // What's already covered: finished/running renders with their trims and redos.
+  const acceptKey = p.groups.map((g) => (g.accepted ?? []).map((x) => x.start.toFixed(3)).join(",")).join("|");
   const coverKey = p.parts
     .filter((x) => x.status !== "idle" && x.status !== "failed")
     .map((x) => `${x.id}:${x.status}:${JSON.stringify(x.trims ?? {})}:${(x.rejected ?? []).join(",")}:${(x.unused ?? []).join(",")}:${(x.deleted ?? []).join(",")}`)
@@ -1397,7 +1398,7 @@ export default function Chapters() {
     if (!loaded || !p.groups.length) return;
     queueMicrotask(() => update((x) => ({ ...x, parts: plan(x) })));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loaded, shotsKey, coverKey, p.range?.start, p.range?.end, p.groups.length]);
+  }, [loaded, shotsKey, coverKey, acceptKey, p.range?.start, p.range?.end, p.groups.length]);
 
   // Resume renders that were in flight when the page closed.
   const resumed = useRef(false);
