@@ -18,6 +18,7 @@ import {
   clipTo,
   covered,
   partsInRange,
+  renderOutdated,
   pending as pendingFor,
   emptyProject,
   fmt,
@@ -390,7 +391,11 @@ export default function Chapters() {
     render: p.shots.length > 0 && unassigned.length === 0 && p.groups.length > 0,
     assemble: partsDone > 0,
   };
-  const go = (s: Step) => reach[s] && update((x) => ({ ...x, step: s }));
+  const go = (s: Step) => {
+    if (!reach[s]) return;
+    if (s === "render") return enterRender();
+    update((x) => ({ ...x, step: s }));
+  };
 
   // ---- scenes: shots, thumbs, grouping --------------------------------------
   async function enterScenes() {
@@ -844,6 +849,15 @@ export default function Chapters() {
     queueMicrotask(() => void analyzeWardrobe(next));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded, p.step, p.groups, p.library, p.defaultRefs, p.range, tasks]);
+
+  // Parts always follow the current shots and span: any trim in Scenes or span drag
+  // rebuilds the not-yet-rendered parts, wherever you navigate from.
+  const shotsKey = p.shots.map((s) => `${s.id}:${s.start.toFixed(4)}-${s.end.toFixed(4)}:${s.groupId}`).join("|");
+  useEffect(() => {
+    if (!loaded || !p.groups.length) return;
+    queueMicrotask(() => update((x) => ({ ...x, parts: plan(x) })));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded, shotsKey, p.range?.start, p.range?.end, p.groups.length]);
 
   // Resume renders that were in flight when the page closed.
   const resumed = useRef(false);
@@ -2182,7 +2196,8 @@ function RenderStep(props: {
                   fps={p.fps}
                   part={pt}
                   index={i}
-                  stale={!!pt.signature && pt.status === "done" && pt.signature !== signature(pt, g, refsOf(p, g))}
+                  stale={pt.status === "done" && ((!!pt.signature && pt.signature !== signature(pt, g, refsOf(p, g))) || renderOutdated(p, pt))}
+                  outdated={pt.status === "done" && renderOutdated(p, pt)}
                   cost={costOf(pt)}
                   canRender={refsOf(p, g).length > 0}
                   onRender={() => props.onRender([pt.id])}
@@ -2399,6 +2414,7 @@ function PartRow({
   part,
   index,
   stale,
+  outdated,
   cost,
   canRender,
   onRender,
@@ -2408,6 +2424,7 @@ function PartRow({
   part: Part;
   index: number;
   stale: boolean;
+  outdated?: boolean;
   cost: number;
   canRender: boolean;
   onRender: () => void;
@@ -2417,7 +2434,7 @@ function PartRow({
     building: "Building clip",
     uploading: "Uploading",
     rendering: "Rendering",
-    done: stale ? "Done · settings changed" : "Done",
+    done: outdated ? "Outdated · shot edges changed, a new part replaces it" : stale ? "Done · settings changed" : "Done",
     failed: "Failed",
   };
   const busy = part.status === "building" || part.status === "uploading" || part.status === "rendering";
@@ -2449,8 +2466,8 @@ function PartRow({
       )}
       <span className="text-faint text-[12px] tabular-nums">~${cost.toFixed(2)}</span>
       <button className="btn" onClick={() => setOpen((o) => !o)}>{open ? "Hide" : "Preview"}</button>
-      <button className={`btn ${part.status === "idle" ? "btn-on" : ""}`} disabled={busy || !canRender} onClick={onRender}>
-        {part.status === "done" || part.status === "failed" ? "Re-roll" : "Render"}
+      <button className={`btn ${part.status === "idle" ? "btn-on" : ""}`} disabled={busy || !canRender || outdated} onClick={onRender}>
+        {outdated ? "Superseded" : part.status === "done" || part.status === "failed" ? "Re-roll" : "Render"}
       </button>
       </div>
       {open && (

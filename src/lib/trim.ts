@@ -218,6 +218,8 @@ function exclusive<T>(fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
+const evalFps = (e: string) => (e.includes("/") ? +e.split("/")[0] / +e.split("/")[1] : +e);
+
 let seq = 0;
 const tmp = (ext: string) => `t${++seq}.${ext}`;
 
@@ -305,24 +307,36 @@ export async function buildClip(
     await ff.writeFile(src, await fetchFile(source));
     const w = size.w - (size.w % 2);
     const h = size.h - (size.h % 2);
+    // Each span is cut to an exact frame count. A quarter-frame pre-roll keeps the
+    // first frame even when the copy's frame times jitter by a few milliseconds;
+    // trim=end_frame stops it from ever running one frame into the next shot.
+    const rate = evalFps(fps);
+    const pre = 0.25 / rate;
+    const frames = spans.map((s) => Math.max(1, Math.round((s.end - s.start) * rate)));
     const args: string[] = [];
-    spans.forEach((s) => args.push("-ss", s.start.toFixed(3), "-t", (s.end - s.start).toFixed(3), "-i", src));
-    const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps},format=yuv420p`;
+    spans.forEach((s, i) =>
+      args.push("-ss", Math.max(0, s.start - pre).toFixed(4), "-t", ((frames[i] + 2) / rate).toFixed(4), "-i", src),
+    );
+    const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p`;
     let graph = "";
     let ins = "";
-    spans.forEach((_, i) => {
-      graph += `[${i}:v]setpts=PTS-STARTPTS,${vf}[v${i}];`;
-      if (withAudio) graph += `[${i}:a]asetpts=PTS-STARTPTS,aresample=48000[a${i}];`;
+    spans.forEach((s, i) => {
+      const skip = s.start - pre < 0 ? 0 : pre;
+      graph += `[${i}:v]setpts=PTS-STARTPTS,fps=${fps}:start_time=${skip.toFixed(4)},trim=end_frame=${frames[i]},setpts=PTS-STARTPTS,${vf}[v${i}];`;
+      if (withAudio) {
+        graph += `[${i}:a]atrim=start=${skip.toFixed(4)}:duration=${(frames[i] / rate).toFixed(4)},asetpts=PTS-STARTPTS,aresample=48000[a${i}];`;
+      }
       ins += withAudio ? `[v${i}][a${i}]` : `[v${i}]`;
     });
     graph += `${ins}concat=n=${spans.length}:v=1:a=${withAudio ? 1 : 0}[v]${withAudio ? "[a]" : ""}`;
-    const total = spans.reduce((t, s) => t + s.end - s.start, 0);
+    const total = frames.reduce((t, n) => t + n, 0) / rate;
     const code = await execTimed(
       ff,
       [
         ...args,
         "-filter_complex", graph,
         "-map", "[v]",
+        "-r", fps,
         ...(withAudio ? ["-map", "[a]", "-c:a", "aac", "-ac", "2"] : []),
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
         "-movflags", "+faststart", "-y", out,
@@ -343,7 +357,6 @@ export async function buildClip(
 
 export type TimelinePiece = { file: number; start: number; end: number }; // file 0 = source
 
-const evalFps = (e: string) => (e.includes("/") ? +e.split("/")[0] / +e.split("/")[1] : +e);
 
 // Lay pieces end to end, conform every piece to w x h, and put the source's own
 // audio for [audioStart, audioEnd] underneath.

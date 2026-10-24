@@ -294,6 +294,8 @@ export function covered(p: Project, groupId?: string): Interval[] {
   const xs = p.parts
     .filter((x) => (groupId ? x.groupId === groupId : true))
     .filter((x) => x.status === "done" || x.status === "rendering" || x.status === "building" || x.status === "uploading")
+    // A render whose shot edges changed no longer counts: its footage gets a fresh part.
+    .filter((x) => !(x.status === "done" && renderOutdated(p, x)))
     .flatMap((x) => x.pieces.map((pc) => ({ start: pc.start, end: pc.end })));
   return merge(xs);
 }
@@ -444,4 +446,12 @@ export function moveEdge(
   if (!hit) c.push(to);
   b.sort((x, y) => x.t - y.t);
   return { boundaries: b, cuts: [...new Set(c)].sort((x, y) => x - y) };
+}
+
+// A finished render is outdated if any of its pieces is no longer fully inside a
+// shot of the same look (edges were trimmed or shots moved after it was rendered).
+export function renderOutdated(p: Project, part: Part): boolean {
+  const shots = p.shots.filter((s) => s.groupId === part.groupId);
+  const tol = 0.5 / p.fps;
+  return part.pieces.some((pc) => !shots.some((s) => pc.start >= s.start - tol && pc.end <= s.end + tol));
 }
