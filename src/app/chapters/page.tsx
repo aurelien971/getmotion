@@ -966,6 +966,16 @@ export default function Chapters() {
       return { ...x, parts };
     });
   }
+  // Validate finished renders: each of their takes becomes the one used for its shot, reviewed.
+  function validateParts(parts: Part[]) {
+    for (const pt of parts)
+      pt.pieces.forEach((_, j) => {
+        if (pt.deleted?.includes(j)) return;
+        chooseTake(keptRange(pt, j), pt.id, j);
+      });
+    flash(`Validated ${parts.length} render${parts.length === 1 ? "" : "s"}`);
+  }
+
   function deletePart(partId: string) {
     const pt = p.parts.find((x) => x.id === partId);
     if (!pt) return;
@@ -1000,7 +1010,7 @@ export default function Chapters() {
 
   // Review decisions. Using a take parks every other take of the same shot (kept, not
   // deleted); Redo marks all of them unwanted so the shot is queued again.
-  function useTake(shotRange: { start: number; end: number }, partId: string, j: number) {
+  function chooseTake(shotRange: { start: number; end: number }, partId: string, j: number) {
     update((x) => {
       const others = takesFor(x, shotRange).filter((t) => !(t.part.id === partId && t.j === j));
       return {
@@ -1873,9 +1883,10 @@ export default function Chapters() {
             compositeBusy={!!tasks.assemble}
             zipBusy={!!tasks.zip}
             onInspect={(pt) => void inspectPart(pt)}
-            onUseTake={useTake}
+            onUseTake={chooseTake}
             onDeleteTake={deleteTake}
             onDeletePart={deletePart}
+            onValidate={validateParts}
             onRestorePart={restorePart}
             onRestoreTakes={restoreTakes}
             onAttach={attachRender}
@@ -2823,6 +2834,7 @@ function RenderStep(props: {
   onRestoreTakes: (partId: string) => void;
   onAttach: (partId: string) => void;
   onAccept: (groupId: string, xs: { start: number; end: number }[]) => void;
+  onValidate: (parts: Part[]) => void;
   onRedoShot: (shot: { start: number; end: number }) => void;
   onTrimPiece: (partId: string, piece: number) => void;
   onFix: (part: Part, only?: Issue[]) => void;
@@ -3248,6 +3260,18 @@ function RenderStep(props: {
               />
             )}
 
+            {(() => {
+              const waiting = parts.filter(
+                (x) => x.status === "done" && !renderOutdated(p, x) && !x.pieces.every((_, j) => x.deleted?.includes(j) || (x.reviewed?.includes(j) && pieceLive(x, j))),
+              );
+              return waiting.length > 1 ? (
+                <div className="flex items-center gap-3 text-[12px]">
+                  <span className="flex-1 text-muted">{waiting.length} renders back and not validated yet</span>
+                  <button className="btn h-8 px-3 text-[12px]" onClick={() => props.onValidate(waiting)}>Validate all {waiting.length}</button>
+                </div>
+              ) : null;
+            })()}
+
             {g.oneShot && (() => {
               const todo = parts.filter((x) => x.status === "idle" || x.status === "failed");
               const unwritten = todo.filter((x) => !g.partPrompts?.[partKey(x)]);
@@ -3292,6 +3316,7 @@ function RenderStep(props: {
                   onDelete={() => props.onDeletePart(pt.id)}
                   onAttach={() => props.onAttach(pt.id)}
                   onSkip={() => props.onAccept(g.id, pt.pieces.map(({ start, end }) => ({ start, end })))}
+                  onValidate={() => props.onValidate([pt])}
                   shotThumbs={pt.pieces.map((pc) => ({ start: pc.start, end: pc.end, thumb: p.shots.find((sh) => sh.id === pc.shotId)?.thumb }))}
                   people={(() => {
                     const on = partPeople(g, pt);
@@ -4010,8 +4035,10 @@ function PartRow({
   people,
   onTogglePerson,
   onSkip,
+  onValidate,
 }: {
   onSkip: () => void;
+  onValidate: () => void;
   people: { index: number; label: string; thumb?: string; on: boolean }[];
   onTogglePerson: (index: number) => void;
   shotThumbs: { start: number; end: number; thumb?: string }[];
@@ -4122,6 +4149,19 @@ function PartRow({
           Inspect
         </button>
       )}
+      {part.status === "done" && !outdated && (() => {
+        const valid = part.pieces.every((_, j) => part.deleted?.includes(j) || (part.reviewed?.includes(j) && pieceLive(part, j)));
+        return valid ? (
+          <span className="inline-flex items-center gap-1.5 text-[12px] text-[#86efac]">
+            <span className="w-5 h-5 rounded-full bg-[#86efac] text-black grid place-items-center text-[11px] font-semibold">✓</span>
+            Validated
+          </span>
+        ) : (
+          <button className="btn btn-on" onClick={onValidate} title="Use this render for its shot(s): marked reviewed and sent to the composite">
+            Validate
+          </button>
+        );
+      })()}
       <button className="btn" onClick={() => setOpen((o) => !o)}>{open ? "Hide" : part.status === "done" ? "Review" : "Preview"}</button>
       <button className={`btn ${part.status === "idle" ? "btn-on" : ""}`} disabled={busy || !canRender || outdated} onClick={onRender}>
         {outdated ? "Superseded" : part.status === "done" || part.status === "failed" ? "Re-roll" : "Render"}
