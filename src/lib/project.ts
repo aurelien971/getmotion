@@ -306,6 +306,7 @@ export type Project = {
   output?: StoredFile;
   range?: Interval; // the span being rendered now; all renders are kept across spans
   library?: LibFace[]; // every reference photo for this project
+  trash?: (Part & { trashedAt: number })[]; // deleted renders, restorable
   defaultRefs?: string[]; // library ids used by looks that don't pick their own
 };
 

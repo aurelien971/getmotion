@@ -926,7 +926,6 @@ export default function Chapters() {
             }
           : pt,
       );
-      parts = parts.filter((pt) => !(pt.status === "done" && pt.pieces.every((_, k) => pt.deleted?.includes(k))));
       // If the deleted take was the one in use, bring back the newest remaining take.
       const rest = takesFor({ ...x, parts }, shotRange).filter((t) => !t.rejected);
       if (rest.length && !rest.some((t) => t.live)) {
@@ -939,8 +938,33 @@ export default function Chapters() {
   function deletePart(partId: string) {
     const pt = p.parts.find((x) => x.id === partId);
     if (!pt) return;
-    if (pt.status === "done" && !confirm("Delete this render and all its takes? Its shots will show as not rendered.")) return;
-    update((x) => ({ ...x, parts: x.parts.filter((y) => y.id !== partId) }));
+    // Finished renders go to the Trash (Renders panel) and can be restored.
+    update((x) => ({
+      ...x,
+      parts: x.parts.filter((y) => y.id !== partId),
+      trash: pt.status === "done" ? [...(x.trash ?? []), { ...pt, trashedAt: Date.now() }] : x.trash,
+    }));
+    if (pt.status === "done") flash("Render moved to Trash · restore it from the Renders panel");
+  }
+  function restorePart(partId: string) {
+    update((x) => {
+      const t = x.trash?.find((y) => y.id === partId);
+      if (!t) return x;
+      const { trashedAt: _t, ...part } = t;
+      void _t;
+      return { ...x, parts: [...x.parts, part], trash: x.trash!.filter((y) => y.id !== partId) };
+    });
+  }
+  function restoreTakes(partId: string) {
+    update((x) => ({ ...x, parts: x.parts.map((pt) => (pt.id === partId ? { ...pt, deleted: undefined } : pt)) }));
+  }
+  // Put a render you already paid for back on a part (URL from fal's Requests page).
+  function attachRender(partId: string) {
+    const url = prompt("Paste the video URL of the render (from fal's Requests page, ends in .mp4):")?.trim();
+    if (!url) return;
+    if (!/^https:\/\/[^\s]+$/.test(url)) return setError("That doesn't look like a video URL.");
+    patchPart(partId, { status: "done", resultUrl: url, renderedAt: Date.now(), calibrated: false, linedUp: false, measuredOffsets: undefined, error: undefined });
+    flash("Render attached");
   }
 
   // Review decisions. Using a take parks every other take of the same shot (kept, not
@@ -1795,6 +1819,9 @@ export default function Chapters() {
             onUseTake={useTake}
             onDeleteTake={deleteTake}
             onDeletePart={deletePart}
+            onRestorePart={restorePart}
+            onRestoreTakes={restoreTakes}
+            onAttach={attachRender}
             onAccept={(gid, xs) => patchGroup(gid, { accepted: [...(p.groups.find((g) => g.id === gid)?.accepted ?? []), ...xs] })}
             onRedoShot={redoShot}
             onTrimPiece={(id, j) => setTrimmingRender({ partId: id, j })}
@@ -2734,6 +2761,9 @@ function RenderStep(props: {
   onUseTake: (shot: { start: number; end: number }, partId: string, j: number) => void;
   onDeleteTake: (shot: { start: number; end: number }, partId: string, j: number) => void;
   onDeletePart: (partId: string) => void;
+  onRestorePart: (partId: string) => void;
+  onRestoreTakes: (partId: string) => void;
+  onAttach: (partId: string) => void;
   onAccept: (groupId: string, xs: { start: number; end: number }[]) => void;
   onRedoShot: (shot: { start: number; end: number }) => void;
   onTrimPiece: (partId: string, piece: number) => void;
@@ -2899,6 +2929,8 @@ function RenderStep(props: {
         onComposite={props.onComposite}
         compositeBusy={props.compositeBusy}
         zipBusy={props.zipBusy}
+        onRestorePart={props.onRestorePart}
+        onRestoreTakes={props.onRestoreTakes}
       />
 
       <section className="glass rounded-3xl p-5 space-y-3">
@@ -3136,6 +3168,7 @@ function RenderStep(props: {
                   writing={props.writing.has(pt.id)}
                   onWritePrompt={() => props.onWritePrompt(pt)}
                   onDelete={() => props.onDeletePart(pt.id)}
+                  onAttach={() => props.onAttach(pt.id)}
                   onEditPrompt={(t) => props.onEditPrompt(pt, t)}
                 />
               ))}
@@ -3247,7 +3280,11 @@ function RendersPanel({
   onComposite,
   compositeBusy,
   zipBusy,
+  onRestorePart,
+  onRestoreTakes,
 }: {
+  onRestorePart: (id: string) => void;
+  onRestoreTakes: (id: string) => void;
   p: Project;
   range: { start: number; end: number };
   onDownload: (pt: Part) => void;
@@ -3259,6 +3296,7 @@ function RendersPanel({
   const [open, setOpen] = useState(true);
   const done = p.parts.filter((x) => x.status === "done" && x.resultUrl).sort((a, b) => (b.renderedAt ?? 0) - (a.renderedAt ?? 0));
   const status = (pt: Part) => {
+    if (pt.pieces.every((_, j) => pt.deleted?.includes(j))) return "all takes deleted";
     const live = pt.pieces.filter((_, j) => pieceLive(pt, j)).length;
     if (live === pt.pieces.length) return "in use";
     if (live === 0) return pt.rejected?.length === pt.pieces.length ? "redo" : "alternative";
@@ -3312,11 +3350,37 @@ function RendersPanel({
                     </span>
                     <button className="btn h-8 px-3 text-[12px]" onClick={() => onDownload(pt)}>Download</button>
                   </div>
+                  {!!pt.deleted?.length && (
+                    <button className="btn h-7 px-2.5 text-[11px] w-full" onClick={() => onRestoreTakes(pt.id)}>
+                      Restore {pt.deleted.length} deleted take{pt.deleted.length === 1 ? "" : "s"}
+                    </button>
+                  )}
                 </div>
               );
             })}
           </div>
         )
+      )}
+      {open && !!p.trash?.length && (
+        <div className="space-y-2 pt-1">
+          <h3 className="text-[13px] text-muted">Trash · {p.trash.length}</h3>
+          <ul className="space-y-1.5">
+            {p.trash.map((pt) => {
+              const g = p.groups.find((x) => x.id === pt.groupId);
+              const a = Math.min(...pt.pieces.map((x) => x.start));
+              const b = Math.max(...pt.pieces.map((x) => x.end));
+              return (
+                <li key={pt.id} className="flex items-center gap-3 rounded-xl ring-1 ring-hair px-3 py-2 text-[12px]">
+                  <span className="w-2 h-2 rounded-full" style={{ background: g?.color }} />
+                  <span className="flex-1 min-w-0 truncate">
+                    {g?.name ?? "Look"} · <span className="text-muted tabular-nums">{fmt(a)}–{fmt(b)} · deleted {new Date(pt.trashedAt).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span>
+                  </span>
+                  <button className="btn h-7 px-2.5 text-[11px]" onClick={() => onRestorePart(pt.id)}>Restore</button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
       )}
     </section>
   );
@@ -3807,8 +3871,10 @@ function PartRow({
   onWritePrompt,
   onEditPrompt,
   onDelete,
+  onAttach,
 }: {
   onDelete: () => void;
+  onAttach: () => void;
   scenePrompt?: ScenePrompt;
   writing: boolean;
   onWritePrompt: () => void;
@@ -3886,6 +3952,11 @@ function PartRow({
       >
         {writing ? "Studying scenes…" : scenePrompt ? `Prompt ✓${scenePrompt.warnings.length ? ` · ${scenePrompt.warnings.length} ⚠` : ""}` : "Write prompt"}
       </button>
+      {(part.status === "idle" || part.status === "failed") && (
+        <button className="btn" onClick={onAttach} title="Already rendered this on fal? Paste its video URL to put it back, no new render">
+          Attach render
+        </button>
+      )}
       {(part.status === "idle" || part.status === "failed") && (
         <button className="btn" onClick={onCheck} title="Build the clip locally and look for frames from other scenes">
           {part.checkedKey ? "Checked ✓" : "Check"}
