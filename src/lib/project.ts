@@ -180,6 +180,7 @@ export type Part = {
   measuredOffsets?: number[];
   edges?: { head: number; tail: number }[]; // junk render frames at each piece's start / end, held over
   linedUp?: boolean; // measured frame by frame against the original
+  edgesV?: number; // version of the edge-glitch check that ran on this render
   calibrated?: boolean;
   issues?: Issue[]; // stray footage found by the pre-flight check
   checkedKey?: string; // pieces the last clean check was for
@@ -516,24 +517,27 @@ export function pending(p: Project, groupId: string): { shotId: string; start: n
 // forward again, and so on. Motion just reverses, so there is never a cut to lose him at.
 // Turnaround frames aren't repeated. The filler is thrown away after rendering.
 export function pingPong(pieces: { start: number; end: number }[], duration: number, f: number) {
+  // Stay one frame clear of every shot edge: a converted copy's timing can jitter by a
+  // frame, and a filler pass must never run into the neighbouring shot (that's a cut).
+  const inner = pieces.map((pc) => (pc.end - pc.start >= 4 * f ? { start: pc.start + f, end: pc.end - f } : pc));
   const pad: { start: number; end: number; reverse?: boolean }[] = [];
   let len = duration;
   let back = true;
-  for (let guard = 0; len < MIN_CLIP - 1e-3 && pieces.length && guard < 400; guard++) {
-    const seq = back ? [...pieces].reverse() : pieces;
+  for (let pass = 0; len < MIN_CLIP - 1e-3 && inner.length && pass < 400; pass++) {
+    const seq = back ? [...inner].reverse() : inner;
     for (let k = 0; k < seq.length && len < MIN_CLIP - 1e-3; k++) {
       const pc = seq[k];
-      // Skip the frame we turned around on (the first one of this pass).
       let a = pc.start;
       let b = pc.end;
-      if (k === 0) {
+      // Skip the frame we turned around on (the previous pass already showed it). The
+      // first pass turns around on the real clip's last frame, which is outside `inner`.
+      if (k === 0 && pass > 0) {
         if (back) b -= f;
         else a += f;
       }
       if (b - a < f / 2) continue;
       const need = MIN_CLIP - len;
       if (b - a > need) {
-        // Partial pass: keep the frames nearest the turnaround.
         if (back) a = b - need;
         else b = a + need;
       }

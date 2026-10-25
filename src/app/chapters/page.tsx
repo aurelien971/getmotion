@@ -1441,7 +1441,7 @@ export default function Chapters() {
   const calibrating = useRef(false);
   useEffect(() => {
     if (!loaded || calibrating.current) return;
-    const next = p.parts.find((x) => x.status === "done" && x.resultUrl && (!x.calibrated || (!x.linedUp && srcUrl)));
+    const next = p.parts.find((x) => x.status === "done" && x.resultUrl && (!x.calibrated || (srcUrl && (!x.linedUp || x.edgesV !== 2))));
     if (!next) return;
     calibrating.current = true;
     const fps = p.fps;
@@ -1458,7 +1458,7 @@ export default function Chapters() {
         }
         const moved = offsets.filter((o, i) => Math.abs(o - next.pieces[i].offset) > 0.5 / fps).length;
         const junk = (edges ?? []).reduce((n, e) => n + e.head + e.tail, 0);
-        patchPart(next.id, { measuredOffsets: offsets, edges, calibrated: true, linedUp: !!srcUrl });
+        patchPart(next.id, { measuredOffsets: offsets, edges, calibrated: true, linedUp: !!srcUrl, edgesV: srcUrl ? 2 : undefined });
         if (moved || junk)
           flash(
             [moved ? `lined up ${moved} piece${moved === 1 ? "" : "s"}` : "", junk ? `holding over ${junk} junk frame${junk === 1 ? "" : "s"} at cuts` : ""]
@@ -1467,7 +1467,7 @@ export default function Chapters() {
               .replace(/^./, (c) => c.toUpperCase()),
           );
       } catch {
-        patchPart(next.id, { calibrated: true, linedUp: true });
+        patchPart(next.id, { calibrated: true, linedUp: true, edgesV: 2 });
       } finally {
         calibrating.current = false;
       }

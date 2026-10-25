@@ -230,6 +230,15 @@ export async function lineUpRender(
       const end = follow - 1;
       edges[i - 1].tail = lastAk < 0 ? 0 : Math.min(3, Math.max(0, end - lastAk));
     }
+    // The clip's first frame and the last real frame (before the filler) have no cut to
+    // check against: a frame that breaks from its neighbours there is a glitch, held over.
+    const glitch = async (x: number, n1: number, n2: number) =>
+      similarity(await b.frame(x), await b.frame(n1)) < CUT_BELOW && similarity(await b.frame(n1), await b.frame(n2)) >= CUT_BELOW;
+    const first = sf(offsets[0]);
+    if (await glitch(first, first + 1, first + 2)) edges[0].head = Math.max(edges[0].head, 1);
+    const li = pieces.length - 1;
+    const last = sf(offsets[li]) + (sf(pieces[li].end) - sf(pieces[li].start)) - 1;
+    if (last - 2 > first && (await glitch(last, last - 1, last - 2))) edges[li].tail = Math.max(edges[li].tail, 1);
     return { offsets, edges };
   } finally {
     a.close();
