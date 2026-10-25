@@ -290,6 +290,20 @@ export function measureOffsets(part: Part, cuts: number[], fps: number): number[
 }
 
 
+// Frame accounting for an export, against the original span.
+export type ExportReport = {
+  span: Interval;
+  fps: number;
+  size: { w: number; h: number };
+  expected: number; // frames in the original span
+  out: number; // frames in the exported file
+  approved: number; // rendered frames from validated / reviewed takes
+  unreviewed: number; // rendered frames not reviewed yet
+  held: number; // 1-2 frame gaps and junk frames filled with the neighbouring rendered frame
+  himOriginal: number; // frames of him left as the original (not rendered, kept original)
+  others: number; // frames without him (original)
+};
+
 export type Step = "source" | "spot" | "scenes" | "render" | "assemble";
 
 export type Project = {
@@ -312,6 +326,7 @@ export type Project = {
   parts: Part[];
   step: Step;
   output?: StoredFile;
+  outputReport?: ExportReport;
   range?: Interval; // the span being rendered now; all renders are kept across spans
   library?: LibFace[]; // every reference photo for this project
   trash?: (Part & { trashedAt: number })[]; // deleted renders, restorable

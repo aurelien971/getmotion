@@ -36,7 +36,7 @@ export async function transcodeInBrowser(
   const stream = (el.captureStream ?? el.mozCaptureStream)?.call(v);
   if (!stream) throw new Error("captureStream unsupported in this browser.");
 
-  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 12_000_000 });
+  const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 40_000_000 });
   const chunks: Blob[] = [];
   rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
   const done = new Promise<void>((res) => (rec.onstop = () => res()));

@@ -387,7 +387,8 @@ export async function assembleTimeline(
       args.push("-ss", (p.start * k).toFixed(4), "-t", ((p.end - p.start) * k).toFixed(4), "-i", names[p.file]);
     });
     if (audio) args.push("-ss", audio.start.toFixed(4), "-t", (audio.end - audio.start).toFixed(4), "-i", names[0]);
-    const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps},format=yuv420p`;
+    // Lanczos: renders come up to the source size cleanly; source footage at its own size is untouched.
+    const vf = `scale=${w}:${h}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps},format=yuv420p`;
     let graph = "";
     pieces.forEach((p, i) => {
       const k = stretch[p.file] ?? 1;
@@ -404,14 +405,19 @@ export async function assembleTimeline(
     });
     graph += pieces.map((_, i) => `[v${i}]`).join("") + `concat=n=${pieces.length}:v=1:a=0[v]`;
     const total = pieces.reduce((t, p) => t + p.end - p.start, 0);
+    // Exact output length: every planned frame plus held frames. Audio is padded so it can
+    // never end early and cut the last video frame.
+    const outFrames = pieces.reduce((n, p) => n + Math.round((p.end - p.start) * evalFps(fps)) + (p.hold ?? 0) + (p.holdStart ?? 0), 0);
     const code = await execTimed(
       ff,
       [
         ...args,
         "-filter_complex", graph,
         "-map", "[v]",
-        ...(audio ? ["-map", `${pieces.length}:a:0?`, "-c:a", "aac", "-b:a", "192k", "-shortest"] : []),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-frames:v", String(outFrames),
+        ...(audio ? ["-map", `${pieces.length}:a:0?`, "-af", "apad", "-c:a", "aac", "-b:a", "320k", "-t", (outFrames / evalFps(fps)).toFixed(6)] : []),
+        // Export quality: near-transparent H.264.
+        "-c:v", "libx264", "-preset", "fast", "-crf", "14", "-profile:v", "high",
         "-movflags", "+faststart", "-y", out,
       ],
       total,

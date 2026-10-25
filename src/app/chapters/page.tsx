@@ -55,6 +55,7 @@ import {
   type Step,
   type StoredFile,
   type ScenePrompt,
+  type ExportReport,
   type Wardrobe,
   defaultTicks,
   refKey,
@@ -1554,7 +1555,7 @@ export default function Chapters() {
       ];
       const drift = stretch.slice(1).map((k, i) => Math.abs(k - 1) * done[i].clipLength * p.fps);
       const files: Blob[] = [p.prepared.blob, ...results];
-      type Rep = { start: number; end: number; file: number; offset: number; head: number; tail: number };
+      type Rep = { start: number; end: number; file: number; offset: number; head: number; tail: number; reviewed: boolean };
       let reps: Rep[] = [];
       done.forEach((d, i) =>
         d.pieces.forEach((pc, j) => {
@@ -1570,16 +1571,21 @@ export default function Chapters() {
             if (pc.end < r.end) out.push({ ...r, start: pc.end, offset: r.offset + (pc.end - r.start), head: 0 });
             return out;
           });
-          reps.push({ start: pc.start, end: pc.end, file: i + 1, offset: at, ...edgeJunk(d, j, p.fps) });
+          reps.push({ start: pc.start, end: pc.end, file: i + 1, offset: at, ...edgeJunk(d, j, p.fps), reviewed: !!d.reviewed?.includes(j) });
         }),
       );
       reps.sort((a, b) => a.start - b.start);
       const pieces: { file: number; start: number; end: number; hold?: number; holdStart?: number }[] = [];
       let t = span.start;
+      const fr = (x: number) => Math.round(x * p.fps);
+      let approved = 0;
+      let unreviewed = 0;
       for (const r of reps) {
         if (r.end <= span.start || r.start >= span.end) continue;
         const a = Math.max(r.start, span.start);
         const b = Math.min(r.end, span.end);
+        if (r.reviewed) approved += fr(b) - fr(a);
+        else unreviewed += fr(b) - fr(a);
         if (a - t > 0.5 / p.fps) pieces.push({ file: 0, start: t, end: a });
         // Junk frames at the render's cuts: skip them and hold the nearest good frame.
         const head = a === r.start ? Math.min(r.head, Math.round((b - a) * p.fps) - 1) : 0;
@@ -1597,6 +1603,7 @@ export default function Chapters() {
       // Close 1-2 frame holes between renders (left by trimming a glitch frame) by
       // holding the neighbouring rendered frame instead of flashing the original.
       let filled = 0;
+      let gapFrames = 0;
       if (fillGaps) {
         for (let i = 0; i < pieces.length; i++) {
           const pc = pieces[i] as { file: number; start: number; end: number; hold?: number; holdStart?: number };
@@ -1604,6 +1611,7 @@ export default function Chapters() {
           if (pc.file !== 0 || n < 1 || n > 2) continue;
           const prev = pieces[i - 1] as typeof pc | undefined;
           const next = pieces[i + 1] as typeof pc | undefined;
+          gapFrames += n;
           if (prev && prev.file !== 0) prev.hold = (prev.hold ?? 0) + n;
           else if (next && next.file !== 0) next.holdStart = (next.holdStart ?? 0) + n;
           else continue;
@@ -1612,15 +1620,8 @@ export default function Chapters() {
           filled++;
         }
       }
-      const size = await new Promise<{ w: number; h: number }>((res) => {
-        if (!done[0]) return res({ w: Math.round((p.width / p.height) * Math.min(720, p.height)), h: Math.min(720, p.height) });
-        const v = document.createElement("video");
-        v.crossOrigin = "anonymous";
-        v.preload = "metadata";
-        v.onloadedmetadata = () => res({ w: v.videoWidth, h: v.videoHeight });
-        v.onerror = () => res({ w: 1280, h: 720 });
-        v.src = done[0].resultUrl!;
-      });
+      // Export at the source's own resolution: nothing is downscaled, renders are upscaled to it.
+      const size = { w: p.width - (p.width % 2), h: p.height - (p.height % 2) };
       setTask("assemble", { label: "Assembling on the original timeline", pct: 0 });
       const off = p.preparedOffset ?? 0;
       const shifted = pieces.map((x) => (x.file === 0 ? { ...x, start: Math.max(0, x.start + off), end: x.end + off } : x));
@@ -1634,7 +1635,39 @@ export default function Chapters() {
         fpsExpr(p.fps),
         stretch,
       );
-      update((x) => ({ ...x, output: { blob: out, name: `${x.name}-${fmt(span.start)}-${fmt(span.end)}.mp4`.replace(/:/g, "."), type: "video/mp4" } }));
+      // Frame accounting against the original span, and a count of what was actually written.
+      const outFrames = await new Promise<number>((res) => {
+        const v = document.createElement("video");
+        const u = URL.createObjectURL(out);
+        v.preload = "metadata";
+        v.onloadedmetadata = () => {
+          res(Math.round(v.duration * p.fps));
+          URL.revokeObjectURL(u);
+        };
+        v.onerror = () => res(-1);
+        v.src = u;
+      });
+      const him = merge(clipTo(p.shots.map((x) => ({ start: x.start, end: x.end })), span));
+      const himFrames = him.reduce((n, x) => n + fr(x.end) - fr(x.start), 0);
+      // Held = tiny gaps filled + junk frames at render edges replaced by their neighbour.
+      const held = pieces.reduce((n, x) => n + ((x as { hold?: number }).hold ?? 0) + ((x as { holdStart?: number }).holdStart ?? 0), 0);
+      const report: ExportReport = {
+        span,
+        fps: p.fps,
+        size,
+        expected: fr(span.end) - fr(span.start),
+        out: outFrames,
+        approved,
+        unreviewed,
+        held,
+        himOriginal: Math.max(0, himFrames - approved - unreviewed - gapFrames),
+        others: Math.max(0, fr(span.end) - fr(span.start) - himFrames),
+      };
+      update((x) => ({
+        ...x,
+        output: { blob: out, name: `${x.name}-${fmt(span.start)}-${fmt(span.end)}.mp4`.replace(/:/g, "."), type: "video/mp4" },
+        outputReport: report,
+      }));
       const worst = Math.max(0, ...drift);
       flash(
         [
@@ -3483,6 +3516,7 @@ function RendersPanel({
           {compositeBusy ? "Building composite…" : `Composite so far · ${fmt(range.start)}–${fmt(range.end)}`}
         </button>
       </div>
+      {p.output && p.outputReport && <ExportReportCard r={p.outputReport} />}
       {open && (
         done.length === 0 ? (
           <p className="text-faint text-[12px]">No renders yet.</p>
@@ -4329,6 +4363,50 @@ function PartRow({
 // ============================================================================
 // Step 5: Assemble
 
+// Frame-by-frame accounting of an export against the original span.
+function ExportReportCard({ r }: { r: ExportReport }) {
+  const ok = r.out === r.expected;
+  const rows: { label: string; n: number; color: string }[] = [
+    { label: "Him · rendered, validated", n: r.approved, color: "#86efac" },
+    { label: "Him · rendered, not reviewed", n: r.unreviewed, color: "#fcd34d" },
+    { label: "Him · left original", n: r.himOriginal, color: "#fca5a5" },
+    { label: "Without him · original", n: r.others, color: "rgba(255,255,255,0.25)" },
+  ];
+  const sum = rows.reduce((n, x) => n + x.n, 0) || 1;
+  return (
+    <div className="glass rounded-2xl p-4 space-y-3 text-[12px]">
+      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+        <span className="text-[13px]">Frame check</span>
+        <span className="text-muted tabular-nums">
+          {fmt(r.span.start)} – {fmt(r.span.end)} · {r.size.w}×{r.size.h} · {r.fps.toFixed(3)} fps
+        </span>
+      </div>
+      <p className={`tabular-nums ${ok ? "text-[#86efac]" : "text-[#fcd34d]"}`}>
+        Original span {r.expected} frames · exported {r.out < 0 ? "?" : r.out} frames {ok ? "✓ same count" : `· off by ${r.out - r.expected}`}
+      </p>
+      <div className="flex h-2 rounded-full overflow-hidden bg-white/5">
+        {rows.map((x) => (
+          <div key={x.label} style={{ width: `${(x.n / sum) * 100}%`, background: x.color }} />
+        ))}
+      </div>
+      <div className="grid sm:grid-cols-2 gap-x-6 gap-y-1 tabular-nums">
+        {rows.map((x) => (
+          <div key={x.label} className="flex items-center gap-2">
+            <span className="w-2 h-2 rounded-sm" style={{ background: x.color }} />
+            <span className="flex-1 text-muted">{x.label}</span>
+            <span>{x.n} f</span>
+          </div>
+        ))}
+        <div className="flex items-center gap-2">
+          <span className="w-2 h-2" />
+          <span className="flex-1 text-muted">Held over (tiny gaps, glitch frames)</span>
+          <span>{r.held} f</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AssembleStep(props: {
   p: Project;
   present: { start: number; end: number }[];
@@ -4351,6 +4429,7 @@ function AssembleStep(props: {
     <div className="max-w-5xl mx-auto p-6 space-y-6">
       <div className="grid md:grid-cols-[minmax(0,1fr)_320px] gap-6">
         <div className="space-y-4">
+          {props.outUrl && p.outputReport && <ExportReportCard r={p.outputReport} />}
           {props.outUrl ? (
             <video src={props.outUrl} controls playsInline className="w-full rounded-2xl ring-1 ring-hair bg-black" />
           ) : (
@@ -4422,7 +4501,7 @@ function AssembleStep(props: {
               <input type="checkbox" checked={props.fillGaps} onChange={(e) => props.setFillGaps(e.target.checked)} className="accent-white" />
               Fill 1–2 frame gaps between renders
             </label>
-            <p className="text-faint text-[11px]">Original audio throughout. Output at the render resolution.</p>
+            <p className="text-faint text-[11px]">Original audio throughout. Exported at the source's own resolution in high quality; renders are upscaled to it.</p>
           </div>
 
           <button className="btn-primary" disabled={props.busy} onClick={props.onAssemble}>
