@@ -145,6 +145,17 @@ export async function waitForSume(job: PendingJob, onStatus: (s: string) => void
   return url as string;
 }
 
-export function waitFor(job: PendingJob, onStatus: (s: string) => void) {
-  return job.provider === "fal" ? waitForFal(job, onStatus) : waitForSume(job, onStatus);
+export class Cancelled extends Error {
+  constructor() {
+    super("Cancelled");
+  }
+}
+
+export function waitFor(job: PendingJob, onStatus: (s: string) => void, stop?: () => boolean) {
+  // A cancelled part stops polling at the next status update.
+  const status = (s: string) => {
+    if (stop?.()) throw new Cancelled();
+    onStatus(s);
+  };
+  return job.provider === "fal" ? waitForFal(job, status) : waitForSume(job, status);
 }

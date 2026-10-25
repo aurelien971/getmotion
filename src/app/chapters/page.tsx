@@ -12,7 +12,7 @@ import { FrameStrip } from "@/components/FrameStrip";
 import { RangePicker } from "@/components/RangePicker";
 import { ReelPlayer } from "@/components/ReelPlayer";
 import { SpotTrack } from "@/components/SpotTrack";
-import { submitFal, submitSume, waitFor, removeJob, transientError, type PendingJob } from "@/lib/jobs";
+import { submitFal, submitSume, waitFor, removeJob, transientError, Cancelled, type PendingJob } from "@/lib/jobs";
 import { MODELS } from "@/lib/models";
 import {
   buildParts,
@@ -1109,7 +1109,7 @@ export default function Chapters() {
   // The exact clip a part sends, built locally (cached until its pieces change).
   const clipCache = useRef(new Map<string, File>());
   async function buildPartClip(part: Part): Promise<File> {
-    const key = partKey(part) + `#${part.pad.map((x) => `${x.start.toFixed(3)}${x.reverse ? "r" : ""}`).join(",")}`;
+    const key = partKey(part) + `#${part.pad.map((x) => `${x.start.toFixed(3)}${x.reverse ? "r" : ""}`).join(",")}#mute`;
     const hit = clipCache.current.get(key);
     if (hit) return hit;
     const h = Math.min(720, p.height);
@@ -1135,7 +1135,7 @@ export default function Chapters() {
       p.prepared!.blob,
       copySpans.map((x, i) => ({ ...x, frames: planned[i], reverse: (spans[i] as { reverse?: boolean }).reverse })),
       { w, h },
-      p.hasAudio,
+      false, // no audio: the model follows the picture, and the export uses the original's audio
       (r) => patchPart(part.id, { progress: r }),
       fpsExpr(p.fps),
     );
@@ -1253,7 +1253,21 @@ export default function Chapters() {
     partsRef.current = p.parts;
   }, [p.parts]);
 
-  async function startPart(part: Part): Promise<PendingJob | null> {
+  // Parts the user cancelled: every step checks this and stops, retries included.
+  const cancelled = useRef(new Set<string>());
+  const isCancelled = (id: string) => cancelled.current.has(id);
+  function cancelPart(part: Part) {
+    cancelled.current.add(part.id);
+    // Tell fal too: a queued request is dropped for free; one already rendering may still finish and bill.
+    if (part.requestId && part.endpoint && part.status === "rendering") {
+      void fal.queue.cancel(part.endpoint, { requestId: part.requestId }).catch(() => {});
+      removeJob(part.requestId);
+    }
+    patchPart(part.id, { status: "idle", progress: undefined, live: undefined, error: "Cancelled" });
+  }
+
+  async function startPart(part: Part, fresh = true): Promise<PendingJob | null> {
+    if (fresh) cancelled.current.delete(part.id);
     const look = p.groups.find((x) => x.id === part.groupId)!;
     // Only the swapped people who are in this part get a photo and a line in the prompt.
     const g = groupForPart(look, part);
@@ -1275,6 +1289,7 @@ export default function Chapters() {
     try {
       if (part.checkedKey !== partKey(part)) {
         const issues = await checkPart(part);
+        if (isCancelled(part.id)) return null;
         if (issues.length) {
           patchPart(part.id, { error: `${issues.length} stray-frame spot${issues.length === 1 ? "" : "s"} in this clip. Fix before rendering.` });
           return null;
@@ -1282,8 +1297,10 @@ export default function Chapters() {
       }
       patchPart(part.id, { status: "building", progress: 0, error: undefined });
       const clip = await buildPartClip(part);
+      if (isCancelled(part.id)) return null;
       patchPart(part.id, { status: "uploading", progress: undefined });
       const videoUrl = await netRetry("Uploading the clip", () => fal.storage.upload(clip));
+      if (isCancelled(part.id)) return null;
       const extra = otherRefsOf(p, g);
       if (photos.length + extra.length > 4) {
         throw new Error(`H3 takes at most 4 photos; this look uses ${photos.length} for him and ${extra.length} for others.`);
@@ -1316,6 +1333,11 @@ export default function Chapters() {
               // Never resubmit blindly here: the job may have reached fal. Check its Requests page.
               throw e instanceof TypeError ? new Error("Submitting: connection lost. Check fal's Requests page before rendering again.") : e;
             });
+      if (isCancelled(part.id)) {
+        if (job.provider === "fal") void fal.queue.cancel(job.endpoint, { requestId: job.requestId }).catch(() => {});
+        removeJob(job.requestId);
+        return null;
+      }
       patchPart(part.id, {
         status: "rendering",
         error: undefined,
@@ -1334,24 +1356,31 @@ export default function Chapters() {
 
   async function waitPart(partId: string, job: PendingJob, resubmits = 0) {
     try {
-      const url = await waitFor(job, (st) => patchPart(partId, { error: undefined, live: st }));
+      const url = await waitFor(job, (st) => patchPart(partId, { error: undefined, live: st }), () => isCancelled(partId));
       removeJob(job.requestId);
       patchPart(partId, { status: "done", resultUrl: url, renderedAt: Date.now(), calibrated: false, measuredOffsets: undefined, live: undefined });
     } catch (e) {
       removeJob(job.requestId);
+      if (e instanceof Cancelled || isCancelled(partId)) return;
       // The provider dropped it mid-render (not charged): submit again, up to 3 times.
       const part = partsRef.current.find((x) => x.id === partId);
       if (transientError(e) && resubmits < 3 && part) {
-        patchPart(partId, { error: `Provider dropped the render, resubmitting (${resubmits + 1}/3)…` });
+        patchPart(partId, { error: `Provider dropped the render, resubmitting (${resubmits + 1}/3)… Cancel stops it.` });
         await new Promise((r) => setTimeout(r, 5000 * (resubmits + 1)));
-        const next = await startPart(part);
+        if (isCancelled(partId)) return;
+        const next = await startPart(part, false);
         if (next) return waitPart(partId, next, resubmits + 1);
         // startPart stopped before submitting; never leave the part spinning.
         const cur = partsRef.current.find((x) => x.id === partId);
         if (cur?.status === "rendering") patchPart(partId, { status: "failed", error: cur.error ?? describe(e) });
         return;
       }
-      patchPart(partId, { status: "failed", error: describe(e) });
+      patchPart(partId, {
+        status: "failed",
+        error: transientError(e)
+          ? `${describe(e)} · MiniMax (behind fal) gave up on this clip ${resubmits + 1} time${resubmits ? "s" : ""} in a row · not charged · fal request ${job.requestId.slice(0, 8)}`
+          : describe(e),
+      });
     }
   }
 
@@ -1919,6 +1948,7 @@ export default function Chapters() {
             onUseTake={chooseTake}
             onDeleteTake={deleteTake}
             onDeletePart={deletePart}
+            onCancel={cancelPart}
             onValidate={validateParts}
             onRestorePart={restorePart}
             onRestoreTakes={restoreTakes}
@@ -2863,6 +2893,7 @@ function RenderStep(props: {
   onUseTake: (shot: { start: number; end: number }, partId: string, j: number) => void;
   onDeleteTake: (shot: { start: number; end: number }, partId: string, j: number) => void;
   onDeletePart: (partId: string) => void;
+  onCancel: (part: Part) => void;
   onRestorePart: (partId: string) => void;
   onRestoreTakes: (partId: string) => void;
   onAttach: (partId: string) => void;
@@ -3350,6 +3381,7 @@ function RenderStep(props: {
                   onAttach={() => props.onAttach(pt.id)}
                   onSkip={() => props.onAccept(g.id, pt.pieces.map(({ start, end }) => ({ start, end })))}
                   onValidate={() => props.onValidate([pt])}
+                  onCancel={() => props.onCancel(pt)}
                   shotThumbs={pt.pieces.map((pc) => ({ start: pc.start, end: pc.end, thumb: p.shots.find((sh) => sh.id === pc.shotId)?.thumb }))}
                   people={(() => {
                     const on = partPeople(g, pt);
@@ -4070,7 +4102,9 @@ function PartRow({
   onTogglePerson,
   onSkip,
   onValidate,
+  onCancel,
 }: {
+  onCancel: () => void;
   onSkip: () => void;
   onValidate: () => void;
   people: { index: number; label: string; thumb?: string; on: boolean }[];
@@ -4145,6 +4179,11 @@ function PartRow({
         <video src={part.resultUrl} muted playsInline className="h-12 rounded-md ring-1 ring-hair bg-black" />
       )}
       <span className="text-faint text-[12px] tabular-nums">~${cost.toFixed(2)}</span>
+      {busy && (
+        <button className="btn" onClick={onCancel} title="Stop this part: no more building, uploading, waiting or retries">
+          Cancel
+        </button>
+      )}
       {!busy && (
         <button
           className="btn btn-icon text-muted hover:text-[#fca5a5]"
