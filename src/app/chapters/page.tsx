@@ -60,7 +60,7 @@ import {
   wardrobePrompt,
 } from "@/lib/project";
 import { kv } from "@/lib/store";
-import { alignSpans, lineUpRender, measureOffset, openReader, refineEdge } from "@/lib/sync";
+import { alignSpans, lineUpRender, measureOffset, openReader, refineEdge, verifyIssues } from "@/lib/sync";
 import { assembleTimeline, buildClip, detectCuts, fileHasAudio, fpsExpr, probeVideo, warmUp } from "@/lib/trim";
 import { transcodeInBrowser } from "@/lib/transcode";
 
@@ -247,7 +247,7 @@ export default function Chapters() {
 
   useEffect(() => {
     if (process.env.NODE_ENV === "development") {
-      (window as unknown as { __engine: unknown }).__engine = { buildClip, assembleTimeline, detectCuts, measureOffset, fpsExpr, measureOffsets, findIssues, alignSpans, lineUpRender };
+      (window as unknown as { __engine: unknown }).__engine = { buildClip, assembleTimeline, detectCuts, measureOffset, fpsExpr, measureOffsets, findIssues, alignSpans, lineUpRender, verifyIssues };
     }
   }, []);
 
@@ -1108,10 +1108,12 @@ export default function Chapters() {
     try {
       const clip = await buildPartClip(part);
       const cuts = await detectCuts(clip, part.clipLength, undefined, 0.25);
-      const issues = findIssues(part, cuts, p.fps).filter(
+      const found = findIssues(part, cuts, p.fps);
+      // Confirm each on the original: flares and fades are not cuts, and counts come from the true cut.
+      const issues = (srcUrl ? await verifyIssues(srcUrl, p.fps, part.pieces, found) : found).filter(
         (is) => !(part.ignored ?? []).some((t) => Math.abs(t - is.at) <= 1.5 / p.fps),
       );
-      patchPart(part.id, { status: "idle", progress: undefined, issues, checkedKey: issues.length ? undefined : partKey(part) });
+      patchPart(part.id, { status: "idle", progress: undefined, issues, issuesVerified: !!srcUrl, checkedKey: issues.length ? undefined : partKey(part) });
       return issues;
     } catch (e) {
       patchPart(part.id, { status: "idle", progress: undefined, error: describe(e) });
@@ -1370,6 +1372,26 @@ export default function Chapters() {
     queueMicrotask(() => void analyzeWardrobe(next));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loaded, p.step, p.groups, p.library, p.defaultRefs, p.range, tasks]);
+
+  // Issues found before the brightness-proof check get re-checked once on the original.
+  const verifying = useRef(false);
+  useEffect(() => {
+    if (!loaded || !srcUrl || verifying.current) return;
+    const next = p.parts.find((x) => x.issues?.length && !x.issuesVerified && x.status !== "done");
+    if (!next) return;
+    verifying.current = true;
+    (async () => {
+      try {
+        const issues = await verifyIssues(srcUrl, p.fps, next.pieces, next.issues!);
+        patchPart(next.id, { issues, issuesVerified: true, ...(issues.length ? {} : { checkedKey: partKey(next), error: undefined }) });
+      } catch {
+        patchPart(next.id, { issuesVerified: true });
+      } finally {
+        verifying.current = false;
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded, p.parts, srcUrl]);
 
   // Every finished render gets its piece positions measured once from its own cuts.
   const calibrating = useRef(false);

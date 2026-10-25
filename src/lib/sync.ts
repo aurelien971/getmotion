@@ -236,3 +236,81 @@ export async function lineUpRender(
     b.close();
   }
 }
+
+// Brightness-proof similarity of two luma frames (zero-mean normalized correlation):
+// ~1 for the same scene even through a lens flare or a fade, ~0 across a hard cut.
+export function similarity(a: Uint8ClampedArray, b: Uint8ClampedArray): number {
+  const n = a.length;
+  let ma = 0;
+  let mb = 0;
+  for (let i = 0; i < n; i++) {
+    ma += a[i];
+    mb += b[i];
+  }
+  ma /= n;
+  mb /= n;
+  let sab = 0;
+  let saa = 0;
+  let sbb = 0;
+  for (let i = 0; i < n; i++) {
+    const x = a[i] - ma;
+    const y = b[i] - mb;
+    sab += x * y;
+    saa += x * x;
+    sbb += y * y;
+  }
+  // A washed-out (near flat) frame can't be compared: call it the same scene.
+  if (saa / n < 64 || sbb / n < 64) return 1;
+  return sab / Math.sqrt(saa * sbb);
+}
+
+export const CUT_BELOW = 0.4; // measured: hard cuts ~0.0-0.1, flares/fades/fast motion >= 0.7
+
+// The hard cut within ±radius frames of frame f: the first frame of the new shot, or null.
+export async function findCut(r: Reader, f: number, radius = 4): Promise<number | null> {
+  let best: number | null = null;
+  let bestS = CUT_BELOW;
+  for (let k = Math.max(1, f - radius); k <= f + radius; k++) {
+    const s = similarity(await r.frame(k - 1), await r.frame(k));
+    if (s < bestS) {
+      bestS = s;
+      best = k;
+    }
+  }
+  return best;
+}
+
+// Check reported stray-frame spots against the original: drop the ones with no real
+// cut (lens flares, fades, fast motion) and re-count the rest from the true cut.
+export async function verifyIssues<I extends { shotId: string; at: number; kind: "start" | "end" | "mid"; frames: number }>(
+  original: string,
+  fps: number,
+  pieces: { shotId: string; start: number; end: number }[],
+  issues: I[],
+): Promise<I[]> {
+  if (!issues.length) return issues;
+  const r = await openReader(original, fps);
+  try {
+    const out: I[] = [];
+    for (const is of issues) {
+      const cut = await findCut(r, Math.round(is.at * fps));
+      if (cut === null) continue;
+      const pc = pieces.find((x) => x.shotId === is.shotId && cut / fps > x.start - 5 / fps && cut / fps < x.end + 5 / fps);
+      if (!pc) continue;
+      const toStart = cut - Math.round(pc.start * fps);
+      const toEnd = Math.round(pc.end * fps) - cut;
+      if (toStart <= 0 || toEnd <= 0) continue; // the cut is on the piece's edge: nothing foreign inside
+      out.push(
+        toStart <= 4
+          ? { ...is, at: cut / fps, kind: "start", frames: toStart }
+          : toEnd <= 4
+            ? { ...is, at: cut / fps, kind: "end", frames: toEnd }
+            : { ...is, at: cut / fps, kind: "mid", frames: 0 },
+      );
+    }
+    // Two reports of the same cut become one.
+    return out.filter((x, i) => out.findIndex((y) => Math.abs(y.at - x.at) < 0.5 / fps) === i);
+  } finally {
+    r.close();
+  }
+}
