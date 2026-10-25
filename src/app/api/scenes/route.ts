@@ -39,6 +39,9 @@ Work in this order:
 
 The prompt must:
 - Open with one sentence naming the single person to replace and how to recognise him.
+- If the original shows bare arms (t-shirt, tank top) and the new outfit has sleeves (suit, jacket,
+  dress shirt), say explicitly that the sleeves cover his arms down to the wrists in every frame,
+  with no bare arms or short sleeves. Models keep the original's bare arms otherwise.
 - Say who he becomes, following the RULES exactly (what comes from the reference photos, what stays
   from the original, what is removed). Never contradict the RULES.
 - Walk through the scenes in order with their time ranges, e.g. "0.0-1.2s, close-up: he fills the

@@ -113,6 +113,9 @@ export function wardrobePrompt(description: string, w: Wardrobe | undefined, ref
   lines.push(
     `Replace him with ${who}: ${list(["his face, identity", ...hair])}${outfit.length ? `, wearing a ${list(outfit)}` : ""}.`,
   );
+  // Models keep the original's bare arms unless told the new sleeves cover them.
+  if (outfit.some((x) => /suit|jacket|blazer|coat|long[- ]sleeve|dress shirt/.test(x)))
+    lines.push("His arms are covered by the long jacket and shirt sleeves down to the wrists in every frame; no bare arms, no short sleeves.");
   if (keep.length) lines.push(`Keep ${list(keep)} exactly as in the original${outfit.length ? ", over the new outfit" : ""}.`);
   if (drop.length)
     lines.push(

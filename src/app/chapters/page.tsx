@@ -25,6 +25,8 @@ import {
   findIssues,
   partKey,
   keptRange,
+  merge,
+  subtract,
   pingPong,
   MIN_CLIP,
   edgeJunk,
@@ -2848,6 +2850,14 @@ function RenderStep(props: {
   const renderedAll = covered(p);
   const renderedIn = total(clipTo(renderedAll, range));
   const acceptedPct = himInRange ? Math.min(100, Math.round((renderedIn / himInRange) * 100)) : 0;
+  // Everything of him in the span that no render covers, sorted into real gaps and 1-2 frame slivers.
+  const gaps = subtract(
+    merge(clipTo(p.shots.map((x) => ({ start: x.start, end: x.end })), range)),
+    merge([...renderedAll, ...p.groups.flatMap((g) => g.accepted ?? [])]),
+  ).filter((x) => x.end - x.start > 0.5 / p.fps);
+  const slivers = gaps.filter((x) => x.end - x.start <= 2.5 / p.fps);
+  const holes = gaps.filter((x) => x.end - x.start > 2.5 / p.fps);
+  const sliverFrames = slivers.reduce((n, x) => n + Math.round((x.end - x.start) * p.fps), 0);
   const issueCount = toRender.reduce((n, x) => n + (x.issues?.length ?? 0), 0);
   const activeGroups = p.groups.filter((g) => partsInRange(p, g.id).length > 0);
   const idleGroups = p.groups.filter((g) => !activeGroups.includes(g));
@@ -2932,6 +2942,32 @@ function RenderStep(props: {
           <Stat label="him in span" value={fmtShort(himInRange)} />
           <Stat label={`kept · ${acceptedPct}% of him`} value={fmtShort(renderedIn)} />
           <Stat label={`to render · ${toRender.length} parts`} value={`$${est.toFixed(2)}`} />
+        </div>
+        <div className="text-[12px] space-y-1">
+          {holes.length === 0 && slivers.length === 0 ? (
+            <p className="text-[#86efac]">Every frame of him in this span is covered by a render.</p>
+          ) : (
+            <>
+              {holes.length > 0 && (
+                <p className="text-muted">
+                  <span className="text-ink">Not rendered: {holes.length} gap{holes.length === 1 ? "" : "s"} · {fmtShort(total(holes))}</span>
+                  {" · "}
+                  {holes.slice(0, 12).map((x, i) => (
+                    <span key={i} className="tabular-nums">
+                      {i ? ", " : ""}
+                      {fmt(x.start)} ({Math.round((x.end - x.start) * p.fps)}f)
+                    </span>
+                  ))}
+                  {holes.length > 12 ? "…" : ""}
+                </p>
+              )}
+              {slivers.length > 0 && (
+                <p className="text-faint">
+                  {slivers.length} sliver{slivers.length === 1 ? "" : "s"} of 1–2 frames ({sliverFrames} frames total) between renders: held over with the next rendered frame at assembly, nothing to render.
+                </p>
+              )}
+            </>
+          )}
         </div>
         <div className="flex items-center gap-3 flex-wrap">
           <div className="flex-1 min-w-48 h-1.5 rounded-full bg-white/10 overflow-hidden flex">
@@ -3255,6 +3291,7 @@ function RenderStep(props: {
                   onWritePrompt={() => props.onWritePrompt(pt)}
                   onDelete={() => props.onDeletePart(pt.id)}
                   onAttach={() => props.onAttach(pt.id)}
+                  onSkip={() => props.onAccept(g.id, pt.pieces.map(({ start, end }) => ({ start, end })))}
                   shotThumbs={pt.pieces.map((pc) => ({ start: pc.start, end: pc.end, thumb: p.shots.find((sh) => sh.id === pc.shotId)?.thumb }))}
                   people={(() => {
                     const on = partPeople(g, pt);
@@ -3972,7 +4009,9 @@ function PartRow({
   shotThumbs,
   people,
   onTogglePerson,
+  onSkip,
 }: {
+  onSkip: () => void;
   people: { index: number; label: string; thumb?: string; on: boolean }[];
   onTogglePerson: (index: number) => void;
   shotThumbs: { start: number; end: number; thumb?: string }[];
@@ -4063,6 +4102,11 @@ function PartRow({
       >
         {writing ? "Studying scenes…" : scenePrompt ? `Prompt ✓${scenePrompt.warnings.length ? ` · ${scenePrompt.warnings.length} ⚠` : ""}` : "Write prompt"}
       </button>
+      {(part.status === "idle" || part.status === "failed") && (
+        <button className="btn" onClick={onSkip} title="Don't render this: count it as done and keep the original footage here">
+          Keep original
+        </button>
+      )}
       {(part.status === "idle" || part.status === "failed") && (
         <button className="btn" onClick={onAttach} title="Already rendered this on fal? Paste its video URL to put it back, no new render">
           Attach render
