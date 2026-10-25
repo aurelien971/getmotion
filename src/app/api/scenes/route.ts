@@ -7,7 +7,8 @@ type Scene = { from: number; to: number; frames: string[] };
 type Body = {
   scenes: Scene[];
   faces: Img[];
-  others?: Img[]; // reference photos for other people being swapped, numbered after `faces`
+  others?: { index: number; label: string; wardrobe: string; dataUrl: string }[]; // people who may also be swapped
+  othersFixed?: boolean; // true: swap exactly these; false: swap only the ones visible in this clip
   look: string;
   rules: string; // wardrobe / swap decisions the user made, must be respected
   basePrompt: string; // the deterministic prompt built from those decisions
@@ -56,12 +57,20 @@ The prompt must:
 - Be plain, literal, present tense. No markdown, no hype words, no quality adjectives
   ("cinematic", "8k", "masterpiece"). Hard limit: 1,800 characters (the model rejects more than 2,000).
 
+OTHER PEOPLE: if any are listed, decide from the frames which of them are actually visible in
+this clip (unless told to swap all). Only those go in the prompt. Their photos are sent to the video
+model after the reference photos of the lead, in the order they are listed, counting only the ones
+you include: with N reference photos of the lead, the first included person is reference image N+1, the
+next N+2. Describe each by position and clothing so the model finds them, and say what they take
+from their photo and what they keep. Anyone visible but not swapped is a decoy: leave unchanged.
+
 Respond with JSON only:
 {
   "prompt": "<the prompt>",
   "target": "<one line: how to recognise him>",
   "scenes": [{"time": "0.0-1.2s", "shot": "close-up", "where": "left, foreground", "action": "...", "visibility": "clear|small|blurred|hidden|absent", "decoys": "..."}],
-  "warnings": ["<scenes where he is absent or ambiguous, decoys likely to be swapped instead, anything that may make the render fail>"]
+  "warnings": ["<scenes where he is absent or ambiguous, decoys likely to be swapped instead, anything that may make the render fail>"],
+  "present": [<Person # numbers you swapped in the prompt, e.g. 0, 2>]
 }`;
 
 function toImage(dataUrl: string): Anthropic.ImageBlockParam {
@@ -81,10 +90,18 @@ export async function POST(req: Request) {
     content.push({ type: "text", text: `Reference image ${i + 1}` });
     content.push(toImage(f.dataUrl));
   });
-  (b.others ?? []).forEach((f, i) => {
-    content.push({ type: "text", text: `Reference image ${b.faces.length + i + 1} (${f.name})` });
-    content.push(toImage(f.dataUrl));
-  });
+  if (b.others?.length) {
+    content.push({
+      type: "text",
+      text: b.othersFixed
+        ? "OTHER PEOPLE TO SWAP in this clip (all of them):"
+        : "OTHER PEOPLE WHO MAY ALSO BE SWAPPED. Swap a person only if they are visible in this clip:",
+    });
+    b.others.forEach((o) => {
+      content.push({ type: "text", text: `Person #${o.index}: ${o.label}. Their new photo below; ${o.wardrobe}.` });
+      content.push(toImage(o.dataUrl));
+    });
+  }
   content.push({ type: "text", text: `THE CLIP, ${b.clipLength.toFixed(1)}s, ${b.scenes.length} scenes in playback order:` });
   b.scenes.forEach((s, i) => {
     content.push({ type: "text", text: `Scene ${i + 1}: ${s.from.toFixed(1)}-${s.to.toFixed(1)}s (${(s.to - s.from).toFixed(1)}s)` });

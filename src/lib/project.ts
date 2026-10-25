@@ -21,6 +21,7 @@ export type ScenePrompt = {
   target: string;
   scenes: { time: string; shot: string; where: string; action: string; visibility: string; decoys?: string }[];
   warnings: string[];
+  present?: number[]; // swapped people (index into wardrobe.others) Claude saw in this clip and wrote into the prompt
   at: number;
   edited?: boolean;
 };
@@ -28,6 +29,7 @@ export type ScenePrompt = {
 export type Group = {
   partPrompts?: Record<string, ScenePrompt>; // by partKey
   accepted?: Interval[]; // leftover footage the user validated as fine without a render
+  partPeople?: Record<string, number[]>; // by partKey: which swapped people (index into wardrobe.others) this render includes
   id: string;
   name: string;
   description: string;
@@ -650,6 +652,24 @@ export function renderOutdated(p: Project, part: Part): boolean {
 }
 
 // Photos for the other people this look replaces, in prompt order (after the target's).
+// Swapped people this part's render includes: your pick, else who Claude saw in the clip, else all.
+export function partPeople(g: Group, part: Part): number[] {
+  const key = partKey(part);
+  const swapped = (g.wardrobe?.others ?? []).flatMap((o, i) => (o.faceId ? [i] : []));
+  const pick = g.partPeople?.[key] ?? g.partPrompts?.[key]?.present;
+  return pick ? pick.filter((i) => swapped.includes(i)) : swapped;
+}
+
+// The look as this part sees it: swapped people who aren't in it stay unchanged.
+export function groupForPart(g: Group, part: Part): Group {
+  if (!g.wardrobe?.others?.length) return g;
+  const keep = partPeople(g, part);
+  return {
+    ...g,
+    wardrobe: { ...g.wardrobe, others: g.wardrobe.others.map((o, i) => (o.faceId && !keep.includes(i) ? { ...o, faceId: undefined } : o)) },
+  };
+}
+
 export function otherRefsOf(p: Project, g: Group): StoredFile[] {
   return (g.wardrobe?.others ?? [])
     .filter((o) => o.faceId)

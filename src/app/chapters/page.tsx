@@ -58,6 +58,8 @@ import {
   refKey,
   refsOf,
   otherRefsOf,
+  partPeople,
+  groupForPart,
   wardrobeClashes,
   wardrobePrompt,
 } from "@/lib/project";
@@ -821,15 +823,35 @@ export default function Chapters() {
       }
       const jpeg = async (r: StoredFile) => ({ name: r.name, dataUrl: await blobToDataUrl((await toJpeg(r.blob, r.name, 1280)).blob) });
       const faces = await Promise.all(refsOf(p, g).map(jpeg));
-      const others = await Promise.all(otherRefsOf(p, g).map(jpeg));
+      // Swap candidates: the people you picked for this part, or every swapped person
+      // of the look and Claude decides who is actually in the shot.
       const w = g.wardrobe;
+      const fixed = !!g.partPeople?.[key];
+      const candIdx = fixed ? g.partPeople![key] : (w?.others ?? []).flatMap((o, i) => (o.faceId ? [i] : []));
+      const others = (
+        await Promise.all(
+          candIdx.map(async (i) => {
+            const o = w!.others![i];
+            const f = p.library?.find((x) => x.id === o.faceId)?.file;
+            if (!f) return null;
+            const ow = o.wardrobe;
+            const take = (ow?.reference ?? []).filter((x) => x.on).map((x) => x.label).join(", ");
+            const keep = (ow?.target ?? []).filter((x) => x.on).map((x) => x.label).join(", ");
+            return {
+              index: i,
+              label: o.label,
+              wardrobe: `${take ? `takes from their photo: ${take}` : "takes the face"}${keep ? `; keeps: ${keep}` : ""}`,
+              dataUrl: (await jpeg(f)).dataUrl,
+            };
+          }),
+        )
+      ).filter((x): x is NonNullable<typeof x> => !!x);
       const rules = w
         ? [
             `Take from the reference photos: ${w.reference.filter((x) => x.on).map((x) => x.label).join(", ") || "face only"}.`,
             `Keep from the original: ${w.target.filter((x) => x.on).map((x) => x.label).join(", ") || "nothing"}.`,
             `Remove / replace: ${w.target.filter((x) => !x.on).map((x) => x.label).join(", ") || "nothing"}.`,
-            ...(w.others ?? []).filter((o) => o.faceId).map((o, k) => `Also replace ${o.label} with reference image ${faces.length + k + 1}.`),
-            ...(w.others ?? []).filter((o) => !o.faceId).map((o) => `${o.label} stays unchanged.`),
+            ...(w.others ?? []).filter((o, i) => !candIdx.includes(i)).map((o) => `${o.label} stays unchanged.`),
           ].join(" ")
         : "";
       const res = await fetch("/api/scenes", {
@@ -839,9 +861,10 @@ export default function Chapters() {
           scenes: withFrames,
           faces,
           others,
+          othersFixed: fixed,
           look: `${g.name}. ${g.description}`,
           rules,
-          basePrompt: defaultPrompt(g, faces.length),
+          basePrompt: defaultPrompt(groupForPart(g, part), faces.length),
           notes: g.notes,
           model: RENDER_MODELS.find((m) => m.id === g.modelId)?.name ?? g.modelId,
           clipLength: part.clipLength,
@@ -855,6 +878,10 @@ export default function Chapters() {
         target: String(json.target ?? ""),
         scenes: Array.isArray(json.scenes) ? json.scenes : [],
         warnings: Array.isArray(json.warnings) ? json.warnings : [],
+        // Claude names people by their index; keep only real candidates, in list order (the photo order).
+        present: fixed
+          ? candIdx
+          : candIdx.filter((i) => Array.isArray(json.present) && json.present.map(Number).includes(i)),
         at: Date.now(),
       };
       update((x) => ({
@@ -1214,7 +1241,9 @@ export default function Chapters() {
   }, [p.parts]);
 
   async function startPart(part: Part): Promise<PendingJob | null> {
-    const g = p.groups.find((x) => x.id === part.groupId)!;
+    const look = p.groups.find((x) => x.id === part.groupId)!;
+    // Only the swapped people who are in this part get a photo and a line in the prompt.
+    const g = groupForPart(look, part);
     const model = RENDER_MODELS.find((m) => m.id === g.modelId) ?? RENDER_MODELS[0];
     if (!p.prepared) {
       setError("The video is still being prepared. Try again in a moment.");
@@ -3227,6 +3256,16 @@ function RenderStep(props: {
                   onDelete={() => props.onDeletePart(pt.id)}
                   onAttach={() => props.onAttach(pt.id)}
                   shotThumbs={pt.pieces.map((pc) => ({ start: pc.start, end: pc.end, thumb: p.shots.find((sh) => sh.id === pc.shotId)?.thumb }))}
+                  people={(() => {
+                    const on = partPeople(g, pt);
+                    return (g.wardrobe?.others ?? []).flatMap((o, i) => (o.faceId ? [{ index: i, label: o.label, thumb: o.thumb, on: on.includes(i) }] : []));
+                  })()}
+                  onTogglePerson={(i) => {
+                    const key = partKey(pt);
+                    const cur = partPeople(g, pt);
+                    const next = cur.includes(i) ? cur.filter((x) => x !== i) : [...cur, i].sort((a, b) => a - b);
+                    props.onPatch(g.id, { partPeople: { ...(g.partPeople ?? {}), [key]: next } });
+                  }}
                   onEditPrompt={(t) => props.onEditPrompt(pt, t)}
                 />
               ))}
@@ -3931,7 +3970,11 @@ function PartRow({
   onDelete,
   onAttach,
   shotThumbs,
+  people,
+  onTogglePerson,
 }: {
+  people: { index: number; label: string; thumb?: string; on: boolean }[];
+  onTogglePerson: (index: number) => void;
   shotThumbs: { start: number; end: number; thumb?: string }[];
   onDelete: () => void;
   onAttach: () => void;
@@ -4040,6 +4083,35 @@ function PartRow({
         {outdated ? "Superseded" : part.status === "done" || part.status === "failed" ? "Re-roll" : "Render"}
       </button>
       </div>
+      {people.length > 0 && part.status !== "done" && (() => {
+        const used = people.filter((x) => x.on).map((x) => x.index).join(",");
+        const written = scenePrompt?.present?.join(",");
+        const stale = scenePrompt && written !== undefined && written !== used;
+        return (
+          <div className="flex flex-wrap items-center gap-2 text-[12px]">
+            <span className="text-muted">Also swapped in this render:</span>
+            {people.map((x) => (
+              <button
+                key={x.index}
+                onClick={() => onTogglePerson(x.index)}
+                title={x.label}
+                className={`inline-flex items-center gap-1.5 h-8 pl-1 pr-2.5 rounded-full ring-1 ${x.on ? "ring-white bg-white/10" : "ring-hair opacity-50"}`}
+              >
+                {x.thumb ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={x.thumb} alt="" className="w-6 h-6 rounded-full object-cover" />
+                ) : (
+                  <span className="w-6 h-6 rounded-full bg-white/10" />
+                )}
+                <span className="max-w-40 truncate">{x.label.replace(/^(a|an|the) /i, "")}</span>
+                <span>{x.on ? "✓" : ""}</span>
+              </button>
+            ))}
+            {!people.some((x) => x.on) && <span className="text-faint">only him</span>}
+            {stale && <span className="text-[#fcd34d]">People changed since the prompt was written · Rewrite it</span>}
+          </div>
+        );
+      })()}
       {showPrompt && scenePrompt && (
         <div className="rounded-xl bg-white/[0.03] ring-1 ring-hair p-3 space-y-3">
           {scenePrompt.target && <p className="text-[12px]"><span className="text-muted">Target · </span>{scenePrompt.target}</p>}
