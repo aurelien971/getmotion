@@ -288,7 +288,7 @@ export async function detectCuts(
   });
 }
 
-type Span = { start: number; end: number; frames?: number }; // frames: exact count to output
+type Span = { start: number; end: number; frames?: number; reverse?: boolean }; // frames: exact count to output; reverse: play backward
 
 // Build one clip from several spans of the same source, back to back, conformed
 // to w x h. Spans are cut with input seeking so late spans don't decode the whole file.
@@ -322,9 +322,10 @@ export async function buildClip(
     let ins = "";
     spans.forEach((s, i) => {
       const skip = s.start - pre < 0 ? 0 : pre;
-      graph += `[${i}:v]setpts=PTS-STARTPTS,fps=${fps}:start_time=${skip.toFixed(4)},trim=end_frame=${frames[i]},setpts=PTS-STARTPTS,${vf}[v${i}];`;
+      const rv = s.reverse ? ",reverse" : "";
+      graph += `[${i}:v]setpts=PTS-STARTPTS,fps=${fps}:start_time=${skip.toFixed(4)},trim=end_frame=${frames[i]},setpts=PTS-STARTPTS${rv},${vf}[v${i}];`;
       if (withAudio) {
-        graph += `[${i}:a]atrim=start=${skip.toFixed(4)}:duration=${(frames[i] / rate).toFixed(4)},asetpts=PTS-STARTPTS,aresample=48000[a${i}];`;
+        graph += `[${i}:a]atrim=start=${skip.toFixed(4)}:duration=${(frames[i] / rate).toFixed(4)},asetpts=PTS-STARTPTS${s.reverse ? ",areverse" : ""},aresample=48000[a${i}];`;
       }
       ins += withAudio ? `[v${i}][a${i}]` : `[v${i}]`;
     });

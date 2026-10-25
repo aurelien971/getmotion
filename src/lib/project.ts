@@ -38,6 +38,7 @@ export type Group = {
   notes: string;
   prompt: string;
   modelId: string;
+  oneShot?: boolean; // render every shot on its own clip (padded with itself), never several shots per render
   wardrobe?: Wardrobe;
 };
 
@@ -155,7 +156,7 @@ export type Part = {
   id: string;
   groupId: string;
   pieces: PartPiece[]; // real footage, in clip order, with offset into the clip
-  pad: { start: number; end: number }[]; // looped filler to reach the model's minimum length
+  pad: { start: number; end: number; reverse?: boolean }[]; // filler to reach the model's minimum length: the footage played backward and forward, so it never cuts
   duration: number; // real footage length
   clipLength: number; // real + filler
   status: PartStatus;
@@ -506,6 +507,39 @@ export function pending(p: Project, groupId: string): { shotId: string; start: n
 
 // Split what's pending for a look into renderable parts (H3 limits), loop short
 // parts up to the minimum, and keep renders that already exist.
+// Filler up to the model's minimum: the clip played backward from its last frame, then
+// forward again, and so on. Motion just reverses, so there is never a cut to lose him at.
+// Turnaround frames aren't repeated. The filler is thrown away after rendering.
+export function pingPong(pieces: { start: number; end: number }[], duration: number, f: number) {
+  const pad: { start: number; end: number; reverse?: boolean }[] = [];
+  let len = duration;
+  let back = true;
+  for (let guard = 0; len < MIN_CLIP - 1e-3 && pieces.length && guard < 400; guard++) {
+    const seq = back ? [...pieces].reverse() : pieces;
+    for (let k = 0; k < seq.length && len < MIN_CLIP - 1e-3; k++) {
+      const pc = seq[k];
+      // Skip the frame we turned around on (the first one of this pass).
+      let a = pc.start;
+      let b = pc.end;
+      if (k === 0) {
+        if (back) b -= f;
+        else a += f;
+      }
+      if (b - a < f / 2) continue;
+      const need = MIN_CLIP - len;
+      if (b - a > need) {
+        // Partial pass: keep the frames nearest the turnaround.
+        if (back) a = b - need;
+        else b = a + need;
+      }
+      pad.push(back ? { start: a, end: b, reverse: true } : { start: a, end: b });
+      len += b - a;
+    }
+    back = !back;
+  }
+  return { pad, len };
+}
+
 export function buildParts(p: Project, groupId: string): Part[] {
   const todo = pending(p, groupId);
   const parts: { pieces: PartPiece[]; duration: number }[] = [];
@@ -516,7 +550,10 @@ export function buildParts(p: Project, groupId: string): Part[] {
     cur = { pieces: [], duration: 0 };
     run = 0;
   };
+  const oneShot = !!p.groups.find((g) => g.id === groupId)?.oneShot;
   for (const s of todo) {
+    // One shot per render: every shot starts its own part.
+    if (oneShot) flush();
     let a = s.start;
     while (a < s.end - 1e-3) {
       const last = cur.pieces[cur.pieces.length - 1];
@@ -539,16 +576,7 @@ export function buildParts(p: Project, groupId: string): Part[] {
   const keyOf = (pcs: PartPiece[]) => pcs.map((x) => `${x.start.toFixed(3)}-${x.end.toFixed(3)}`).join("|");
   const old = p.parts.filter((x) => x.groupId === groupId);
   const fresh = parts.map((pt) => {
-    const pad: { start: number; end: number }[] = [];
-    let len = pt.duration;
-    let i = 0;
-    while (len < MIN_CLIP && pt.pieces.length) {
-      const src = pt.pieces[i % pt.pieces.length];
-      const take = Math.min(src.end - src.start, MIN_CLIP - len);
-      pad.push({ start: src.start, end: src.start + take });
-      len += take;
-      i++;
-    }
+    const { pad, len } = pingPong(pt.pieces, pt.duration, 1 / p.fps);
     const prev = old.find((o) => (o.status === "idle" || o.status === "failed") && keyOf(o.pieces) === keyOf(pt.pieces));
     return prev
       ? { ...prev, pad, clipLength: len }

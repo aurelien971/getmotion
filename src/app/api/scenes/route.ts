@@ -44,8 +44,13 @@ The prompt must:
   left half of the frame, rapping toward camera." One short line per scene, concrete visual cues
   only: position, framing, action, and the decoys to leave alone. Call out hard cases explicitly
   ("even though he is tiny in the back", "even though motion blur hides his face").
-- If the clip has loop filler (after LOOP FROM), say the footage after that time repeats earlier
-  scenes and he must be replaced there too.
+- If the clip has filler (after LOOP FROM), it is the same footage played backward, then forward
+  again. Say that from that time the shot replays in reverse and forward and he must be replaced
+  there too, the same way.
+- If the clip has only ONE scene, it is a single continuous shot: do not number scenes. Describe
+  exactly where he is in the frame and how he moves through the shot (start, middle, end), the
+  decoys next to him, and what covers his face if anything (flare, hand, cap). This is the
+  most important case: be precise about his position.
 - State that everyone else, the background, camera motion, lighting, haze, lens flares and the color
   grade stay exactly as they are, and that lip-sync, expressions and gestures are preserved.
 - Be plain, literal, present tense. No markdown, no hype words, no quality adjectives
@@ -89,7 +94,7 @@ export async function POST(req: Request) {
     type: "text",
     text: [
       `LOOK: ${b.look}`,
-      b.loopFrom < b.clipLength - 0.05 ? `LOOP FROM: ${b.loopFrom.toFixed(1)}s (filler repeating earlier scenes until ${b.clipLength.toFixed(1)}s)` : "LOOP FROM: none",
+      b.loopFrom < b.clipLength - 0.05 ? `LOOP FROM: ${b.loopFrom.toFixed(1)}s (filler: the same footage played backward then forward until ${b.clipLength.toFixed(1)}s)` : "LOOP FROM: none",
       `RULES (the user's decisions, follow exactly): ${b.rules || "(none)"}`,
       `BASE PROMPT built from those rules, for reference: ${b.basePrompt}`,
       `NOTES: ${b.notes?.trim() || "(none)"}`,

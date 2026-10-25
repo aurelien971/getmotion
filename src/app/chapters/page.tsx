@@ -25,6 +25,8 @@ import {
   findIssues,
   partKey,
   keptRange,
+  pingPong,
+  MIN_CLIP,
   edgeJunk,
   pieceLive,
   takesFor,
@@ -247,7 +249,7 @@ export default function Chapters() {
 
   useEffect(() => {
     if (process.env.NODE_ENV === "development") {
-      (window as unknown as { __engine: unknown }).__engine = { buildClip, assembleTimeline, detectCuts, measureOffset, fpsExpr, measureOffsets, findIssues, alignSpans, lineUpRender, verifyIssues };
+      (window as unknown as { __engine: unknown }).__engine = { buildClip, assembleTimeline, detectCuts, measureOffset, fpsExpr, measureOffsets, findIssues, alignSpans, lineUpRender, verifyIssues, pingPong, openReader };
     }
   }, []);
 
@@ -1067,7 +1069,7 @@ export default function Chapters() {
   // The exact clip a part sends, built locally (cached until its pieces change).
   const clipCache = useRef(new Map<string, File>());
   async function buildPartClip(part: Part): Promise<File> {
-    const key = partKey(part) + `#${part.pad.length}`;
+    const key = partKey(part) + `#${part.pad.map((x) => `${x.start.toFixed(3)}${x.reverse ? "r" : ""}`).join(",")}`;
     const hit = clipCache.current.get(key);
     if (hit) return hit;
     const h = Math.min(720, p.height);
@@ -1091,7 +1093,7 @@ export default function Chapters() {
     const planned = spans.map((x) => Math.max(1, Math.round((x.end - x.start) * evalRate(fpsExpr(p.fps)))));
     const clip = await buildClip(
       p.prepared!.blob,
-      copySpans.map((x, i) => ({ ...x, frames: planned[i] })),
+      copySpans.map((x, i) => ({ ...x, frames: planned[i], reverse: (spans[i] as { reverse?: boolean }).reverse })),
       { w, h },
       p.hasAudio,
       (r) => patchPart(part.id, { progress: r }),
@@ -1223,7 +1225,7 @@ export default function Chapters() {
       setError(`Pick a face for "${g.name}" first.`);
       return null;
     }
-    const text = g.partPrompts?.[partKey(part)]?.prompt || g.prompt || "";
+    const text = g.partPrompts?.[partKey(part)]?.prompt || (g.oneShot ? defaultPrompt(g, 1) : g.prompt) || "";
     if (/recast/i.test(model.id) && text.length > 2000) {
       patchPart(part.id, { status: "failed", error: `Prompt is ${text.length} characters; H3 takes at most 2,000. Shorten it first.` });
       return null;
@@ -1257,7 +1259,8 @@ export default function Chapters() {
         prompt: "",
         directed:
           g.partPrompts?.[partKey(part)]?.prompt ||
-          g.prompt ||
+          // A look prompt lists every shot of the look; a one-shot clip gets the checklist prompt instead.
+          (g.oneShot ? defaultPrompt(g, photos.length) : g.prompt) ||
           `The target appears in every single shot of this clip. Replace him with the man in reference image 1 in all of them, even with sunglasses, a hat, a side angle or when small in frame. ${g.description} Keep his clothing, hats and sunglasses exactly. Everyone else unchanged. Preserve lip-sync and motion.`,
         duration: part.clipLength,
         side: "center",
@@ -1435,7 +1438,7 @@ export default function Chapters() {
   // rebuilds the not-yet-rendered parts, wherever you navigate from.
   const shotsKey = p.shots.map((s) => `${s.id}:${s.start.toFixed(4)}-${s.end.toFixed(4)}:${s.groupId}`).join("|");
   // What's already covered: finished/running renders with their trims and redos.
-  const acceptKey = p.groups.map((g) => (g.accepted ?? []).map((x) => x.start.toFixed(3)).join(",")).join("|");
+  const acceptKey = p.groups.map((g) => `${g.oneShot ? 1 : 0}:${(g.accepted ?? []).map((x) => x.start.toFixed(3)).join(",")}`).join("|");
   const coverKey = p.parts
     .filter((x) => x.status !== "idle" && x.status !== "failed")
     .map((x) => `${x.id}:${x.status}:${JSON.stringify(x.trims ?? {})}:${(x.rejected ?? []).join(",")}:${(x.unused ?? []).join(",")}:${(x.deleted ?? []).join(",")}`)
@@ -1827,6 +1830,7 @@ export default function Chapters() {
             onRender={renderParts}
             onCheck={checkParts}
             onWritePrompt={(pt) => void writePartPrompt(pt)}
+            onWriteAll={(pts) => void (async () => { for (const pt of pts) await writePartPrompt(pt); })()}
             onEditPrompt={editPartPrompt}
             writing={new Set(Object.keys(tasks).filter((k) => k.startsWith("pp-") && tasks[k]).map((k) => k.slice(3)))}
             onDownloadRender={(pt) => void downloadRender(pt)}
@@ -2772,6 +2776,7 @@ function RenderStep(props: {
   onRender: (partIds: string[]) => void;
   onCheck: (partIds: string[]) => void;
   onWritePrompt: (part: Part) => void;
+  onWriteAll: (parts: Part[]) => void;
   onEditPrompt: (part: Part, prompt: string) => void;
   writing: Set<string>;
   onDownloadRender: (part: Part) => void;
@@ -3126,6 +3131,18 @@ function RenderStep(props: {
                   </div>
                   <p className="text-faint text-[11px]">{model.note} · ~${model.usdPerSec}/s</p>
                 </div>
+                <div className="space-y-2">
+                  <span className="text-[13px]">Shots per render</span>
+                  <div className="seg glass w-fit">
+                    <button className={!g.oneShot ? "on" : ""} onClick={() => props.onPatch(g.id, { oneShot: false })}>Several · cheaper</button>
+                    <button className={g.oneShot ? "on" : ""} onClick={() => props.onPatch(g.id, { oneShot: true })}>One · reliable</button>
+                  </div>
+                  <p className="text-faint text-[11px]">
+                    {g.oneShot
+                      ? `Every shot gets its own render, padded to ${MIN_CLIP}s with itself played backward and forward, so there's no cut for the model to lose him at. Only the real frames are kept. ~$${(model.usdPerSec * MIN_CLIP).toFixed(2)} per short shot.`
+                      : "Shots are stitched into shared renders. Cheaper, but the model often drops him after a cut."}
+                  </p>
+                </div>
                 <textarea
                   value={g.notes}
                   onChange={(e) => props.onPatch(g.id, { notes: e.target.value })}
@@ -3166,6 +3183,24 @@ function RenderStep(props: {
               />
             )}
 
+            {g.oneShot && (() => {
+              const todo = parts.filter((x) => x.status === "idle" || x.status === "failed");
+              const unwritten = todo.filter((x) => !g.partPrompts?.[partKey(x)]);
+              return (
+                <div className="flex flex-wrap items-center gap-3 text-[12px]">
+                  <span className="flex-1 text-muted">
+                    One shot per render · {todo.length} to render · ~${todo.reduce((n, x) => n + costOf(x), 0).toFixed(2)}
+                    {unwritten.length ? ` · ${unwritten.length} without their own prompt (they use the checklist prompt)` : ""}
+                  </span>
+                  {unwritten.length > 0 && (
+                    <button className="btn h-8 px-3 text-[12px]" disabled={props.writing.size > 0} onClick={() => props.onWriteAll(unwritten)}>
+                      {props.writing.size > 0 ? "Studying scenes…" : `Write ${unwritten.length} prompt${unwritten.length === 1 ? "" : "s"} with Claude`}
+                    </button>
+                  )}
+                </div>
+              );
+            })()}
+
             <ol className="space-y-2">
               {parts.map((pt, i) => (
                 <PartRow
@@ -3191,6 +3226,7 @@ function RenderStep(props: {
                   onWritePrompt={() => props.onWritePrompt(pt)}
                   onDelete={() => props.onDeletePart(pt.id)}
                   onAttach={() => props.onAttach(pt.id)}
+                  shotThumbs={pt.pieces.map((pc) => ({ start: pc.start, end: pc.end, thumb: p.shots.find((sh) => sh.id === pc.shotId)?.thumb }))}
                   onEditPrompt={(t) => props.onEditPrompt(pt, t)}
                 />
               ))}
@@ -3894,7 +3930,9 @@ function PartRow({
   onEditPrompt,
   onDelete,
   onAttach,
+  shotThumbs,
 }: {
+  shotThumbs: { start: number; end: number; thumb?: string }[];
   onDelete: () => void;
   onAttach: () => void;
   scenePrompt?: ScenePrompt;
@@ -3934,9 +3972,17 @@ function PartRow({
     <li className="rounded-2xl ring-1 ring-hair p-3 space-y-3">
       <div className="flex flex-wrap items-center gap-4">
       <span className="text-[13px] w-16">Part {index + 1}</span>
-      <span className="text-muted text-[12px] tabular-nums w-48">
-        {part.pieces.length} pieces · {fmtShort(part.duration)}
-        {padLen > 0.05 ? ` + ${fmtShort(padLen)} loop` : ""}
+      <span className="flex -space-x-2">
+        {shotThumbs.slice(0, 6).map((t, k) =>
+          t.thumb ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img key={k} src={t.thumb} alt="" title={`${fmt(t.start)} – ${fmt(t.end)}`} className="h-8 aspect-video object-cover rounded ring-1 ring-black" />
+          ) : null,
+        )}
+      </span>
+      <span className="text-muted text-[12px] tabular-nums w-52">
+        {part.pieces.length === 1 ? `Shot ${fmt(part.pieces[0].start)}` : `${part.pieces.length} shots`} · {fmtShort(part.duration)}
+        {padLen > 0.05 ? ` + ${fmtShort(padLen)} ${part.pad.some((x) => x.reverse) ? "ping-pong" : "loop"}` : ""}
       </span>
       <span className="flex items-center gap-2 text-[12px] min-w-40">
         <span
@@ -4110,7 +4156,7 @@ function PartRow({
         <div className="grid md:grid-cols-2 gap-4">
           <div className="space-y-1.5">
             <span className="text-[12px] text-muted">What gets sent{padLen > 0.05 ? ` (last ${fmtShort(padLen)} is loop filler, thrown away)` : ""}</span>
-            <ReelPlayer src={src} fps={fps} spans={[...part.pieces, ...part.pad]} className="aspect-video" />
+            <ReelPlayer src={src} fps={fps} spans={part.pieces} className="aspect-video" />
           </div>
           {part.resultUrl && (
             <div className="space-y-1.5">
