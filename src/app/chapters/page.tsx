@@ -4540,7 +4540,7 @@ function AssembleStep(props: {
               <input type="checkbox" checked={props.fillGaps} onChange={(e) => props.setFillGaps(e.target.checked)} className="accent-white" />
               Fill 1–2 frame gaps between renders
             </label>
-            <p className="text-faint text-[11px]">Original audio throughout. Exported at the source's own resolution in high quality; renders are upscaled to it.</p>
+            <p className="text-faint text-[11px]">Original audio throughout. Exported at the source&apos;s own resolution in high quality; renders are upscaled to it.</p>
           </div>
 
           <button className="btn-primary" disabled={props.busy} onClick={props.onAssemble}>
