@@ -1385,6 +1385,18 @@ export default function Chapters() {
     }));
   }
 
+  // Switching a part's input (original ↔ fixed frames) makes its old failure stale.
+  function setSwapInput(part: Part, on: boolean) {
+    const key = partKey(part);
+    update((x) => ({
+      ...x,
+      groups: x.groups.map((gg) => (gg.id === part.groupId ? { ...gg, swapInput: { ...(gg.swapInput ?? {}), [key]: on } } : gg)),
+      parts: x.parts.map((pt) =>
+        pt.groupId === part.groupId && partKey(pt) === key && pt.status === "failed" ? { ...pt, status: "idle" as const, error: undefined } : pt,
+      ),
+    }));
+  }
+
   // A new image for a frame starts unadjusted and not yet validated.
   const withFrame = (gg: Group, key: string, f: number, url: string): Group => {
     const adj = { ...(gg.frameAdjust?.[key] ?? {}) };
@@ -2313,6 +2325,10 @@ export default function Chapters() {
             onDeleteTake={deleteTake}
             onDeletePart={deletePart}
             onCancel={cancelPart}
+            onDismissError={(id) => {
+              const pt = p.parts.find((x) => x.id === id);
+              patchPart(id, { error: undefined, ...(pt?.status === "failed" && !pt.resultUrl ? { status: "idle" as const } : {}) });
+            }}
             onBuildSent={async (pt) => {
               try {
                 return URL.createObjectURL(await buildPartClip(pt));
@@ -2508,7 +2524,7 @@ export default function Chapters() {
                   // The "use fixed frames" setting must be saved before the clip is built.
                   go: () => {
                     if (!look) return;
-                    patchGroup(look.id, { swapInput: { ...(look.swapInput ?? {}), [partKey(part)]: true } });
+                    setSwapInput(part, true);
                     setTimeout(() => void renderRef.current([part.id]), 400);
                   },
                 };
@@ -2516,7 +2532,7 @@ export default function Chapters() {
               mode: swapModeOf(part),
               onMode: (m: "swap" | "edit") => look && patchGroup(look.id, { swapMode: { ...(look.swapMode ?? {}), [partKey(part)]: m } }),
               useAsInput: !!look?.swapInput?.[partKey(part)],
-              onUseAsInput: (on: boolean) => look && patchGroup(look.id, { swapInput: { ...(look.swapInput ?? {}), [partKey(part)]: on } }),
+              onUseAsInput: (on: boolean) => setSwapInput(part, on),
               promptFor: (f: number) => swapPromptFor(part, f),
               allPrompt: look?.swapPrompts?.[partKey(part)]?.all ?? swapDefaultPrompt(part),
               allEdited: !!look?.swapPrompts?.[partKey(part)]?.all,
@@ -3488,6 +3504,7 @@ function RenderStep(props: {
   onCancel: (part: Part) => void;
   onRestoreTake: (partId: string) => void;
   onBuildSent: (part: Part) => Promise<string | null>;
+  onDismissError: (partId: string) => void;
   onRestorePart: (partId: string) => void;
   onRestoreTakes: (partId: string) => void;
   onAttach: (partId: string) => void;
@@ -3978,6 +3995,7 @@ function RenderStep(props: {
                   inUse={inUse}
                   editedInput={!!g.swapInput?.[partKey(pt)]}
                   onBuildSent={() => props.onBuildSent(pt)}
+                  onDismissError={() => props.onDismissError(pt.id)}
                   onCheck={() => props.onCheck([pt.id])}
                   onInspect={() => props.onInspect(pt)}
                   onFix={(only) => props.onFix(pt, only)}
@@ -4731,7 +4749,9 @@ function PartRow({
   inUse,
   editedInput,
   onBuildSent,
+  onDismissError,
 }: {
+  onDismissError: () => void;
   onBuildSent: () => Promise<string | null>; // object URL of the clip that gets uploaded
   editedInput?: boolean; // renders from frames fixed in Inspect
 
@@ -4832,7 +4852,12 @@ function PartRow({
         {part.progress !== undefined && busy && <span className="text-faint tabular-nums">{Math.round(part.progress * 100)}%</span>}
         {part.status === "rendering" && <LiveStatus part={part} />}
       </span>
-      {part.error && <span className="text-[12px] text-[#fca5a5] break-all flex-1 min-w-48">{part.error}</span>}
+      {part.error && (
+        <span className="text-[12px] text-[#fca5a5] break-all flex-1 min-w-48">
+          {part.error}{" "}
+          <button className="text-faint hover:text-ink" title="Dismiss" onClick={onDismissError}>✕</button>
+        </span>
+      )}
       <span className="flex-1" />
       {part.resultUrl && !open && (
         <video src={part.resultUrl} muted playsInline className="h-12 rounded-md ring-1 ring-hair bg-black" />
