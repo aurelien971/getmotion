@@ -1655,6 +1655,12 @@ export default function Chapters() {
     }
   }
 
+  // Latest renderParts, for actions that must wait for a state update first.
+  const renderRef = useRef<(ids: string[]) => Promise<void>>(async () => {});
+  useEffect(() => {
+    renderRef.current = renderParts;
+  });
+
   // Parts being started right now (clicks land before state updates): never start one twice.
   const starting = useRef(new Set<string>());
   async function renderParts(ids: string[]) {
@@ -2400,6 +2406,22 @@ export default function Chapters() {
               regionFor: (f: number) => regionOf(part, f),
               boxed: Array.from({ length: clipFrames(part) }, (_, f) => f).filter((f) => !!regionOf(part, f)),
               onRegion: (frames: number[], r: { x: number; y: number; w: number; h: number } | null) => setRegions(part, frames, r),
+              render: (() => {
+                const g = look ? groupForPart(look, part) : null;
+                const model = RENDER_MODELS.find((m) => m.id === look?.modelId) ?? RENDER_MODELS[0];
+                const prompt = g ? g.partPrompts?.[partKey(part)]?.prompt || (g.oneShot ? defaultPrompt(g, refsOf(p, g).length) : g.prompt) || "" : "";
+                return {
+                  model: model.name.replace(" (fal)", ""),
+                  cost: model.usdPerSec * part.clipLength,
+                  prompt,
+                  // The "use fixed frames" setting must be saved before the clip is built.
+                  go: () => {
+                    if (!look) return;
+                    patchGroup(look.id, { swapInput: { ...(look.swapInput ?? {}), [partKey(part)]: true } });
+                    setTimeout(() => void renderRef.current([part.id]), 400);
+                  },
+                };
+              })(),
               mode: swapModeOf(part),
               onMode: (m: "swap" | "edit") => look && patchGroup(look.id, { swapMode: { ...(look.swapMode ?? {}), [partKey(part)]: m } }),
               useAsInput: !!look?.swapInput?.[partKey(part)],

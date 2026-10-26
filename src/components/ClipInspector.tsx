@@ -6,6 +6,32 @@ type Piece = { start: number; end: number; offset: number };
 
 const fmt = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(2).padStart(5, "0")}`;
 
+type Box = { x: number; y: number; w: number; h: number };
+
+// What the guided gesture fix turns the middle finger into.
+const GESTURES = [
+  {
+    id: "gun",
+    label: "Finger gun",
+    note: "Index opens next to the middle finger",
+    text: "The index finger extends straight next to the raised middle finger, pressed against it, so the two fingers point together like a finger gun; the middle finger stays exactly as it is.",
+  },
+  {
+    id: "palm",
+    label: "Open palm",
+    note: "All fingers up, a brush-off wave",
+    text: "The middle finger folds into line with the other fingers, which all extend relaxed and together, like an open palm brushing someone off.",
+  },
+  {
+    id: "fist",
+    label: "Fist",
+    note: "Middle finger folds down",
+    text: "The raised middle finger folds down into a loose fist with the other fingers.",
+  },
+] as const;
+const gesturePrompt = (change: string) =>
+  `This is a close crop from a blurry, hazy music-video frame. Change only the hand that shows the middle finger: ${change.charAt(0).toLowerCase() + change.slice(1)} Keep the hand in the same place, at the same size, angle and orientation, with the same skin tone, sleeve and the same soft motion blur, haze and lens flare over it, so it looks like the original footage. Do not change his face, cap, the background or anything else in the image. If no hand showing the middle finger is visible, return the image unchanged.`;
+
 // Every frame of the exact file that will be uploaded, grouped by piece, each
 // labelled with the source frame it came from. Plus a frame-step player of the file.
 export function ClipInspector({
@@ -48,6 +74,8 @@ export function ClipInspector({
     onMode: (m: "swap" | "edit") => void;
     useAsInput: boolean; // the part renders from these frames
     onUseAsInput: (on: boolean) => void;
+    // Final step of the guided fix: render the part from the fixed frames.
+    render: { model: string; cost: number; prompt: string; go: () => void };
   };
   file: Blob;
   fps: number; // the clip's frame rate
@@ -75,6 +103,12 @@ export function ClipInspector({
   // Frames picked for a batch fix: click, shift-click for a range, cmd/ctrl-click to toggle.
   const [picked, setPicked] = useState<Set<number>>(new Set());
   const [drawing, setDrawing] = useState(false);
+  // Guided gesture fix: choose → mark (a box per frame) → fix → check (then render).
+  const [wiz, setWiz] = useState<null | "choose" | "mark" | "fix" | "check">(null);
+  const [gesture, setGesture] = useState<string>("gun");
+  const [customFix, setCustomFix] = useState("");
+  const [lastBox, setLastBox] = useState<Box | null>(null);
+  const [fixStarted, setFixStarted] = useState(false);
   const [drag, setDrag] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
   const [anchor, setAnchor] = useState<number | null>(null);
   const pick = (f: number, e: { shiftKey: boolean; metaKey: boolean; ctrlKey: boolean }) => {
@@ -139,6 +173,18 @@ export function ClipInspector({
     };
   }, [url, fps]);
 
+  // Fix step: once everything sent has come back, move on to checking.
+  useEffect(() => {
+    if (wiz === "fix" && fixStarted && swap && swap.busy.size === 0) {
+      const t = setTimeout(() => {
+        setFixStarted(false);
+        setShowSwapped(true);
+        setWiz("check");
+      }, 0);
+      return () => clearTimeout(t);
+    }
+  }, [wiz, fixStarted, swap]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -164,6 +210,40 @@ export function ClipInspector({
     return { piece: j, src: Math.floor((pieces[j].start + (t - pieces[j].offset)) * sourceFps + 1e-3) };
   };
   const cur = info(sel);
+  const isReal = (f: number) => f >= 0 && f < count && info(f).piece >= 0;
+  const realFrames = Array.from({ length: count }, (_, f) => f).filter(isReal);
+  // Guided fix, mark step: a box on this frame, then on to the next real frame.
+  const advance = () => {
+    if (isReal(sel + 1)) setSel(sel + 1);
+    else {
+      setDrawing(false);
+      setWiz("fix");
+    }
+  };
+  const markBox = (box: Box) => {
+    swap?.onRegion([sel], box);
+    setLastBox(box);
+    advance();
+  };
+  const markNone = () => {
+    swap?.onRegion([sel], null);
+    if (swap?.frames[sel]) swap.onRemove([sel]);
+    advance();
+  };
+  // Mark step keys: Enter = same box as before, S = no finger on this frame.
+  useEffect(() => {
+    if (wiz !== "mark") return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement) return;
+      if (e.key === "Enter" && lastBox) {
+        e.preventDefault();
+        markBox(lastBox);
+      }
+      if (e.key === "s" || e.key === "S") markNone();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
   const groups: { piece: number; frames: number[] }[] = [];
   for (let f = 0; f < count; f++) {
     const p = info(f).piece;
@@ -217,9 +297,15 @@ export function ClipInspector({
                   onPointerUp={() => {
                     if (drag) {
                       const box = { x: Math.min(drag.x0, drag.x1), y: Math.min(drag.y0, drag.y1), w: Math.abs(drag.x1 - drag.x0), h: Math.abs(drag.y1 - drag.y0) };
+                      const ok = box.w > 0.02 && box.h > 0.02;
+                      if (wiz === "mark") {
+                        setDrag(null);
+                        if (ok) markBox(box);
+                        return; // stay in drawing mode for the next frame
+                      }
                       // The box goes on the selected frames, or on this frame when nothing is selected.
                       const targets = picked.size ? [...picked].filter((f) => info(f).piece >= 0) : [sel];
-                      if (box.w > 0.02 && box.h > 0.02) swap.onRegion(targets, box);
+                      if (ok) swap.onRegion(targets, box);
                     }
                     setDrag(null);
                     setDrawing(false);
@@ -231,7 +317,14 @@ export function ClipInspector({
                       style={{ left: `${r.x * 100}%`, top: `${r.y * 100}%`, width: `${r.w * 100}%`, height: `${r.h * 100}%` }}
                     />
                   )}
-                  {drawing && !drag && (
+                  {wiz === "mark" && !r && lastBox && (
+                    <div
+                      className="absolute border-2 border-dashed border-[#7dd3fc]/70 rounded-sm"
+                      style={{ left: `${lastBox.x * 100}%`, top: `${lastBox.y * 100}%`, width: `${lastBox.w * 100}%`, height: `${lastBox.h * 100}%` }}
+                      title="Previous box: press Enter to use it here"
+                    />
+                  )}
+                  {drawing && !drag && wiz !== "mark" && (
                     <span className="absolute left-1/2 top-3 -translate-x-1/2 text-[12px] bg-black/70 rounded-full px-3 py-1">
                       Drag a box around the area to change{picked.size ? ` · goes on ${picked.size} selected frames` : ` · frame ${sel}`}
                     </span>
@@ -289,7 +382,156 @@ export function ClipInspector({
               );
             })()}
             {thumbs.length < count && <p className="text-faint text-[11px]">Reading frames… {thumbs.length}/{count}</p>}
-            {swap && (() => {
+            {swap && !wiz && (
+              <button
+                className="btn btn-on w-full mt-2"
+                onClick={() => {
+                  setWiz("choose");
+                  setPicked(new Set());
+                }}
+              >
+                Fix a gesture (guided)
+              </button>
+            )}
+            {swap && wiz && (() => {
+              const g = GESTURES.find((x) => x.id === gesture);
+              const change = gesture === "custom" ? customFix.trim() : g?.text ?? "";
+              const boxed = swap.boxed;
+              const fixedBoxed = boxed.filter((f) => swap.frames[f]);
+              const failed = boxed.filter((f) => swap.errors[f]);
+              const running = swap.busy.size;
+              const steps = ["choose", "mark", "fix", "check"] as const;
+              return (
+                <div className="pt-3 mt-2 border-t border-hair space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span>Fix a gesture</span>
+                    <button className="text-faint hover:text-ink text-[11px]" onClick={() => { setWiz(null); setDrawing(false); }}>Exit</button>
+                  </div>
+                  <div className="grid grid-cols-4 gap-1 text-[10px] text-center">
+                    {["1 Choose", "2 Mark", "3 Fix", "4 Check"].map((x, k) => (
+                      <span key={x} className={`rounded-full py-0.5 ${steps.indexOf(wiz) === k ? "bg-white text-black" : steps.indexOf(wiz) > k ? "bg-white/15" : "bg-white/5 text-faint"}`}>{x}</span>
+                    ))}
+                  </div>
+
+                  {wiz === "choose" && (
+                    <div className="space-y-2">
+                      <p className="text-muted text-[12px]">Turn the middle finger into:</p>
+                      {GESTURES.map((x) => (
+                        <button key={x.id} onClick={() => setGesture(x.id)} className={`w-full text-left rounded-xl ring-1 px-3 py-2 ${gesture === x.id ? "ring-white bg-white/10" : "ring-hair"}`}>
+                          <span className="block text-[13px]">{x.label}</span>
+                          <span className="block text-faint text-[11px]">{x.note}</span>
+                        </button>
+                      ))}
+                      <button onClick={() => setGesture("custom")} className={`w-full text-left rounded-xl ring-1 px-3 py-2 ${gesture === "custom" ? "ring-white bg-white/10" : "ring-hair"}`}>
+                        <span className="block text-[13px]">My own words</span>
+                      </button>
+                      {gesture === "custom" && (
+                        <textarea
+                          className="w-full min-h-20 rounded-lg bg-black/40 ring-1 ring-hair p-2 text-[12px]"
+                          placeholder="e.g. the index finger also opens, like a peace sign"
+                          value={customFix}
+                          onChange={(e) => setCustomFix(e.target.value)}
+                        />
+                      )}
+                      <button
+                        className="btn btn-on w-full"
+                        disabled={!change}
+                        onClick={() => {
+                          swap.onMode("edit");
+                          swap.onEditAll(gesturePrompt(change));
+                          const first = isReal(sel) ? sel : realFrames[0];
+                          setSel(first);
+                          setDrawing(true);
+                          setWiz("mark");
+                        }}
+                      >
+                        Next: mark the frames
+                      </button>
+                    </div>
+                  )}
+
+                  {wiz === "mark" && (
+                    <div className="space-y-2 text-[12px]">
+                      <p className="text-muted">
+                        Frame <span className="text-ink tabular-nums">{sel}</span> of {realFrames.length - 1} · {boxed.length} boxed
+                      </p>
+                      <p className="text-faint text-[11px] leading-relaxed">
+                        Drag a box around the hand on the big view: it saves and jumps to the next frame. The dashed box is the previous one.
+                      </p>
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <button className="btn" disabled={!lastBox} onClick={() => lastBox && markBox(lastBox)}>Same box · Enter</button>
+                        <button className="btn" onClick={markNone}>No finger · S</button>
+                        <button className="btn" disabled={!isReal(sel - 1)} onClick={() => setSel(sel - 1)}>‹ Back</button>
+                        <button className="btn" onClick={() => { setDrawing(false); setWiz("fix"); }}>Done marking</button>
+                      </div>
+                    </div>
+                  )}
+
+                  {wiz === "fix" && (
+                    <div className="space-y-2 text-[12px]">
+                      <p className="text-muted">{boxed.length} frame{boxed.length === 1 ? "" : "s"} boxed. Each is fixed inside its own box only.</p>
+                      <button
+                        className="btn btn-on w-full"
+                        disabled={!boxed.length || running > 0}
+                        onClick={() => {
+                          setFixStarted(true);
+                          swap.onSwapMany(boxed);
+                        }}
+                      >
+                        {running ? `Fixing… ${boxed.length - running}/${boxed.length}` : `Fix ${boxed.length} frame${boxed.length === 1 ? "" : "s"} · ~$${(boxed.length * swap.price).toFixed(2)}`}
+                      </button>
+                      <button className="btn w-full" onClick={() => { setDrawing(true); setWiz("mark"); }}>‹ Back to marking</button>
+                    </div>
+                  )}
+
+                  {wiz === "check" && (
+                    <div className="space-y-2 text-[12px]">
+                      <p className={failed.length ? "text-[#fcd34d]" : "text-[#86efac]"}>
+                        {fixedBoxed.length}/{boxed.length} fixed{failed.length ? ` · ${failed.length} failed (red dot)` : ""}
+                      </p>
+                      <div className="flex flex-wrap gap-1">
+                        {boxed.map((f) => (
+                          <button
+                            key={f}
+                            onClick={() => setSel(f)}
+                            className={`h-7 min-w-9 px-2 rounded-full ring-1 text-[11px] tabular-nums ${f === sel ? "ring-white bg-white/10" : swap.errors[f] ? "ring-[#fca5a5]" : "ring-hair"}`}
+                          >
+                            {f}
+                          </button>
+                        ))}
+                      </div>
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <button className="btn" onPointerDown={() => setShowSwapped(false)} onPointerUp={() => setShowSwapped(true)} onPointerLeave={() => setShowSwapped(true)}>
+                          Hold: original
+                        </button>
+                        <button className="btn" disabled={swap.busy.has(sel) || !boxed.includes(sel)} onClick={() => swap.onSwap(sel)}>
+                          {swap.busy.has(sel) ? "Fixing…" : `Redo frame ${sel}`}
+                        </button>
+                      </div>
+                      <div className="rounded-xl ring-1 ring-[#86efac]/50 p-3 space-y-2">
+                        <span className="block">Put him in</span>
+                        <p className="text-faint text-[11px] leading-relaxed">
+                          Renders this part from your fixed frames with {swap.render.model} · ~${swap.render.cost.toFixed(2)}. Prompt: {swap.render.prompt.slice(0, 140)}
+                          {swap.render.prompt.length > 140 ? "…" : ""}
+                        </p>
+                        <button
+                          className="btn btn-on w-full"
+                          disabled={!fixedBoxed.length || running > 0}
+                          onClick={() => {
+                            swap.onUseAsInput(true);
+                            swap.render.go();
+                            onClose();
+                          }}
+                        >
+                          Render with fixed frames · ~${swap.render.cost.toFixed(2)}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+            {swap && !wiz && (() => {
               const real = Array.from({ length: count }, (_, f) => f).filter((f) => info(f).piece >= 0);
               const done = real.filter((f) => swap.frames[f]).length;
               const left = real.length - done;
