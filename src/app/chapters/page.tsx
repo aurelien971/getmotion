@@ -2313,6 +2313,14 @@ export default function Chapters() {
             onDeleteTake={deleteTake}
             onDeletePart={deletePart}
             onCancel={cancelPart}
+            onBuildSent={async (pt) => {
+              try {
+                return URL.createObjectURL(await buildPartClip(pt));
+              } catch (e) {
+                setError(describe(e));
+                return null;
+              }
+            }}
             onRestoreTake={(id) => patchPart(id, { status: "done", error: undefined, live: undefined, progress: undefined })}
             onValidate={validateParts}
             onRestorePart={restorePart}
@@ -3479,6 +3487,7 @@ function RenderStep(props: {
   onDeletePart: (partId: string) => void;
   onCancel: (part: Part) => void;
   onRestoreTake: (partId: string) => void;
+  onBuildSent: (part: Part) => Promise<string | null>;
   onRestorePart: (partId: string) => void;
   onRestoreTakes: (partId: string) => void;
   onAttach: (partId: string) => void;
@@ -3968,6 +3977,7 @@ function RenderStep(props: {
                   take={take}
                   inUse={inUse}
                   editedInput={!!g.swapInput?.[partKey(pt)]}
+                  onBuildSent={() => props.onBuildSent(pt)}
                   onCheck={() => props.onCheck([pt.id])}
                   onInspect={() => props.onInspect(pt)}
                   onFix={(only) => props.onFix(pt, only)}
@@ -4720,7 +4730,9 @@ function PartRow({
   onRestore,
   inUse,
   editedInput,
+  onBuildSent,
 }: {
+  onBuildSent: () => Promise<string | null>; // object URL of the clip that gets uploaded
   editedInput?: boolean; // renders from frames fixed in Inspect
 
   inUse?: string; // another take of this part is the validated one
@@ -4769,6 +4781,24 @@ function PartRow({
   const padLen = part.clipLength - part.duration;
   const [open, setOpen] = useState(false);
   const [showPrompt, setShowPrompt] = useState(false);
+  // Preview of a part that renders from fixed frames: the real clip, built on demand.
+  const [sentUrl, setSentUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open || !editedInput) return;
+    let gone = false;
+    let url: string | null = null;
+    void onBuildSent().then((u) => {
+      if (gone) return;
+      url = u;
+      setSentUrl(u);
+    });
+    return () => {
+      gone = true;
+      if (url) URL.revokeObjectURL(url);
+      setSentUrl(null);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, editedInput]);
   return (
     <li className={`rounded-2xl ring-1 ring-hair p-3 space-y-3 ${take ? "ml-8" : ""}`}>
       <div className="flex flex-wrap items-center gap-4">
@@ -5026,7 +5056,18 @@ function PartRow({
         <div className="grid md:grid-cols-2 gap-4">
           <div className="space-y-1.5">
             <span className="text-[12px] text-muted">What gets sent{padLen > 0.05 ? ` (last ${fmtShort(padLen)} is loop filler, thrown away)` : ""}</span>
-            <ReelPlayer src={src} fps={fps} spans={part.pieces} className="aspect-video" />
+            {editedInput ? (
+              // Built from your fixed frames: play the exact file that gets uploaded, filler included.
+              sentUrl ? (
+                <video src={sentUrl} controls loop playsInline className="w-full aspect-video rounded-2xl bg-black ring-1 ring-hair" />
+              ) : (
+                <div className="aspect-video rounded-2xl ring-1 ring-hair bg-black grid place-items-center text-[12px] text-muted">
+                  Building the clip from your fixed frames…
+                </div>
+              )
+            ) : (
+              <ReelPlayer src={src} fps={fps} spans={part.pieces} className="aspect-video" />
+            )}
           </div>
           {part.resultUrl && (
             <div className="space-y-1.5">
