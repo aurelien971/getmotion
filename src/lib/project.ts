@@ -608,7 +608,8 @@ export function buildParts(p: Project, groupId: string): Part[] {
       : { id: uid(), groupId, pieces: pt.pieces, pad, duration: pt.duration, clipLength: len, status: "idle" as const };
   });
   // Renders that exist (or are running) stay, whatever span is selected.
-  const keep = old.filter((x) => x.status !== "idle" && x.status !== "failed");
+  // Re-roll copies stay whatever their state (only ✕ removes them), so a failed one shows why.
+  const keep = old.filter((x) => (x.status !== "idle" && x.status !== "failed") || x.rerollOf);
   return [...keep, ...fresh];
 }
 
