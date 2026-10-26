@@ -34,6 +34,7 @@ export type Group = {
   swapMode?: Record<string, "swap" | "edit">; // by partKey: swap people in, or edit the frame only (no reference photos)
   swapInput?: Record<string, boolean>;
   swapRegion?: Record<string, { x: number; y: number; w: number; h: number }>; // legacy: one box for every frame of the part
+  frameModel?: string; // image model used to fix frames (id from FRAME_MODELS)
   swapRegions?: Record<string, Record<number, { x: number; y: number; w: number; h: number }>>; // by partKey: clip frame → its box (0-1 of the frame); only that area is edited // by partKey: render from the edited frames instead of the original // by partKey: your edits to the frame-swap prompt // by partKey: clip frame → swapped image URL (Inspect → Swap)
   partPeople?: Record<string, number[]>; // by partKey: which swapped people (index into wardrobe.others) this render includes
   id: string;

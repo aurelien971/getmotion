@@ -146,11 +146,31 @@ export const MODELS: Model[] = [
 
 export const SUME_MODELS = MODELS.filter((m) => m.provider === "sume").map((m) => m.id);
 
-// Image editor used to swap him into single frames (Inspect → Swap).
-export const FRAME_SWAP = { id: "fal-ai/nano-banana-2/edit", name: "Nano Banana 2", usdPerFrame: 0.08 };
+// Image editors for fixing single frames in Inspect. `ratio` is the output aspect.
+export type FrameModel = {
+  id: string;
+  name: string;
+  usdPerFrame: number; // rough
+  build: (i: { prompt: string; imageUrls: string[]; ratio: string }) => Record<string, unknown>;
+};
+export const FRAME_MODELS: FrameModel[] = [
+  {
+    id: "fal-ai/nano-banana-2/edit",
+    name: "Nano Banana 2",
+    usdPerFrame: 0.08,
+    build: (i) => ({ prompt: i.prompt, image_urls: i.imageUrls, num_images: 1, resolution: "1K", aspect_ratio: i.ratio, output_format: "jpeg", seed: 4242 }),
+  },
+  {
+    id: "openai/gpt-image-2/edit",
+    name: "GPT Image 2 (OpenAI)",
+    usdPerFrame: 0.2, // token-billed; roughly this at high quality
+    build: (i) => ({ prompt: i.prompt, image_urls: i.imageUrls, num_images: 1, image_size: "auto", quality: "high", output_format: "jpeg" }),
+  },
+];
+export const FRAME_SWAP = FRAME_MODELS[0];
 
 export const ALLOWED_ENDPOINTS = [
   SAM2_VIDEO,
-  FRAME_SWAP.id,
+  ...FRAME_MODELS.map((m) => m.id),
   ...MODELS.filter((m) => m.provider === "fal").map((m) => m.id),
 ].flatMap((id) => [id, `${id}/**`]);

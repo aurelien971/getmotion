@@ -74,6 +74,10 @@ export function ClipInspector({
     onMode: (m: "swap" | "edit") => void;
     useAsInput: boolean; // the part renders from these frames
     onUseAsInput: (on: boolean) => void;
+    models: { id: string; name: string; price: number }[]; // image models to fix frames with
+    modelId: string;
+    onModel: (id: string) => void;
+    onPaste: (f: number, img: Blob) => void; // your own image replaces that frame
     // Final step of the guided fix: render the part from the fixed frames.
     render: { model: string; cost: number; prompt: string; go: () => void };
   };
@@ -230,6 +234,30 @@ export function ClipInspector({
     if (swap?.frames[sel]) swap.onRemove([sel]);
     advance();
   };
+  // ⌘V pastes an image onto the frame you're on.
+  useEffect(() => {
+    if (!swap) return;
+    const onPaste = (e: ClipboardEvent) => {
+      if (e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement) return;
+      const item = [...(e.clipboardData?.items ?? [])].find((x) => x.type.startsWith("image/"));
+      const file = item?.getAsFile();
+      if (file && info(sel).piece >= 0) {
+        e.preventDefault();
+        swap.onPaste(sel, file);
+      }
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  });
+  const pasteFromClipboard = async () => {
+    try {
+      for (const it of await navigator.clipboard.read()) {
+        const t = it.types.find((x) => x.startsWith("image/"));
+        if (t) return swap?.onPaste(sel, await it.getType(t));
+      }
+    } catch {}
+  };
+
   // Mark step keys: Enter = same box as before, S = no finger on this frame.
   useEffect(() => {
     if (wiz !== "mark") return;
@@ -267,7 +295,16 @@ export function ClipInspector({
         </header>
 
         <div className="grid md:grid-cols-[minmax(0,1fr)_360px] gap-5 items-start">
-          <div className="relative">
+          <div
+            className="relative"
+            onDragOver={(e) => swap && e.preventDefault()}
+            onDrop={(e) => {
+              const file = [...e.dataTransfer.files].find((x) => x.type.startsWith("image/"));
+              if (!swap || !file || info(sel).piece < 0) return;
+              e.preventDefault();
+              swap.onPaste(sel, file);
+            }}
+          >
             <video ref={player} src={url ?? undefined} controls playsInline className="w-full aspect-video rounded-2xl bg-black ring-1 ring-hair" />
             {swap && showSwapped && swap.frames[sel] && (
               // eslint-disable-next-line @next/next/no-img-element
@@ -382,6 +419,26 @@ export function ClipInspector({
               );
             })()}
             {thumbs.length < count && <p className="text-faint text-[11px]">Reading frames… {thumbs.length}/{count}</p>}
+            {swap && (
+              <div className="pt-3 mt-2 border-t border-hair space-y-2">
+                <div className="flex items-center justify-between text-[12px]">
+                  <span className="text-muted">Image model</span>
+                  <span className="text-faint text-[11px]">~${swap.price.toFixed(2)} / frame</span>
+                </div>
+                <div className="seg glass w-full grid grid-cols-2">
+                  {swap.models.map((m) => (
+                    <button key={m.id} className={swap.modelId === m.id ? "on" : ""} onClick={() => swap.onModel(m.id)}>
+                      {m.name}
+                    </button>
+                  ))}
+                </div>
+                {cur.piece >= 0 && (
+                  <button className="btn w-full" onClick={() => void pasteFromClipboard()} title="Or press ⌘V, or drop an image on the big view">
+                    Paste image on frame {sel} · ⌘V
+                  </button>
+                )}
+              </div>
+            )}
             {swap && !wiz && (
               <button
                 className="btn btn-on w-full mt-2"

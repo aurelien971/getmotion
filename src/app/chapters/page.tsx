@@ -13,7 +13,7 @@ import { RangePicker } from "@/components/RangePicker";
 import { ReelPlayer } from "@/components/ReelPlayer";
 import { SpotTrack } from "@/components/SpotTrack";
 import { submitFal, submitSume, waitFor, removeJob, transientError, Cancelled, type PendingJob } from "@/lib/jobs";
-import { FRAME_SWAP, MODELS } from "@/lib/models";
+import { FRAME_MODELS, FRAME_SWAP, MODELS } from "@/lib/models";
 import {
   buildParts,
   buildShots,
@@ -1329,17 +1329,10 @@ export default function Chapters() {
       const prompt = swapPromptFor(part, f);
       const ratios: [string, number][] = [["16:9", 16 / 9], ["4:3", 4 / 3], ["1:1", 1], ["3:4", 3 / 4], ["9:16", 9 / 16], ["21:9", 21 / 9]];
       const ratio = ratios.reduce((a, b) => (Math.abs(b[1] - p.width / p.height) < Math.abs(a[1] - p.width / p.height) ? b : a))[0];
-      const res = mock ? { data: { images: [{ url: await mock(sendBlob) }] } } : await fal.subscribe(FRAME_SWAP.id, {
-        input: {
-          prompt,
-          image_urls: [frameUrl, ...refUrls],
-          num_images: 1,
-          resolution: "1K",
-          aspect_ratio: box ? box.ratio : ratio,
-          output_format: "jpeg",
-          seed: 4242, // same seed for every frame keeps them closer to each other
-        },
-      });
+      const fm = FRAME_MODELS.find((m) => m.id === look.frameModel) ?? FRAME_SWAP;
+      const res = mock
+        ? { data: { images: [{ url: await mock(sendBlob) }] } }
+        : await fal.subscribe(fm.id, { input: fm.build({ prompt, imageUrls: [frameUrl, ...refUrls], ratio: box ? box.ratio : ratio }) });
       const out = (res.data as { images?: { url?: string }[] })?.images?.[0]?.url;
       if (!out) throw new Error("No image came back");
       // Region: paste the edited box back into the untouched frame.
@@ -1374,6 +1367,30 @@ export default function Chapters() {
         return { ...gg, frameSwaps: { ...gg.frameSwaps, [key]: m } };
       }),
     }));
+  }
+
+  // Your own image replaces a frame (e.g. made in ChatGPT): scaled to fill the frame.
+  async function pasteFrame(part: Part, f: number, img: Blob) {
+    try {
+      const bmp = await createImageBitmap(img);
+      const c = document.createElement("canvas");
+      c.width = p.width;
+      c.height = p.height;
+      const k = Math.max(c.width / bmp.width, c.height / bmp.height);
+      const w = bmp.width * k;
+      const h = bmp.height * k;
+      c.getContext("2d")!.drawImage(bmp, (c.width - w) / 2, (c.height - h) / 2, w, h);
+      const url = c.toDataURL("image/jpeg", 0.93);
+      const key = partKey(part);
+      update((x) => ({
+        ...x,
+        groups: x.groups.map((gg) =>
+          gg.id === part.groupId ? { ...gg, frameSwaps: { ...(gg.frameSwaps ?? {}), [key]: { ...(gg.frameSwaps?.[key] ?? {}), [f]: url } } } : gg,
+        ),
+      }));
+    } catch (e) {
+      setSwapErrors((x) => ({ ...x, [`${part.id}:${f}`]: `Couldn't read that image: ${describe(e)}` }));
+    }
   }
 
   async function swapAllFrames(part: Part, only?: number[]) {
@@ -2399,8 +2416,12 @@ export default function Chapters() {
               frames: look?.frameSwaps?.[partKey(part)] ?? {},
               busy: new Set([...swapping].filter((k) => k.startsWith(part.id + ":")).map((k) => +k.split(":")[1])),
               errors: Object.fromEntries(Object.entries(swapErrors).filter(([k]) => k.startsWith(part.id + ":")).map(([k, v]) => [+k.split(":")[1], v])),
-              price: FRAME_SWAP.usdPerFrame,
-              model: FRAME_SWAP.name,
+              price: (FRAME_MODELS.find((m) => m.id === look?.frameModel) ?? FRAME_SWAP).usdPerFrame,
+              model: (FRAME_MODELS.find((m) => m.id === look?.frameModel) ?? FRAME_SWAP).name,
+              models: FRAME_MODELS.map((m) => ({ id: m.id, name: m.name, price: m.usdPerFrame })),
+              modelId: look?.frameModel ?? FRAME_SWAP.id,
+              onModel: (id: string) => look && patchGroup(look.id, { frameModel: id }),
+              onPaste: (f: number, img: Blob) => void pasteFrame(part, f, img),
               building: !!tasks.swaptake,
               onSwap: (f: number) => void swapFrame(part, f),
               regionFor: (f: number) => regionOf(part, f),
