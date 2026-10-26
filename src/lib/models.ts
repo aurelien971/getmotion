@@ -35,6 +35,12 @@ function castPrompt(i: GenInput) {
   return [...lines, "Keep everyone else unchanged.", i.prompt].join(" ").trim();
 }
 
+// Kling names the clip @Video1 and character photos @Element1..N instead of "reference image N".
+function klingPrompt(i: GenInput) {
+  const base = castPrompt(i).replace(/reference images? (\d+)(?: to (\d+))?/gi, (_m, a, b) => (b ? `@Element${a} to @Element${b}` : `@Element${a}`));
+  return `Edit @Video1. ${base}`;
+}
+
 export const MODELS: Model[] = [
   {
     id: "fal-ai/wan-vace-14b",
@@ -118,6 +124,22 @@ export const MODELS: Model[] = [
       video_url: i.videoUrl,
       prompt: i.prompt,
       duration: clamp(i.duration, 5, 16),
+    }),
+  },
+  {
+    id: "fal-ai/kling-video/o3/pro/video-to-video/edit",
+    provider: "fal",
+    name: "Kling O3 Pro Edit",
+    note: "Kling's video editor: replaces a character with your photo, keeps motion, camera and light. 3-15 s clips.",
+    usesMask: false,
+    keepsAudio: false,
+    maxCast: 4,
+    usdPerSec: 0.168,
+    build: (i) => ({
+      video_url: i.videoUrl,
+      prompt: klingPrompt(i),
+      elements: i.cast.slice(0, 4).map((c) => ({ frontal_image_url: c.url, reference_image_urls: [c.url] })),
+      keep_audio: false,
     }),
   },
 ];
