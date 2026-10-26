@@ -29,6 +29,15 @@ export function ClipInspector({
     onSwap: (f: number) => void;
     onSwapAll: () => void;
     onMakeTake: () => void;
+    promptFor: (f: number) => string; // what will be sent for that frame
+    allPrompt: string;
+    allEdited: boolean;
+    frameEdited: (f: number) => boolean;
+    onEditAll: (text: string | null) => void; // null resets to the built prompt
+    onEditFrame: (f: number, text: string | null) => void; // null drops the frame's own prompt
+    images: string[]; // what image 1, 2, 3… are
+    people: { index: number; label: string; thumb?: string; on: boolean }[];
+    onTogglePerson: (index: number) => void;
   };
   file: Blob;
   fps: number; // the clip's frame rate
@@ -144,7 +153,7 @@ export function ClipInspector({
           <button className="btn" onClick={onClose}>Close</button>
         </header>
 
-        <div className="grid md:grid-cols-[minmax(0,1fr)_280px] gap-5 items-start">
+        <div className="grid md:grid-cols-[minmax(0,1fr)_360px] gap-5 items-start">
           <div className="relative">
             <video ref={player} src={url ?? undefined} controls playsInline className="w-full aspect-video rounded-2xl bg-black ring-1 ring-hair" />
             {swap && showSwapped && swap.frames[sel] && (
@@ -237,6 +246,64 @@ export function ClipInspector({
                     <label className="flex items-center gap-2 text-[12px] text-muted">
                       <input type="checkbox" checked={showSwapped} onChange={(e) => setShowSwapped(e.target.checked)} /> Show swapped frames
                     </label>
+                  )}
+                  {swap.people.length > 0 && (
+                    <div className="space-y-1.5 pt-1">
+                      <span className="text-muted text-[12px]">Also swap in this shot</span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {swap.people.map((x) => (
+                          <button
+                            key={x.index}
+                            onClick={() => swap.onTogglePerson(x.index)}
+                            title={x.label}
+                            className={`inline-flex items-center gap-1.5 h-7 pl-1 pr-2 rounded-full ring-1 text-[11px] ${x.on ? "ring-white bg-white/10" : "ring-hair opacity-50"}`}
+                          >
+                            {x.thumb ? (
+                              // eslint-disable-next-line @next/next/no-img-element
+                              <img src={x.thumb} alt="" className="w-5 h-5 rounded-full object-cover" />
+                            ) : null}
+                            <span className="max-w-32 truncate">{x.label.replace(/^(a|an|the) /i, "")}</span>
+                            {x.on ? "✓" : ""}
+                          </button>
+                        ))}
+                      </div>
+                      {!swap.people.some((x) => x.on) && <p className="text-faint text-[11px]">Only him.</p>}
+                    </div>
+                  )}
+                  <p className="text-faint text-[11px] leading-relaxed">
+                    {swap.images.map((x, k) => `Image ${k + 1} = ${x}`).join(" · ")}
+                  </p>
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between text-[12px]">
+                      <span className="text-muted">Prompt · all frames{swap.allEdited ? " · edited" : ""}</span>
+                      {swap.allEdited && (
+                        <button className="text-faint hover:text-ink text-[11px]" onClick={() => swap.onEditAll(null)}>Reset</button>
+                      )}
+                    </div>
+                    <textarea
+                      className="w-full min-h-36 rounded-lg bg-black/40 ring-1 ring-hair p-2 text-[12px] leading-relaxed"
+                      value={swap.allPrompt}
+                      onChange={(e) => swap.onEditAll(e.target.value)}
+                    />
+                  </div>
+                  {cur.piece >= 0 && (
+                    <div className="space-y-1">
+                      <label className="flex items-center gap-2 text-[12px] text-muted">
+                        <input
+                          type="checkbox"
+                          checked={swap.frameEdited(sel)}
+                          onChange={(e) => swap.onEditFrame(sel, e.target.checked ? swap.promptFor(sel) : null)}
+                        />
+                        Custom prompt for frame {sel}
+                      </label>
+                      {swap.frameEdited(sel) && (
+                        <textarea
+                          className="w-full min-h-28 rounded-lg bg-black/40 ring-1 ring-hair p-2 text-[12px] leading-relaxed"
+                          value={swap.promptFor(sel)}
+                          onChange={(e) => swap.onEditFrame(sel, e.target.value)}
+                        />
+                      )}
+                    </div>
                   )}
                 </div>
               );

@@ -1196,6 +1196,40 @@ export default function Chapters() {
   };
   const clipFrames = (part: Part) => Math.round(part.duration * p.fps);
 
+  // The frame-swap prompt built from the look and the people picked for this part.
+  function swapDefaultPrompt(part: Part) {
+    const look = p.groups.find((x) => x.id === part.groupId);
+    if (!look) return "";
+    const g = groupForPart(look, part);
+    const n = Math.max(1, refsOf(p, g).length);
+    const base = defaultPrompt(g, n).replace(/reference images? (\d+)(?: to (\d+))?/gi, (_m, a, b) => (b ? `images ${+a + 1} to ${+b + 1}` : `image ${+a + 1}`));
+    return [
+      "Image 1 is a single frame from a music video. Edit image 1 only; the other images are reference photos.",
+      base,
+      "Return image 1 with only those people changed: the same framing, crop, pose, hand positions, motion blur, focus, lens flares, haze, lighting and colors, and every other person exactly as in image 1.",
+    ].join(" ");
+  }
+  const swapPromptFor = (part: Part, f: number) => {
+    const ed = p.groups.find((x) => x.id === part.groupId)?.swapPrompts?.[partKey(part)];
+    return ed?.frames?.[f] ?? ed?.all ?? swapDefaultPrompt(part);
+  };
+  function editSwapPrompt(part: Part, f: number | null, text: string | null) {
+    const key = partKey(part);
+    update((x) => ({
+      ...x,
+      groups: x.groups.map((gg) => {
+        if (gg.id !== part.groupId) return gg;
+        const cur = gg.swapPrompts?.[key] ?? {};
+        const frames = { ...(cur.frames ?? {}) };
+        let all = cur.all;
+        if (f === null) all = text ?? undefined;
+        else if (text === null) delete frames[f];
+        else frames[f] = text;
+        return { ...gg, swapPrompts: { ...(gg.swapPrompts ?? {}), [key]: { all, frames } } };
+      }),
+    }));
+  }
+
   async function swapFrame(part: Part, f: number) {
     const look = p.groups.find((x) => x.id === part.groupId);
     const t = clipFrameSource(part, f);
@@ -1214,14 +1248,7 @@ export default function Chapters() {
       const mock = process.env.NODE_ENV !== "production" ? (window as unknown as { __mockSwap?: (b: Blob) => Promise<string> }).__mockSwap : undefined;
       const frameUrl = mock ? "" : await uploadOnce(`frame:${partKey(part)}:${f}`, stillBlob, `frame-${f}.jpg`);
       const refUrls = mock ? [] : await Promise.all(refs.map((r) => uploadOnce(`ref:${r.name}:${r.blob.size}`, r.blob, r.name)));
-      const base = defaultPrompt(g, photos.length).replace(/reference images? (\d+)(?: to (\d+))?/gi, (_m, a, b) =>
-        b ? `images ${+a + 1} to ${+b + 1}` : `image ${+a + 1}`,
-      );
-      const prompt = [
-        "Image 1 is a single frame from a music video. Edit image 1 only; the other images are reference photos.",
-        base,
-        "Return image 1 with only those people changed: the same framing, crop, pose, hand positions, motion blur, focus, lens flares, haze, lighting and colors, and every other person exactly as in image 1.",
-      ].join(" ");
+      const prompt = swapPromptFor(part, f);
       const ratios: [string, number][] = [["16:9", 16 / 9], ["4:3", 4 / 3], ["1:1", 1], ["3:4", 3 / 4], ["9:16", 9 / 16], ["21:9", 21 / 9]];
       const ratio = ratios.reduce((a, b) => (Math.abs(b[1] - p.width / p.height) < Math.abs(a[1] - p.width / p.height) ? b : a))[0];
       const res = mock ? { data: { images: [{ url: await mock(stillBlob) }] } } : await fal.subscribe(FRAME_SWAP.id, {
@@ -2274,6 +2301,27 @@ export default function Chapters() {
               model: FRAME_SWAP.name,
               building: !!tasks.swaptake,
               onSwap: (f: number) => void swapFrame(part, f),
+              promptFor: (f: number) => swapPromptFor(part, f),
+              allPrompt: look?.swapPrompts?.[partKey(part)]?.all ?? swapDefaultPrompt(part),
+              allEdited: !!look?.swapPrompts?.[partKey(part)]?.all,
+              frameEdited: (f: number) => look?.swapPrompts?.[partKey(part)]?.frames?.[f] !== undefined,
+              onEditAll: (t: string | null) => editSwapPrompt(part, null, t),
+              onEditFrame: (f: number, t: string | null) => editSwapPrompt(part, f, t),
+              images: (() => {
+                if (!look) return [];
+                const g = groupForPart(look, part);
+                const lead = refsOf(p, g).map((r, k) => `${look.name}: him${refsOf(p, g).length > 1 ? ` (${k + 1})` : ""}`);
+                const others = partPeople(look, part).map((i) => (look.wardrobe?.others?.[i]?.label ?? "person").replace(/^(a|an|the) /i, ""));
+                return ["this frame", ...lead, ...others];
+              })(),
+              people: (look?.wardrobe?.others ?? []).flatMap((o, i) => (o.faceId ? [{ index: i, label: o.label, thumb: o.thumb, on: partPeople(look!, part).includes(i) }] : [])),
+              onTogglePerson: (i: number) => {
+                if (!look) return;
+                const key = partKey(part);
+                const cur = partPeople(look, part);
+                const next = cur.includes(i) ? cur.filter((x) => x !== i) : [...cur, i].sort((a, b) => a - b);
+                patchGroup(look.id, { partPeople: { ...(look.partPeople ?? {}), [key]: next } });
+              },
               onSwapAll: () => void swapAllFrames(part),
               onMakeTake: () => void takeFromFrames(part),
             };

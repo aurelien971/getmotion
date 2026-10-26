@@ -29,7 +29,8 @@ export type ScenePrompt = {
 export type Group = {
   partPrompts?: Record<string, ScenePrompt>; // by partKey
   accepted?: Interval[]; // leftover footage the user validated as fine without a render
-  frameSwaps?: Record<string, Record<number, string>>; // by partKey: clip frame → swapped image URL (Inspect → Swap)
+  frameSwaps?: Record<string, Record<number, string>>;
+  swapPrompts?: Record<string, { all?: string; frames?: Record<number, string> }>; // by partKey: your edits to the frame-swap prompt // by partKey: clip frame → swapped image URL (Inspect → Swap)
   partPeople?: Record<string, number[]>; // by partKey: which swapped people (index into wardrobe.others) this render includes
   id: string;
   name: string;
