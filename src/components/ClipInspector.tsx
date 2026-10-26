@@ -7,6 +7,7 @@ type Piece = { start: number; end: number; offset: number };
 const fmt = (s: number) => `${Math.floor(s / 60)}:${(s % 60).toFixed(2).padStart(5, "0")}`;
 
 type Box = { x: number; y: number; w: number; h: number };
+type Adj = { s: number; dx: number; dy: number; ar?: number };
 
 // What the guided gesture fix turns the middle finger into.
 const GESTURES = [
@@ -78,6 +79,11 @@ export function ClipInspector({
     modelId: string;
     onModel: (id: string) => void;
     onPaste: (f: number, img: Blob) => void; // your own image replaces that frame
+    adjustFor: (f: number) => Adj; // how a fixed frame is lined up over the original
+    onAdjust: (f: number, a: Adj) => void;
+    onAutoAlign: (f: number) => void;
+    ok: number[]; // fixed frames you validated
+    onOk: (f: number, on: boolean) => void;
     // Final step of the guided fix: render the part from the fixed frames.
     render: { model: string; cost: number; prompt: string; go: () => void };
   };
@@ -113,6 +119,10 @@ export function ClipInspector({
   const [customFix, setCustomFix] = useState("");
   const [lastBox, setLastBox] = useState<Box | null>(null);
   const [fixStarted, setFixStarted] = useState(false);
+  // Review: see the fixed frame over the original and line it up.
+  const [opacity, setOpacity] = useState(100);
+  const [moving, setMoving] = useState<{ x: number; y: number; a: Adj } | null>(null);
+  const [live, setLive] = useState<Adj | null>(null); // adjustment while dragging
   const [drag, setDrag] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
   const [anchor, setAnchor] = useState<number | null>(null);
   const pick = (f: number, e: { shiftKey: boolean; metaKey: boolean; ctrlKey: boolean }) => {
@@ -258,6 +268,21 @@ export function ClipInspector({
     } catch {}
   };
 
+  // Review: V validates this fixed frame and jumps to the next fixed one.
+  useEffect(() => {
+    if (!swap) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement) return;
+      if ((e.key === "v" || e.key === "V") && swap.frames[sel]) {
+        swap.onOk(sel, true);
+        const next = Object.keys(swap.frames).map(Number).sort((x, y) => x - y).find((f) => f > sel);
+        if (next !== undefined) setSel(next);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
   // Mark step keys: Enter = same box as before, S = no finger on this frame.
   useEffect(() => {
     if (wiz !== "mark") return;
@@ -306,9 +331,42 @@ export function ClipInspector({
             }}
           >
             <video ref={player} src={url ?? undefined} controls playsInline className="w-full aspect-video rounded-2xl bg-black ring-1 ring-hair" />
-            {swap && showSwapped && swap.frames[sel] && (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={swap.frames[sel]} alt="" className="absolute inset-0 w-full h-full object-contain rounded-2xl bg-black pointer-events-none" />
+            {swap && showSwapped && swap.frames[sel] && (() => {
+              const a = live ?? swap.adjustFor(sel);
+              return (
+                <div className="absolute inset-0 rounded-2xl overflow-hidden pointer-events-none">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={swap.frames[sel]}
+                    alt=""
+                    className="absolute inset-0 w-full h-full object-fill"
+                    style={{
+                      opacity: opacity / 100,
+                      transform: `translate(${a.dx * 100}%, ${a.dy * 100}%) scale(${a.s}, ${a.s * (a.ar ?? 1)})`,
+                    }}
+                  />
+                </div>
+              );
+            })()}
+            {swap && showSwapped && swap.frames[sel] && !drawing && (
+              <div
+                className="absolute inset-0 rounded-2xl cursor-move"
+                title="Drag to move the fixed frame"
+                onPointerDown={(e) => {
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                  setMoving({ x: e.clientX, y: e.clientY, a: swap.adjustFor(sel) });
+                }}
+                onPointerMove={(e) => {
+                  if (!moving) return;
+                  const b = e.currentTarget.getBoundingClientRect();
+                  setLive({ ...moving.a, dx: moving.a.dx + (e.clientX - moving.x) / b.width, dy: moving.a.dy + (e.clientY - moving.y) / b.height });
+                }}
+                onPointerUp={() => {
+                  if (live) swap.onAdjust(sel, live);
+                  setMoving(null);
+                  setLive(null);
+                }}
+              />
             )}
             {swap && showSwapped && swap.frames[sel] && (
               <span className="absolute left-3 top-3 text-[11px] bg-black/60 rounded-full px-2 py-0.5">Swapped frame</span>
@@ -439,6 +497,68 @@ export function ClipInspector({
                 )}
               </div>
             )}
+            {swap && swap.frames[sel] && (() => {
+              const a = swap.adjustFor(sel);
+              const ar = a.ar ?? 1;
+              const set = (x: Partial<Adj>) => swap.onAdjust(sel, { ...a, ...x });
+              const fixedList = Object.keys(swap.frames).map(Number).sort((x, y) => x - y);
+              const next = fixedList.find((f) => f > sel);
+              const isOk = swap.ok.includes(sel);
+              return (
+                <div className={`rounded-xl ring-1 p-3 mt-2 space-y-2 text-[12px] ${isOk ? "ring-[#86efac]/60" : "ring-hair"}`}>
+                  <div className="flex items-center justify-between">
+                    <span>Review frame {sel}</span>
+                    <span className="text-faint text-[11px]">{swap.ok.filter((f) => swap.frames[f]).length}/{fixedList.length} validated</span>
+                  </div>
+                  <label className="block space-y-1">
+                    <span className="flex justify-between text-muted"><span>New over original</span><span className="tabular-nums">{opacity}%</span></span>
+                    <input type="range" min={0} max={100} value={opacity} onChange={(e) => setOpacity(+e.target.value)} className="w-full" />
+                  </label>
+                  <label className="block space-y-1">
+                    <span className="flex justify-between text-muted">
+                      <span>Scale</span>
+                      <span className="tabular-nums text-ink">×{a.s.toFixed(3)}</span>
+                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <button className="btn h-6 px-2 text-[11px]" onClick={() => set({ s: +(a.s - 0.002).toFixed(4) })}>−</button>
+                      <input type="range" min={0.8} max={1.25} step={0.001} value={a.s} onChange={(e) => set({ s: +e.target.value })} className="flex-1" />
+                      <button className="btn h-6 px-2 text-[11px]" onClick={() => set({ s: +(a.s + 0.002).toFixed(4) })}>+</button>
+                    </div>
+                  </label>
+                  <label className="block space-y-1">
+                    <span className="flex justify-between text-muted">
+                      <span>Stretch (height)</span>
+                      <span className="tabular-nums text-ink">×{ar.toFixed(3)}</span>
+                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <button className="btn h-6 px-2 text-[11px]" onClick={() => set({ ar: +(ar - 0.002).toFixed(4) })}>−</button>
+                      <input type="range" min={0.8} max={1.25} step={0.001} value={ar} onChange={(e) => set({ ar: +e.target.value })} className="flex-1" />
+                      <button className="btn h-6 px-2 text-[11px]" onClick={() => set({ ar: +(ar + 0.002).toFixed(4) })}>+</button>
+                    </div>
+                  </label>
+                  <p className="text-faint text-[11px] tabular-nums">
+                    Offset x {(a.dx * 100).toFixed(2)}% · y {(a.dy * 100).toFixed(2)}% · drag the picture to move
+                  </p>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button className="btn" onClick={() => swap.onAutoAlign(sel)}>Auto-align</button>
+                    <button className="btn" onClick={() => swap.onAdjust(sel, { s: 1, ar: 1, dx: 0, dy: 0 })}>Reset</button>
+                  </div>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button className={`btn ${isOk ? "" : "btn-on"}`} onClick={() => swap.onOk(sel, !isOk)}>{isOk ? "✓ Validated" : "Validate"}</button>
+                    <button
+                      className="btn btn-on"
+                      disabled={next === undefined && isOk}
+                      onClick={() => {
+                        swap.onOk(sel, true);
+                        if (next !== undefined) setSel(next);
+                      }}
+                    >
+                      {next === undefined ? "Validate" : "Validate & next · V"}
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
             {swap && !wiz && (
               <button
                 className="btn btn-on w-full mt-2"
@@ -798,7 +918,12 @@ export function ClipInspector({
                       // eslint-disable-next-line @next/next/no-img-element
                       <img src={swap && showSwapped && swap.frames[f] ? swap.frames[f] : thumbs[f]} alt="" className="absolute inset-0 w-full h-full object-cover" />
                     )}
-                    {swap?.frames[f] && <span className="absolute right-1 top-1 w-2 h-2 rounded-full bg-[#86efac]" title="Swapped" />}
+                    {swap?.frames[f] &&
+                      (swap.ok.includes(f) ? (
+                        <span className="absolute right-0.5 top-0.5 w-3.5 h-3.5 rounded-full bg-[#86efac] text-black text-[9px] leading-[14px] text-center font-semibold" title="Validated">✓</span>
+                      ) : (
+                        <span className="absolute right-1 top-1 w-2 h-2 rounded-full bg-[#86efac]" title="Fixed, not validated yet" />
+                      ))}
                     {swap?.errors[f] && !swap.frames[f] && <span className="absolute right-1 top-1 w-2 h-2 rounded-full bg-[#fca5a5]" title={swap.errors[f]} />}
                     {swap?.boxed.includes(f) && (
                       <span className="absolute left-1 top-1 w-3 h-2.5 rounded-[2px] ring-[1.5px] ring-[#7dd3fc]" title="Has a box" />

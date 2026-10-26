@@ -1114,7 +1114,9 @@ export default function Chapters() {
     const key =
       partKey(part) +
       `#${part.pad.map((x) => `${x.start.toFixed(3)}${x.reverse ? "r" : ""}`).join(",")}#mute` +
-      (edited ? `#edited:${Object.entries(edited).map(([f, u]) => `${f}=${u.slice(-12)}`).join(",")}` : "");
+      (edited
+        ? `#edited:${Object.entries(edited).map(([f, u]) => `${f}=${u.slice(-12)}`).join(",")}#adj:${JSON.stringify(look?.frameAdjust?.[partKey(part)] ?? {})}`
+        : "");
     const hit = clipCache.current.get(key);
     if (hit) return hit;
     const h = Math.min(720, p.height);
@@ -1139,9 +1141,13 @@ export default function Chapters() {
         const f = frameOf(sourceTimes[i]);
         let b: Blob | undefined = cache.get(f);
         if (!b) {
-          b = (edited[f]
-            ? await fetch(edited[f]).then((r) => r.blob())
-            : await fetch((await grabFrames(srcUrl, [sourceTimes[i]], p.width))[0]).then((r) => r.blob())) as Blob;
+          const orig = async () => (await fetch((await grabFrames(srcUrl, [sourceTimes[i]], p.width))[0]).then((r) => r.blob())) as Blob;
+          const adj = look?.frameAdjust?.[partKey(part)]?.[f];
+          b = edited[f]
+            ? isIdentity(adj)
+              ? ((await fetch(edited[f]).then((r) => r.blob())) as Blob)
+              : await composeAdjusted((await fetch(edited[f]).then((r) => r.blob())) as Blob, await orig(), adj!, p.width, p.height)
+            : await orig();
           cache.set(f, b);
         }
         frames.push(b!);
@@ -1341,7 +1347,7 @@ export default function Chapters() {
       update((x) => ({
         ...x,
         groups: x.groups.map((gg) =>
-          gg.id === look.id ? { ...gg, frameSwaps: { ...(gg.frameSwaps ?? {}), [key]: { ...(gg.frameSwaps?.[key] ?? {}), [f]: url } } } : gg,
+          gg.id === look.id ? withFrame(gg, key, f, url) : gg,
         ),
       }));
     } catch (e) {
@@ -1363,29 +1369,67 @@ export default function Chapters() {
       groups: x.groups.map((gg) => {
         if (gg.id !== part.groupId || !gg.frameSwaps?.[key]) return gg;
         const m = { ...gg.frameSwaps[key] };
-        for (const f of frames) delete m[f];
-        return { ...gg, frameSwaps: { ...gg.frameSwaps, [key]: m } };
+        const adj = { ...(gg.frameAdjust?.[key] ?? {}) };
+        for (const f of frames) {
+          delete m[f];
+          delete adj[f];
+        }
+        const ok = (gg.frameOk?.[key] ?? []).filter((x) => !frames.includes(x));
+        return {
+          ...gg,
+          frameSwaps: { ...gg.frameSwaps, [key]: m },
+          frameAdjust: { ...(gg.frameAdjust ?? {}), [key]: adj },
+          frameOk: { ...(gg.frameOk ?? {}), [key]: ok },
+        };
       }),
     }));
   }
 
-  // Your own image replaces a frame (e.g. made in ChatGPT): scaled to fill the frame.
+  // A new image for a frame starts unadjusted and not yet validated.
+  const withFrame = (gg: Group, key: string, f: number, url: string): Group => {
+    const adj = { ...(gg.frameAdjust?.[key] ?? {}) };
+    delete adj[f];
+    return {
+      ...gg,
+      frameSwaps: { ...(gg.frameSwaps ?? {}), [key]: { ...(gg.frameSwaps?.[key] ?? {}), [f]: url } },
+      frameAdjust: { ...(gg.frameAdjust ?? {}), [key]: adj },
+      frameOk: { ...(gg.frameOk ?? {}), [key]: (gg.frameOk?.[key] ?? []).filter((x) => x !== f) },
+    };
+  };
+
+  // Auto-align a fixed frame with the original and store the result as its adjustment.
+  async function alignFrame(part: Part, f: number, url?: string) {
+    const look = p.groups.find((x) => x.id === part.groupId);
+    const img = url ?? look?.frameSwaps?.[partKey(part)]?.[f];
+    const t = clipFrameSource(part, f);
+    if (!img || !srcUrl || t === null) return;
+    const [still] = await grabFrames(srcUrl, [t], p.width);
+    const a = await autoAlign((await fetch(img).then((r) => r.blob())) as Blob, await (await fetch(still)).blob());
+    const key = partKey(part);
+    update((x) => ({
+      ...x,
+      groups: x.groups.map((gg) =>
+        gg.id === part.groupId ? { ...gg, frameAdjust: { ...(gg.frameAdjust ?? {}), [key]: { ...(gg.frameAdjust?.[key] ?? {}), [f]: a } } } : gg,
+      ),
+    }));
+  }
+
+  // Your own image replaces a frame (e.g. made in ChatGPT); it's then lined up with the original.
   async function pasteFrame(part: Part, f: number, img: Blob) {
     try {
       const bmp = await createImageBitmap(img);
       const c = document.createElement("canvas");
       c.width = p.width;
       c.height = p.height;
-      const k = Math.max(c.width / bmp.width, c.height / bmp.height);
-      const w = bmp.width * k;
-      const h = bmp.height * k;
-      c.getContext("2d")!.drawImage(bmp, (c.width - w) / 2, (c.height - h) / 2, w, h);
+      // Keep the whole pasted image (no crop): fill the frame, then line it up automatically.
+      c.getContext("2d")!.drawImage(bmp, 0, 0, c.width, c.height);
       const url = c.toDataURL("image/jpeg", 0.93);
       const key = partKey(part);
+      void alignFrame(part, f, url);
       update((x) => ({
         ...x,
         groups: x.groups.map((gg) =>
-          gg.id === part.groupId ? { ...gg, frameSwaps: { ...(gg.frameSwaps ?? {}), [key]: { ...(gg.frameSwaps?.[key] ?? {}), [f]: url } } } : gg,
+          gg.id === part.groupId ? withFrame(gg, key, f, url) : gg,
         ),
       }));
     } catch (e) {
@@ -1419,7 +1463,11 @@ export default function Chapters() {
     try {
       const frames: Blob[] = [];
       for (let f = 0; f < n; f++) {
-        if (have[f]) frames.push(await fetch(have[f]).then((r) => r.blob()));
+        const adj = look.frameAdjust?.[partKey(part)]?.[f];
+        if (have[f] && !isIdentity(adj)) {
+          const [still] = await grabFrames(srcUrl, [clipFrameSource(part, f) ?? 0], p.width);
+          frames.push(await composeAdjusted((await fetch(have[f]).then((r) => r.blob())) as Blob, await (await fetch(still)).blob(), adj!, p.width, p.height));
+        } else if (have[f]) frames.push(await fetch(have[f]).then((r) => r.blob()));
         else {
           const [still] = await grabFrames(srcUrl, [clipFrameSource(part, f) ?? 0], p.width);
           frames.push(await (await fetch(still)).blob());
@@ -2422,6 +2470,20 @@ export default function Chapters() {
               modelId: look?.frameModel ?? FRAME_SWAP.id,
               onModel: (id: string) => look && patchGroup(look.id, { frameModel: id }),
               onPaste: (f: number, img: Blob) => void pasteFrame(part, f, img),
+              onAutoAlign: (f: number) => void alignFrame(part, f),
+              adjustFor: (f: number) => ({ ar: 1, ...(look?.frameAdjust?.[partKey(part)]?.[f] ?? { s: 1, dx: 0, dy: 0 }) }),
+              onAdjust: (f: number, a: { s: number; dx: number; dy: number; ar?: number }) => {
+                if (!look) return;
+                const key = partKey(part);
+                patchGroup(look.id, { frameAdjust: { ...(look.frameAdjust ?? {}), [key]: { ...(look.frameAdjust?.[key] ?? {}), [f]: a } } });
+              },
+              ok: look?.frameOk?.[partKey(part)] ?? [],
+              onOk: (f: number, on: boolean) => {
+                if (!look) return;
+                const key = partKey(part);
+                const cur = look.frameOk?.[key] ?? [];
+                patchGroup(look.id, { frameOk: { ...(look.frameOk ?? {}), [key]: on ? [...new Set([...cur, f])] : cur.filter((x) => x !== f) } });
+              },
               building: !!tasks.swaptake,
               onSwap: (f: number) => void swapFrame(part, f),
               regionFor: (f: number) => regionOf(part, f),
@@ -2610,6 +2672,93 @@ async function pasteBack(frame: Blob, edited: Blob, b: { x: number; y: number; w
   tc.drawImage(mask, 0, 0);
   ctx.drawImage(t, b.x, b.y);
   return c.toDataURL("image/jpeg", 0.93);
+}
+
+// A fixed frame lined up by hand: scaled around the center and shifted, over the
+// original so any edge the resize uncovers shows the original.
+type Adjust = { s: number; dx: number; dy: number; ar?: number };
+const isIdentity = (a?: Adjust) =>
+  !a || (Math.abs(a.s - 1) < 1e-4 && Math.abs((a.ar ?? 1) - 1) < 1e-4 && Math.abs(a.dx) < 1e-4 && Math.abs(a.dy) < 1e-4);
+
+// Line a fixed frame up with the original automatically: search scale, stretch and
+// offset for the best match over everything the two share (most of the picture).
+async function autoAlign(fixed: Blob, original: Blob): Promise<Adjust> {
+  const W = 128;
+  const H = 72;
+  const [f, o] = await Promise.all([createImageBitmap(fixed), createImageBitmap(original)]);
+  const luma = (d: Uint8ClampedArray) => {
+    const y = new Float32Array(W * H);
+    for (let i = 0; i < y.length; i++) y[i] = d[i * 4] * 0.299 + d[i * 4 + 1] * 0.587 + d[i * 4 + 2] * 0.114;
+    return y;
+  };
+  const c = document.createElement("canvas");
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext("2d", { willReadFrequently: true })!;
+  ctx.drawImage(o, 0, 0, W, H);
+  const ref = luma(ctx.getImageData(0, 0, W, H).data);
+  // Correlation over the pixels the moved image covers only, so shrinking isn't rewarded.
+  const score = (a: Adjust) => {
+    const w = W * a.s;
+    const h = H * a.s * (a.ar ?? 1);
+    const x0 = (W - w) / 2 + a.dx * W;
+    const y0 = (H - h) / 2 + a.dy * H;
+    ctx.clearRect(0, 0, W, H);
+    ctx.drawImage(f, x0, y0, w, h);
+    const cur = luma(ctx.getImageData(0, 0, W, H).data);
+    const xa = Math.max(0, Math.ceil(x0));
+    const xb = Math.min(W, Math.floor(x0 + w));
+    const ya = Math.max(0, Math.ceil(y0));
+    const yb = Math.min(H, Math.floor(y0 + h));
+    let n = 0, sa = 0, sb = 0;
+    for (let y = ya; y < yb; y++) for (let x = xa; x < xb; x++) { sa += cur[y * W + x]; sb += ref[y * W + x]; n++; }
+    if (n < W * H * 0.5) return -1;
+    const ma = sa / n, mb = sb / n;
+    let ab = 0, aa = 0, bb = 0;
+    for (let y = ya; y < yb; y++)
+      for (let x = xa; x < xb; x++) {
+        const p = cur[y * W + x] - ma;
+        const q = ref[y * W + x] - mb;
+        ab += p * q;
+        aa += p * p;
+        bb += q * q;
+      }
+    return ab / Math.sqrt(aa * bb || 1);
+  };
+  let best: Adjust = { s: 1, ar: 1, dx: 0, dy: 0 };
+  let bestScore = score(best);
+  const keys = ["s", "ar", "dx", "dy"] as const;
+  const step = { s: 0.08, ar: 0.08, dx: 0.04, dy: 0.04 };
+  for (let round = 0; round < 7; round++) {
+    let moved = true;
+    while (moved) {
+      moved = false;
+      for (const k of keys)
+        for (const dir of [-1, 1]) {
+          const t = { ...best, [k]: (best[k] ?? 1) + dir * step[k] };
+          const sc = score(t);
+          if (sc > bestScore + 1e-5) {
+            best = t;
+            bestScore = sc;
+            moved = true;
+          }
+        }
+    }
+    for (const k of keys) step[k] /= 2;
+  }
+  return best;
+}
+async function composeAdjusted(fixed: Blob, original: Blob, a: Adjust, W: number, H: number) {
+  const [f, o] = await Promise.all([createImageBitmap(fixed), createImageBitmap(original)]);
+  const c = document.createElement("canvas");
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext("2d")!;
+  ctx.drawImage(o, 0, 0, W, H);
+  const w = W * a.s;
+  const h = H * a.s * (a.ar ?? 1);
+  ctx.drawImage(f, (W - w) / 2 + a.dx * W, (H - h) / 2 + a.dy * H, w, h);
+  return new Promise<Blob>((res) => c.toBlob((b) => res(b!), "image/jpeg", 0.93));
 }
 
 // Full-size stills at given source times, for Claude to look at.
