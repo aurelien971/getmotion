@@ -41,8 +41,9 @@ export function ClipInspector({
     images: string[]; // what image 1, 2, 3… are
     people: { index: number; label: string; thumb?: string; on: boolean }[];
     onTogglePerson: (index: number) => void;
-    region: { x: number; y: number; w: number; h: number } | null; // only this box is edited (0-1 of the frame)
-    onRegion: (r: { x: number; y: number; w: number; h: number } | null) => void;
+    regionFor: (f: number) => { x: number; y: number; w: number; h: number } | null; // that frame's box (0-1 of the frame)
+    boxed: number[]; // frames that have a box
+    onRegion: (frames: number[], r: { x: number; y: number; w: number; h: number } | null) => void;
     mode: "swap" | "edit"; // edit: fix the frame only (no photos); swap: put people in
     onMode: (m: "swap" | "edit") => void;
     useAsInput: boolean; // the part renders from these frames
@@ -195,10 +196,10 @@ export function ClipInspector({
             {swap && showSwapped && swap.frames[sel] && (
               <span className="absolute left-3 top-3 text-[11px] bg-black/60 rounded-full px-2 py-0.5">Swapped frame</span>
             )}
-            {swap && (drawing || swap.region) && (() => {
+            {swap && (drawing || swap.regionFor(sel)) && (() => {
               const r = drag
                 ? { x: Math.min(drag.x0, drag.x1), y: Math.min(drag.y0, drag.y1), w: Math.abs(drag.x1 - drag.x0), h: Math.abs(drag.y1 - drag.y0) }
-                : swap.region;
+                : swap.regionFor(sel);
               const at = (e: React.PointerEvent<HTMLDivElement>) => {
                 const b = e.currentTarget.getBoundingClientRect();
                 return { x: Math.min(1, Math.max(0, (e.clientX - b.left) / b.width)), y: Math.min(1, Math.max(0, (e.clientY - b.top) / b.height)) };
@@ -216,7 +217,9 @@ export function ClipInspector({
                   onPointerUp={() => {
                     if (drag) {
                       const box = { x: Math.min(drag.x0, drag.x1), y: Math.min(drag.y0, drag.y1), w: Math.abs(drag.x1 - drag.x0), h: Math.abs(drag.y1 - drag.y0) };
-                      if (box.w > 0.02 && box.h > 0.02) swap.onRegion(box);
+                      // The box goes on the selected frames, or on this frame when nothing is selected.
+                      const targets = picked.size ? [...picked].filter((f) => info(f).piece >= 0) : [sel];
+                      if (box.w > 0.02 && box.h > 0.02) swap.onRegion(targets, box);
                     }
                     setDrag(null);
                     setDrawing(false);
@@ -229,7 +232,9 @@ export function ClipInspector({
                     />
                   )}
                   {drawing && !drag && (
-                    <span className="absolute left-1/2 top-3 -translate-x-1/2 text-[12px] bg-black/70 rounded-full px-3 py-1">Drag a box around the area to change</span>
+                    <span className="absolute left-1/2 top-3 -translate-x-1/2 text-[12px] bg-black/70 rounded-full px-3 py-1">
+                      Drag a box around the area to change{picked.size ? ` · goes on ${picked.size} selected frames` : ` · frame ${sel}`}
+                    </span>
                   )}
                 </div>
               );
@@ -316,15 +321,32 @@ export function ClipInspector({
                     </div>
                     <div className="flex items-center gap-2 text-[12px]">
                       <span className="flex-1 text-muted">
-                        {swap.region ? "Only the blue box changes; the rest stays identical" : "Whole frame (or draw a box to change only an area)"}
+                        {swap.regionFor(sel) ? `Frame ${sel}: only its box changes` : `Frame ${sel}: no box (whole frame)`}
                       </span>
                       <button className={`btn h-7 px-2.5 text-[11px] ${drawing ? "btn-on" : ""}`} onClick={() => setDrawing((d) => !d)}>
-                        {drawing ? "Drawing…" : swap.region ? "Redraw box" : "Draw box"}
+                        {drawing ? "Drawing…" : picked.size ? `Box on ${picked.size} selected` : swap.regionFor(sel) ? "Redraw box" : "Draw box"}
                       </button>
-                      {swap.region && (
-                        <button className="btn h-7 px-2.5 text-[11px]" onClick={() => swap.onRegion(null)}>Clear</button>
+                      {(picked.size ? [...picked].some((f) => swap.regionFor(f)) : !!swap.regionFor(sel)) && (
+                        <button
+                          className="btn h-7 px-2.5 text-[11px]"
+                          onClick={() => swap.onRegion(picked.size ? [...picked] : [sel], null)}
+                        >
+                          Clear
+                        </button>
                       )}
                     </div>
+                    {swap.boxed.length > 0 && (() => {
+                      const todo = swap.boxed.filter((f) => !swap.frames[f]);
+                      return (
+                        <button className="btn btn-on w-full" disabled={running > 0 || !todo.length} onClick={() => swap.onSwapMany(todo)}>
+                          {running
+                            ? `${running} running…`
+                            : todo.length
+                              ? `${verb} ${todo.length} boxed frame${todo.length === 1 ? "" : "s"} · each with its box · ~$${(todo.length * swap.price).toFixed(2)}`
+                              : `All ${swap.boxed.length} boxed frames done`}
+                        </button>
+                      );
+                    })()}
                     {Object.keys(swap.errors).length > 0 && (
                       <p className="text-[11px] text-[#fca5a5]">{Object.keys(swap.errors).length} frame{Object.keys(swap.errors).length === 1 ? "" : "s"} failed (red dot). Click one to see why.</p>
                     )}
@@ -479,6 +501,9 @@ export function ClipInspector({
                     )}
                     {swap?.frames[f] && <span className="absolute right-1 top-1 w-2 h-2 rounded-full bg-[#86efac]" title="Swapped" />}
                     {swap?.errors[f] && !swap.frames[f] && <span className="absolute right-1 top-1 w-2 h-2 rounded-full bg-[#fca5a5]" title={swap.errors[f]} />}
+                    {swap?.boxed.includes(f) && (
+                      <span className="absolute left-1 top-1 w-3 h-2.5 rounded-[2px] ring-[1.5px] ring-[#7dd3fc]" title="Has a box" />
+                    )}
                     {swap?.busy.has(f) && <span className="absolute inset-0 grid place-items-center bg-black/50 text-[10px]">…</span>}
                     {marked.has(f) && (
                       <span className="absolute inset-0 grid place-items-center bg-[rgba(220,38,38,0.45)] text-white text-[18px]">✕</span>

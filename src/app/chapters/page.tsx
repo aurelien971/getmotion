@@ -1235,11 +1235,37 @@ export default function Chapters() {
   const clipFrames = (part: Part) => Math.round(part.duration * p.fps);
 
   // The frame-swap prompt built from the look and the people picked for this part.
+  const regionOf = (part: Part, f: number) => {
+    const look = p.groups.find((x) => x.id === part.groupId);
+    return look?.swapRegions?.[partKey(part)]?.[f] ?? look?.swapRegion?.[partKey(part)] ?? null;
+  };
+  const anyRegion = (part: Part) => {
+    const look = p.groups.find((x) => x.id === part.groupId);
+    return !!look?.swapRegion?.[partKey(part)] || Object.keys(look?.swapRegions?.[partKey(part)] ?? {}).length > 0;
+  };
+  function setRegions(part: Part, frames: number[], box: { x: number; y: number; w: number; h: number } | null) {
+    const key = partKey(part);
+    update((x) => ({
+      ...x,
+      groups: x.groups.map((gg) => {
+        if (gg.id !== part.groupId) return gg;
+        const m = { ...(gg.swapRegions?.[key] ?? {}) };
+        for (const f of frames) {
+          if (box) m[f] = box;
+          else delete m[f];
+        }
+        // The old single box is replaced by per-frame boxes.
+        const legacy = { ...(gg.swapRegion ?? {}) };
+        delete legacy[key];
+        return { ...gg, swapRegions: { ...(gg.swapRegions ?? {}), [key]: m }, swapRegion: legacy };
+      }),
+    }));
+  }
   const swapModeOf = (part: Part) => p.groups.find((x) => x.id === part.groupId)?.swapMode?.[partKey(part)] ?? "swap";
   function swapDefaultPrompt(part: Part) {
     const look = p.groups.find((x) => x.id === part.groupId);
     if (!look) return "";
-    if (swapModeOf(part) === "edit" && look.swapRegion?.[partKey(part)])
+    if (swapModeOf(part) === "edit" && anyRegion(part))
       return "This is a close crop of a frame from a music video. Change only the hand gesture: a hand showing the middle finger becomes an open palm with the fingers together, in a casual brush-off wave. If no hand shows the middle finger, change nothing. Keep the skin tone, sleeve, motion blur, lighting, colors and everything else in this image exactly as it is, at the same size and position.";
     if (swapModeOf(part) === "edit")
       return "Edit this frame from a music video. Change only the hand gesture of the young man closest to the camera: any raised hand becomes an open palm with the fingers together, in a casual brush-off wave. If no hand is raised, change nothing. Keep his face, hair, clothes and body, everyone else, the framing, motion blur, focus, lens flares, haze, lighting and colors exactly as they are.";
@@ -1295,7 +1321,7 @@ export default function Chapters() {
       const stillBlob = await (await fetch(still)).blob();
       // Dev only: a test hook stands in for the model so the flow can be checked without paid calls.
       const mock = process.env.NODE_ENV !== "production" ? (window as unknown as { __mockSwap?: (b: Blob) => Promise<string> }).__mockSwap : undefined;
-      const region = look.swapRegion?.[partKey(part)];
+      const region = regionOf(part, f);
       const box = region ? regionBox(p.width, p.height, region) : null;
       const sendBlob = box ? await cropBlob(stillBlob, box) : stillBlob;
       const frameUrl = mock ? "" : await uploadOnce(`frame:${partKey(part)}:${f}:${box ? `${box.x},${box.y},${box.w},${box.h}` : "full"}`, sendBlob, `frame-${f}.jpg`);
@@ -2371,14 +2397,9 @@ export default function Chapters() {
               model: FRAME_SWAP.name,
               building: !!tasks.swaptake,
               onSwap: (f: number) => void swapFrame(part, f),
-              region: look?.swapRegion?.[partKey(part)] ?? null,
-              onRegion: (r: { x: number; y: number; w: number; h: number } | null) => {
-                if (!look) return;
-                const m = { ...(look.swapRegion ?? {}) };
-                if (r) m[partKey(part)] = r;
-                else delete m[partKey(part)];
-                patchGroup(look.id, { swapRegion: m });
-              },
+              regionFor: (f: number) => regionOf(part, f),
+              boxed: Array.from({ length: clipFrames(part) }, (_, f) => f).filter((f) => !!regionOf(part, f)),
+              onRegion: (frames: number[], r: { x: number; y: number; w: number; h: number } | null) => setRegions(part, frames, r),
               mode: swapModeOf(part),
               onMode: (m: "swap" | "edit") => look && patchGroup(look.id, { swapMode: { ...(look.swapMode ?? {}), [partKey(part)]: m } }),
               useAsInput: !!look?.swapInput?.[partKey(part)],
