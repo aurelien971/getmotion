@@ -3349,8 +3349,11 @@ function RenderStep(props: {
             )}
 
             {(() => {
+              const valid = (x: Part) =>
+                x.status === "done" && x.pieces.every((_, j) => x.deleted?.includes(j) || (x.reviewed?.includes(j) && pieceLive(x, j)));
+              // A spare take of footage that already has a validated take isn't waiting.
               const waiting = parts.filter(
-                (x) => x.status === "done" && !renderOutdated(p, x) && !x.pieces.every((_, j) => x.deleted?.includes(j) || (x.reviewed?.includes(j) && pieceLive(x, j))),
+                (x) => x.status === "done" && !renderOutdated(p, x) && !valid(x) && !parts.some((y) => y !== x && valid(y) && partKey(y) === partKey(x)),
               );
               return waiting.length > 1 ? (
                 <div className="flex items-center gap-3 text-[12px]">
@@ -3387,14 +3390,22 @@ function RenderStep(props: {
                     ? x.rerollOf
                     : parts.slice(0, parts.indexOf(x)).find((y) => partKey(y) === partKey(x))?.id;
                 const roots = parts.filter((x) => !rootOf(x));
-                return roots.flatMap((root, i) => [
-                  { pt: root, i, take: 0 },
-                  ...parts.filter((x) => rootOf(x) === root.id).map((x, k) => ({ pt: x, i, take: k + 2 })),
-                ]);
-              })().map(({ pt, i, take }) => (
+                const valid = (x: Part) =>
+                  x.status === "done" && x.pieces.every((_, j) => x.deleted?.includes(j) || (x.reviewed?.includes(j) && pieceLive(x, j)));
+                return roots.flatMap((root, i) => {
+                  const group = [
+                    { pt: root, i, take: 0 },
+                    ...parts.filter((x) => rootOf(x) === root.id).map((x, k) => ({ pt: x, i, take: k + 2 })),
+                  ];
+                  const used = group.find((x) => valid(x.pt));
+                  // The take in use, as seen from every take of the part.
+                  return group.map((x) => ({ ...x, inUse: used && used.pt.id !== x.pt.id ? (used.take ? `take ${used.take}` : "the first take") : undefined }));
+                });
+              })().map(({ pt, i, take, inUse }) => (
                 <PartRow
                   key={pt.id}
                   take={take}
+                  inUse={inUse}
                   onCheck={() => props.onCheck([pt.id])}
                   onInspect={() => props.onInspect(pt)}
                   onFix={(only) => props.onFix(pt, only)}
@@ -4145,7 +4156,10 @@ function PartRow({
   rerolling,
   take = 0,
   onRestore,
+  inUse,
 }: {
+  inUse?: string; // another take of this part is the validated one
+
   onRestore: () => void;
   take?: number; // 2, 3… for re-rolls listed under their part
   rerolling: boolean;
@@ -4279,6 +4293,13 @@ function PartRow({
             <span className="w-5 h-5 rounded-full bg-[#86efac] text-black grid place-items-center text-[11px] font-semibold">✓</span>
             Validated
           </span>
+        ) : inUse ? (
+          <>
+            <span className="inline-flex items-center gap-1.5 text-[12px] text-[#86efac]">✓ Using {inUse}</span>
+            <button className="btn" onClick={onValidate} title="Switch to this take instead (the other one is kept)">
+              Use this instead
+            </button>
+          </>
         ) : (
           <button className="btn btn-on" onClick={onValidate} title="Use this render for its shot(s): marked reviewed and sent to the composite">
             Validate
