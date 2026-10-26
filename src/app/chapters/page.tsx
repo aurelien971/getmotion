@@ -1109,11 +1109,48 @@ export default function Chapters() {
   // The exact clip a part sends, built locally (cached until its pieces change).
   const clipCache = useRef(new Map<string, File>());
   async function buildPartClip(part: Part): Promise<File> {
-    const key = partKey(part) + `#${part.pad.map((x) => `${x.start.toFixed(3)}${x.reverse ? "r" : ""}`).join(",")}#mute`;
+    const look = p.groups.find((x) => x.id === part.groupId);
+    const edited = look?.swapInput?.[partKey(part)] ? (look.frameSwaps?.[partKey(part)] ?? {}) : null;
+    const key =
+      partKey(part) +
+      `#${part.pad.map((x) => `${x.start.toFixed(3)}${x.reverse ? "r" : ""}`).join(",")}#mute` +
+      (edited ? `#edited:${Object.entries(edited).map(([f, u]) => `${f}=${u.slice(-12)}`).join(",")}` : "");
     const hit = clipCache.current.get(key);
     if (hit) return hit;
     const h = Math.min(720, p.height);
     const w = Math.round((p.width / p.height) * h);
+    // Render from edited frames: the clip is rebuilt frame by frame, edited frames where
+    // there are some, the original elsewhere, padding mapped onto the same frames.
+    if (edited && srcUrl) {
+      const fps = p.fps;
+      const frameOf = (t: number) => {
+        const pc = part.pieces.find((x) => t >= x.start - 1e-6 && t < x.end - 1e-6) ?? part.pieces[0];
+        return Math.floor((pc.offset + (t - pc.start)) * fps + 1e-6); // clip frame showing that (mid-frame) source time
+      };
+      const sourceTimes: number[] = [];
+      for (const pc of part.pieces) for (let k = 0; k < Math.round((pc.end - pc.start) * fps); k++) sourceTimes.push(pc.start + (k + 0.5) / fps);
+      for (const sp of part.pad) {
+        const n = Math.round((sp.end - sp.start) * fps);
+        for (let k = 0; k < n; k++) sourceTimes.push(sp.start + ((sp.reverse ? n - 1 - k : k) + 0.5) / fps);
+      }
+      const cache = new Map<number, Blob>();
+      const frames: Blob[] = [];
+      for (let i = 0; i < sourceTimes.length; i++) {
+        const f = frameOf(sourceTimes[i]);
+        let b: Blob | undefined = cache.get(f);
+        if (!b) {
+          b = (edited[f]
+            ? await fetch(edited[f]).then((r) => r.blob())
+            : await fetch((await grabFrames(srcUrl, [sourceTimes[i]], p.width))[0]).then((r) => r.blob())) as Blob;
+          cache.set(f, b);
+        }
+        frames.push(b!);
+        patchPart(part.id, { progress: (i / sourceTimes.length) * 0.5 });
+      }
+      const clip = await imagesToVideo(frames, { w, h }, fpsExpr(p.fps), (r) => patchPart(part.id, { progress: 0.5 + r / 2 }));
+      clipCache.current.set(key, clip);
+      return clip;
+    }
     const off = p.preparedOffset ?? 0;
     const spans = [...part.pieces, ...part.pad];
     let copySpans = spans.map((x) => ({ start: Math.max(0, x.start + off), end: x.end + off }));
@@ -1197,9 +1234,12 @@ export default function Chapters() {
   const clipFrames = (part: Part) => Math.round(part.duration * p.fps);
 
   // The frame-swap prompt built from the look and the people picked for this part.
+  const swapModeOf = (part: Part) => p.groups.find((x) => x.id === part.groupId)?.swapMode?.[partKey(part)] ?? "swap";
   function swapDefaultPrompt(part: Part) {
     const look = p.groups.find((x) => x.id === part.groupId);
     if (!look) return "";
+    if (swapModeOf(part) === "edit")
+      return "Edit this frame from a music video. Change only the hand gesture of the young man closest to the camera: any raised hand becomes an open palm with the fingers together, in a casual brush-off wave. If no hand is raised, change nothing. Keep his face, hair, clothes and body, everyone else, the framing, motion blur, focus, lens flares, haze, lighting and colors exactly as they are.";
     const g = groupForPart(look, part);
     const n = Math.max(1, refsOf(p, g).length);
     const base = defaultPrompt(g, n).replace(/reference images? (\d+)(?: to (\d+))?/gi, (_m, a, b) => (b ? `images ${+a + 1} to ${+b + 1}` : `image ${+a + 1}`));
@@ -1238,9 +1278,10 @@ export default function Chapters() {
     setSwapping((x) => new Set(x).add(id));
     try {
       const g = groupForPart(look, part);
+      const edit = swapModeOf(part) === "edit";
       const photos = refsOf(p, g);
-      if (!photos.length) throw new Error(`Pick a face for "${look.name}" first.`);
-      const refs = [...photos, ...otherRefsOf(p, g)];
+      if (!photos.length && !edit) throw new Error(`Pick a face for "${look.name}" first.`);
+      const refs = edit ? [] : [...photos, ...otherRefsOf(p, g)];
       // The frame from the original at full resolution.
       const [still] = await grabFrames(srcUrl, [t], p.width);
       const stillBlob = await (await fetch(still)).blob();
@@ -2301,6 +2342,10 @@ export default function Chapters() {
               model: FRAME_SWAP.name,
               building: !!tasks.swaptake,
               onSwap: (f: number) => void swapFrame(part, f),
+              mode: swapModeOf(part),
+              onMode: (m: "swap" | "edit") => look && patchGroup(look.id, { swapMode: { ...(look.swapMode ?? {}), [partKey(part)]: m } }),
+              useAsInput: !!look?.swapInput?.[partKey(part)],
+              onUseAsInput: (on: boolean) => look && patchGroup(look.id, { swapInput: { ...(look.swapInput ?? {}), [partKey(part)]: on } }),
               promptFor: (f: number) => swapPromptFor(part, f),
               allPrompt: look?.swapPrompts?.[partKey(part)]?.all ?? swapDefaultPrompt(part),
               allEdited: !!look?.swapPrompts?.[partKey(part)]?.all,
@@ -3617,6 +3662,7 @@ function RenderStep(props: {
                   key={pt.id}
                   take={take}
                   inUse={inUse}
+                  editedInput={!!g.swapInput?.[partKey(pt)]}
                   onCheck={() => props.onCheck([pt.id])}
                   onInspect={() => props.onInspect(pt)}
                   onFix={(only) => props.onFix(pt, only)}
@@ -4368,7 +4414,10 @@ function PartRow({
   take = 0,
   onRestore,
   inUse,
+  editedInput,
 }: {
+  editedInput?: boolean; // renders from frames fixed in Inspect
+
   inUse?: string; // another take of this part is the validated one
 
   onRestore: () => void;
@@ -4431,6 +4480,11 @@ function PartRow({
         {part.pieces.length === 1 ? `Shot ${fmt(part.pieces[0].start)}` : `${part.pieces.length} shots`} · {fmtShort(part.duration)}
         {padLen > 0.05 ? ` + ${fmtShort(padLen)} ${part.pad.some((x) => x.reverse) ? "ping-pong" : "loop"}` : ""}
       </span>
+      {editedInput && part.status !== "done" && (
+        <span className="text-[11px] rounded-full px-2 py-0.5 ring-1 ring-[#86efac]/60 text-[#86efac]" title="Renders from the frames you fixed in Inspect">
+          Input: fixed frames
+        </span>
+      )}
       <span className="flex items-center gap-2 text-[12px] min-w-40">
         <span
           className={`w-2 h-2 rounded-full ${busy ? "animate-pulse" : ""}`}
