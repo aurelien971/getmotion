@@ -3377,9 +3377,22 @@ function RenderStep(props: {
             })()}
 
             <ol className="space-y-2">
-              {parts.map((pt, i) => (
+              {(() => {
+                // Re-rolls are new takes of their part: listed right under it, not as new parts.
+                // Older copies have no link: the first earlier part with the exact same footage is their part.
+                const rootOf = (x: Part): string | undefined =>
+                  x.rerollOf && parts.some((y) => y.id === x.rerollOf)
+                    ? x.rerollOf
+                    : parts.slice(0, parts.indexOf(x)).find((y) => partKey(y) === partKey(x))?.id;
+                const roots = parts.filter((x) => !rootOf(x));
+                return roots.flatMap((root, i) => [
+                  { pt: root, i, take: 0 },
+                  ...parts.filter((x) => rootOf(x) === root.id).map((x, k) => ({ pt: x, i, take: k + 2 })),
+                ]);
+              })().map(({ pt, i, take }) => (
                 <PartRow
                   key={pt.id}
+                  take={take}
                   onCheck={() => props.onCheck([pt.id])}
                   onInspect={() => props.onInspect(pt)}
                   onFix={(only) => props.onFix(pt, only)}
@@ -4127,7 +4140,9 @@ function PartRow({
   onValidate,
   onCancel,
   rerolling,
+  take = 0,
 }: {
+  take?: number; // 2, 3… for re-rolls listed under their part
   rerolling: boolean;
   onCancel: () => void;
   onSkip: () => void;
@@ -4171,9 +4186,9 @@ function PartRow({
   const [open, setOpen] = useState(false);
   const [showPrompt, setShowPrompt] = useState(false);
   return (
-    <li className="rounded-2xl ring-1 ring-hair p-3 space-y-3">
+    <li className={`rounded-2xl ring-1 ring-hair p-3 space-y-3 ${take ? "ml-8" : ""}`}>
       <div className="flex flex-wrap items-center gap-4">
-      <span className="text-[13px] w-16">Part {index + 1}</span>
+      <span className={`text-[13px] ${take ? "w-28 text-muted" : "w-16"}`}>{take ? `↳ Part ${index + 1} · take ${take}` : `Part ${index + 1}`}</span>
       <span className="flex -space-x-2">
         {shotThumbs.slice(0, 6).map((t, k) =>
           t.thumb ? (
