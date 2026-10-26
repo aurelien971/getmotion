@@ -68,7 +68,7 @@ export const MODELS: Model[] = [
     build: (i) => ({
       video_url: i.videoUrl,
       image_url: i.cast[0].url,
-      resolution: "480p",
+      resolution: "720p", // 480p looks soft next to H3 renders
       use_turbo: true,
     }),
   },
