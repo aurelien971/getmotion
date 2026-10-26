@@ -293,6 +293,9 @@ h2 {
   --hair: rgba(236, 231, 223, 0.1);
   --glass: rgba(255, 248, 238, 0.055);
   --glass-line: rgba(255, 244, 228, 0.12);
+  /* The one color: warm amber, used only as a signal (ready, selected, focused). */
+  --accent: #e8b464;
+  --accent-soft: rgba(232, 180, 100, 0.16);
   background:
     radial-gradient(1100px 700px at 12% -10%, rgba(255, 242, 222, 0.07), transparent 60%),
     var(--bg);
@@ -321,7 +324,7 @@ h2 {
   background: rgba(255, 248, 238, 0.06);
 }
 .landing :focus-visible {
-  outline: 1.5px solid var(--text);
+  outline: 1.5px solid var(--accent);
   outline-offset: 3px;
   border-radius: 12px;
 }
@@ -354,7 +357,8 @@ h2 {
 }
 .landing .field-quiet:focus {
   outline: none;
-  border-color: rgba(236, 231, 223, 0.45);
+  border-color: rgba(232, 180, 100, 0.7);
+  box-shadow: 0 0 0 3px var(--accent-soft);
   background: rgba(10, 9, 8, 0.7);
 }
 .landing .drop-quiet {
@@ -492,8 +496,31 @@ h2 {
   border-color: rgba(236, 231, 223, 0.22);
 }
 .landing .option-quiet.is-on {
-  border-color: rgba(236, 231, 223, 0.6);
-  background: rgba(255, 248, 238, 0.05);
+  border-color: rgba(232, 180, 100, 0.7);
+  background: rgba(232, 180, 100, 0.06);
+}
+.landing .option-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  border: 1.5px solid rgba(236, 231, 223, 0.35);
+  flex-shrink: 0;
+  transition: background-color 0.2s, border-color 0.2s;
+}
+.landing .option-quiet.is-on .option-dot {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+/* Generate: the amber dot appears the moment everything needed is filled in. */
+.landing .ready-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 10px;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(232, 180, 100, 0.22);
+  vertical-align: 2px;
 }
 .landing .close-quiet {
   display: grid;
@@ -523,7 +550,7 @@ h2 {
   position: absolute;
   inset: 0;
   pointer-events: none;
-  background: linear-gradient(105deg, transparent 40%, rgba(255, 252, 245, 0.8) 50%, transparent 60%) no-repeat;
+  background: linear-gradient(105deg, transparent 40%, rgba(255, 226, 178, 0.8) 50%, transparent 60%) no-repeat;
   background-size: 250% 100%;
   background-position: 130% 0;
   mix-blend-mode: screen;

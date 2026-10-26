@@ -205,6 +205,7 @@ export function Recast() {
       </div>
 
       <button type="button" onClick={generate} className="btn-solid mt-7 w-full" aria-disabled={!ready}>
+        {ready && <span className="ready-dot" aria-hidden />}
         Generate
       </button>
       <p className="mt-3 min-h-5 text-center text-[13px] text-[var(--faint)]">
@@ -279,7 +280,8 @@ function Paywall({
           <legend className="sr-only">Choose how to pay</legend>
           {options.map((o) => (
             <label key={o.id} className={`option-quiet ${pick === o.id ? "is-on" : ""}`}>
-              <input type="radio" name="plan" value={o.id} checked={pick === o.id} onChange={() => setPick(o.id)} className="sr-only" />
+              <input type="radio" name="plan" value={o.id} checked={pick === o.id} onChange={() => setPick(o.id)} className="sr-only" autoFocus={pick === o.id} />
+              <span className="option-dot" aria-hidden />
               <span className="flex-1">
                 <span className="block text-[15px]">{o.label}</span>
                 <span className="block text-[13px] text-[var(--faint)]">{o.note}</span>
