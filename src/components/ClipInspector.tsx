@@ -23,6 +23,7 @@ export function ClipInspector({
   swap?: {
     frames: Record<number, string>; // clip frame → swapped image URL
     busy: Set<number>;
+    errors: Record<number, string>; // frames that failed, and why
     price: number;
     model: string;
     building: boolean;
@@ -247,6 +248,10 @@ export function ClipInspector({
                         {done}/{real.length} done{running ? ` · ${running} running` : ""}
                       </span>
                     </div>
+                    {Object.keys(swap.errors).length > 0 && (
+                      <p className="text-[11px] text-[#fca5a5]">{Object.keys(swap.errors).length} frame{Object.keys(swap.errors).length === 1 ? "" : "s"} failed (red dot). Click one to see why.</p>
+                    )}
+                    {swap.errors[sel] && <p className="text-[11px] text-[#fca5a5] break-words">Frame {sel}: {swap.errors[sel]}</p>}
                     {cur.piece >= 0 && (
                       <button className="btn w-full" disabled={swap.busy.has(sel)} onClick={() => swap.onSwap(sel)}>
                         {swap.busy.has(sel) ? "Working…" : swap.frames[sel] ? `Redo frame ${sel}` : `${verb} frame ${sel}`}
@@ -373,6 +378,7 @@ export function ClipInspector({
                       <img src={swap && showSwapped && swap.frames[f] ? swap.frames[f] : thumbs[f]} alt="" className="absolute inset-0 w-full h-full object-cover" />
                     )}
                     {swap?.frames[f] && <span className="absolute right-1 top-1 w-2 h-2 rounded-full bg-[#86efac]" title="Swapped" />}
+                    {swap?.errors[f] && !swap.frames[f] && <span className="absolute right-1 top-1 w-2 h-2 rounded-full bg-[#fca5a5]" title={swap.errors[f]} />}
                     {swap?.busy.has(f) && <span className="absolute inset-0 grid place-items-center bg-black/50 text-[10px]">…</span>}
                     {marked.has(f) && (
                       <span className="absolute inset-0 grid place-items-center bg-[rgba(220,38,38,0.45)] text-white text-[18px]">✕</span>

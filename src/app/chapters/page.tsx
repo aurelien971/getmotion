@@ -1217,6 +1217,7 @@ export default function Chapters() {
 
   // ---- frame swap: swap him into single frames with an image editor --------
   const [swapping, setSwapping] = useState<Set<string>>(new Set());
+  const [swapErrors, setSwapErrors] = useState<Record<string, string>>({}); // "partId:frame" → why it failed
   const uploads = useRef(new Map<string, string>());
   const uploadOnce = async (key: string, blob: Blob, name: string) => {
     const hit = uploads.current.get(key);
@@ -1276,6 +1277,11 @@ export default function Chapters() {
     if (!look || !srcUrl || t === null) return;
     const id = `${part.id}:${f}`;
     setSwapping((x) => new Set(x).add(id));
+    setSwapErrors((x) => {
+      const n = { ...x };
+      delete n[id];
+      return n;
+    });
     try {
       const g = groupForPart(look, part);
       const edit = swapModeOf(part) === "edit";
@@ -1313,7 +1319,7 @@ export default function Chapters() {
         ),
       }));
     } catch (e) {
-      setError(`Frame ${f}: ${describe(e)}`);
+      setSwapErrors((x) => ({ ...x, [id]: describe(e) }));
     } finally {
       setSwapping((x) => {
         const n = new Set(x);
@@ -2338,6 +2344,7 @@ export default function Chapters() {
             return {
               frames: look?.frameSwaps?.[partKey(part)] ?? {},
               busy: new Set([...swapping].filter((k) => k.startsWith(part.id + ":")).map((k) => +k.split(":")[1])),
+              errors: Object.fromEntries(Object.entries(swapErrors).filter(([k]) => k.startsWith(part.id + ":")).map(([k, v]) => [+k.split(":")[1], v])),
               price: FRAME_SWAP.usdPerFrame,
               model: FRAME_SWAP.name,
               building: !!tasks.swaptake,
