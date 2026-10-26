@@ -17,7 +17,19 @@ export function ClipInspector({
   title,
   onClose,
   onDrop,
+  swap,
 }: {
+  // Frame swap: swap him into single frames with an image model, then make a take of them.
+  swap?: {
+    frames: Record<number, string>; // clip frame → swapped image URL
+    busy: Set<number>;
+    price: number;
+    model: string;
+    building: boolean;
+    onSwap: (f: number) => void;
+    onSwapAll: () => void;
+    onMakeTake: () => void;
+  };
   file: Blob;
   fps: number; // the clip's frame rate
   sourceFps: number;
@@ -40,6 +52,7 @@ export function ClipInspector({
   const [thumbs, setThumbs] = useState<string[]>([]);
   const [sel, setSel] = useState(0);
   const [marked, setMarked] = useState<Set<number>>(new Set());
+  const [showSwapped, setShowSwapped] = useState(true);
   const toggleMark = (f: number) =>
     setMarked((m) => {
       const n = new Set(m);
@@ -132,7 +145,16 @@ export function ClipInspector({
         </header>
 
         <div className="grid md:grid-cols-[minmax(0,1fr)_280px] gap-5 items-start">
-          <video ref={player} src={url ?? undefined} controls playsInline className="w-full aspect-video rounded-2xl bg-black ring-1 ring-hair" />
+          <div className="relative">
+            <video ref={player} src={url ?? undefined} controls playsInline className="w-full aspect-video rounded-2xl bg-black ring-1 ring-hair" />
+            {swap && showSwapped && swap.frames[sel] && (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={swap.frames[sel]} alt="" className="absolute inset-0 w-full h-full object-contain rounded-2xl bg-black pointer-events-none" />
+            )}
+            {swap && showSwapped && swap.frames[sel] && (
+              <span className="absolute left-3 top-3 text-[11px] bg-black/60 rounded-full px-2 py-0.5">Swapped frame</span>
+            )}
+          </div>
           <div className="glass rounded-2xl p-4 space-y-2 text-[13px] tabular-nums">
             <div className="flex justify-between"><span className="text-muted">Clip frame</span><span>{sel} / {Math.max(0, count - 1)}</span></div>
             <div className="flex justify-between">
@@ -182,6 +204,43 @@ export function ClipInspector({
               );
             })()}
             {thumbs.length < count && <p className="text-faint text-[11px]">Reading frames… {thumbs.length}/{count}</p>}
+            {swap && (() => {
+              const real = Array.from({ length: count }, (_, f) => f).filter((f) => info(f).piece >= 0);
+              const done = real.filter((f) => swap.frames[f]).length;
+              const left = real.length - done;
+              const running = swap.busy.size;
+              return (
+                <div className="pt-3 mt-2 border-t border-hair space-y-2">
+                  <div className="flex justify-between">
+                    <span>Face swap per frame</span>
+                    <span className="text-muted">{swap.model}</span>
+                  </div>
+                  <p className="text-faint text-[11px]">
+                    {done}/{real.length} frames swapped{running ? ` · ${running} running` : ""} · ${swap.price.toFixed(2)} per frame
+                  </p>
+                  {cur.piece >= 0 && (
+                    <button className="btn w-full" disabled={swap.busy.has(sel)} onClick={() => swap.onSwap(sel)}>
+                      {swap.busy.has(sel) ? "Swapping…" : swap.frames[sel] ? "Redo this frame" : "Swap this frame"}
+                    </button>
+                  )}
+                  {left > 0 && (
+                    <button className="btn btn-on w-full" disabled={running > 0} onClick={swap.onSwapAll}>
+                      {running ? `Swapping… ${running} running` : `Swap all ${left} frame${left === 1 ? "" : "s"} · ~$${(left * swap.price).toFixed(2)}`}
+                    </button>
+                  )}
+                  {done > 0 && (
+                    <button className="btn w-full" disabled={swap.building || running > 0} onClick={swap.onMakeTake}>
+                      {swap.building ? "Building take…" : `Make take from ${done}/${real.length} swapped frames`}
+                    </button>
+                  )}
+                  {done > 0 && (
+                    <label className="flex items-center gap-2 text-[12px] text-muted">
+                      <input type="checkbox" checked={showSwapped} onChange={(e) => setShowSwapped(e.target.checked)} /> Show swapped frames
+                    </label>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         </div>
 
@@ -201,10 +260,12 @@ export function ClipInspector({
                     className={`relative w-[88px] aspect-video rounded overflow-hidden bg-white/[0.04] ${f === sel ? "ring-2 ring-white" : "ring-1 ring-white/10 hover:ring-white/40"}`}
                     title={`Clip frame ${f}`}
                   >
-                    {thumbs[f] && (
+                    {(swap && showSwapped && swap.frames[f] ? swap.frames[f] : thumbs[f]) && (
                       // eslint-disable-next-line @next/next/no-img-element
-                      <img src={thumbs[f]} alt="" className="absolute inset-0 w-full h-full object-cover" />
+                      <img src={swap && showSwapped && swap.frames[f] ? swap.frames[f] : thumbs[f]} alt="" className="absolute inset-0 w-full h-full object-cover" />
                     )}
+                    {swap?.frames[f] && <span className="absolute right-1 top-1 w-2 h-2 rounded-full bg-[#86efac]" title="Swapped" />}
+                    {swap?.busy.has(f) && <span className="absolute inset-0 grid place-items-center bg-black/50 text-[10px]">…</span>}
                     {marked.has(f) && (
                       <span className="absolute inset-0 grid place-items-center bg-[rgba(220,38,38,0.45)] text-white text-[18px]">✕</span>
                     )}

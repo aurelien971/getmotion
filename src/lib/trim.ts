@@ -462,3 +462,37 @@ export async function probeVideo(file: Blob): Promise<{ codec: string | null; fp
     return { codec, fps };
   });
 }
+
+// One video from still frames (in order), each frame shown exactly once, scaled to w x h.
+export async function imagesToVideo(frames: Blob[], size: { w: number; h: number }, fps = "24", onProgress?: (r: number) => void): Promise<File> {
+  return exclusive(async () => {
+    const ff = await load();
+    const base = `sw${++seq}`;
+    const names = frames.map((_, i) => `${base}_${String(i).padStart(4, "0")}.jpg`);
+    for (let i = 0; i < frames.length; i++) await ff.writeFile(names[i], await fetchFile(frames[i]));
+    const out = tmp("mp4");
+    const w = size.w - (size.w % 2);
+    const h = size.h - (size.h % 2);
+    const code = await execTimed(
+      ff,
+      [
+        "-framerate", fps,
+        "-i", `${base}_%04d.jpg`,
+        "-vf", `scale=${w}:${h}:force_original_aspect_ratio=decrease:flags=lanczos,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p`,
+        "-frames:v", String(frames.length),
+        "-r", fps,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "14",
+        "-movflags", "+faststart", "-y", out,
+      ],
+      frames.length / evalFps(fps),
+      onProgress,
+    );
+    try {
+      if (code !== 0) throw new Error("Building the video from frames failed (ffmpeg exit " + code + ")");
+      const data = (await ff.readFile(out)) as Uint8Array;
+      return new File([data.slice().buffer as ArrayBuffer], "frame-swap.mp4", { type: "video/mp4" });
+    } finally {
+      for (const n of [...names, out]) await ff.deleteFile(n).catch(() => {});
+    }
+  });
+}

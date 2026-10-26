@@ -146,7 +146,11 @@ export const MODELS: Model[] = [
 
 export const SUME_MODELS = MODELS.filter((m) => m.provider === "sume").map((m) => m.id);
 
+// Image editor used to swap him into single frames (Inspect → Swap).
+export const FRAME_SWAP = { id: "fal-ai/nano-banana-2/edit", name: "Nano Banana 2", usdPerFrame: 0.08 };
+
 export const ALLOWED_ENDPOINTS = [
   SAM2_VIDEO,
+  FRAME_SWAP.id,
   ...MODELS.filter((m) => m.provider === "fal").map((m) => m.id),
 ].flatMap((id) => [id, `${id}/**`]);

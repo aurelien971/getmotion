@@ -13,7 +13,7 @@ import { RangePicker } from "@/components/RangePicker";
 import { ReelPlayer } from "@/components/ReelPlayer";
 import { SpotTrack } from "@/components/SpotTrack";
 import { submitFal, submitSume, waitFor, removeJob, transientError, Cancelled, type PendingJob } from "@/lib/jobs";
-import { MODELS } from "@/lib/models";
+import { FRAME_SWAP, MODELS } from "@/lib/models";
 import {
   buildParts,
   buildShots,
@@ -68,7 +68,7 @@ import {
 } from "@/lib/project";
 import { kv } from "@/lib/store";
 import { alignSpans, lineUpRender, measureOffset, openReader, refineEdge, verifyIssues } from "@/lib/sync";
-import { assembleTimeline, buildClip, detectCuts, fileHasAudio, fpsExpr, probeVideo, warmUp } from "@/lib/trim";
+import { assembleTimeline, buildClip, detectCuts, fileHasAudio, fpsExpr, imagesToVideo, probeVideo, warmUp } from "@/lib/trim";
 import { transcodeInBrowser } from "@/lib/transcode";
 
 fal.config({ proxyUrl: "/api/fal/proxy" });
@@ -1166,6 +1166,7 @@ export default function Chapters() {
   // Build the exact upload and open it frame by frame.
   async function inspectPart(part: Part) {
     if (!p.prepared) return setError("The video is still being prepared.");
+    const was = part.status;
     try {
       patchPart(part.id, { status: "building", progress: 0 });
       const file = await buildPartClip(part);
@@ -1173,7 +1174,155 @@ export default function Chapters() {
     } catch (e) {
       setError(describe(e));
     } finally {
-      patchPart(part.id, { status: "idle", progress: undefined });
+      patchPart(part.id, { status: was, progress: undefined });
+    }
+  }
+
+  // ---- frame swap: swap him into single frames with an image editor --------
+  const [swapping, setSwapping] = useState<Set<string>>(new Set());
+  const uploads = useRef(new Map<string, string>());
+  const uploadOnce = async (key: string, blob: Blob, name: string) => {
+    const hit = uploads.current.get(key);
+    if (hit) return hit;
+    const url = await netRetry("Uploading", () => fal.storage.upload(new File([blob], name, { type: blob.type || "image/jpeg" })));
+    uploads.current.set(key, url);
+    return url;
+  };
+  // Source time shown by a frame of the part's clip (inside the real pieces, not the filler).
+  const clipFrameSource = (part: Part, f: number) => {
+    const t = (f + 0.5) / p.fps;
+    const pc = part.pieces.find((x) => t >= x.offset && t < x.offset + (x.end - x.start));
+    return pc ? pc.start + (t - pc.offset) : null;
+  };
+  const clipFrames = (part: Part) => Math.round(part.duration * p.fps);
+
+  async function swapFrame(part: Part, f: number) {
+    const look = p.groups.find((x) => x.id === part.groupId);
+    const t = clipFrameSource(part, f);
+    if (!look || !srcUrl || t === null) return;
+    const id = `${part.id}:${f}`;
+    setSwapping((x) => new Set(x).add(id));
+    try {
+      const g = groupForPart(look, part);
+      const photos = refsOf(p, g);
+      if (!photos.length) throw new Error(`Pick a face for "${look.name}" first.`);
+      const refs = [...photos, ...otherRefsOf(p, g)];
+      // The frame from the original at full resolution.
+      const [still] = await grabFrames(srcUrl, [t], p.width);
+      const stillBlob = await (await fetch(still)).blob();
+      // Dev only: a test hook stands in for the model so the flow can be checked without paid calls.
+      const mock = process.env.NODE_ENV !== "production" ? (window as unknown as { __mockSwap?: (b: Blob) => Promise<string> }).__mockSwap : undefined;
+      const frameUrl = mock ? "" : await uploadOnce(`frame:${partKey(part)}:${f}`, stillBlob, `frame-${f}.jpg`);
+      const refUrls = mock ? [] : await Promise.all(refs.map((r) => uploadOnce(`ref:${r.name}:${r.blob.size}`, r.blob, r.name)));
+      const base = defaultPrompt(g, photos.length).replace(/reference images? (\d+)(?: to (\d+))?/gi, (_m, a, b) =>
+        b ? `images ${+a + 1} to ${+b + 1}` : `image ${+a + 1}`,
+      );
+      const prompt = [
+        "Image 1 is a single frame from a music video. Edit image 1 only; the other images are reference photos.",
+        base,
+        "Return image 1 with only those people changed: the same framing, crop, pose, hand positions, motion blur, focus, lens flares, haze, lighting and colors, and every other person exactly as in image 1.",
+      ].join(" ");
+      const ratios: [string, number][] = [["16:9", 16 / 9], ["4:3", 4 / 3], ["1:1", 1], ["3:4", 3 / 4], ["9:16", 9 / 16], ["21:9", 21 / 9]];
+      const ratio = ratios.reduce((a, b) => (Math.abs(b[1] - p.width / p.height) < Math.abs(a[1] - p.width / p.height) ? b : a))[0];
+      const res = mock ? { data: { images: [{ url: await mock(stillBlob) }] } } : await fal.subscribe(FRAME_SWAP.id, {
+        input: {
+          prompt,
+          image_urls: [frameUrl, ...refUrls],
+          num_images: 1,
+          resolution: "1K",
+          aspect_ratio: ratio,
+          output_format: "jpeg",
+          seed: 4242, // same seed for every frame keeps them closer to each other
+        },
+      });
+      const url = (res.data as { images?: { url?: string }[] })?.images?.[0]?.url;
+      if (!url) throw new Error("No image came back");
+      const key = partKey(part);
+      update((x) => ({
+        ...x,
+        groups: x.groups.map((gg) =>
+          gg.id === look.id ? { ...gg, frameSwaps: { ...(gg.frameSwaps ?? {}), [key]: { ...(gg.frameSwaps?.[key] ?? {}), [f]: url } } } : gg,
+        ),
+      }));
+    } catch (e) {
+      setError(`Frame ${f}: ${describe(e)}`);
+    } finally {
+      setSwapping((x) => {
+        const n = new Set(x);
+        n.delete(id);
+        return n;
+      });
+    }
+  }
+
+  async function swapAllFrames(part: Part) {
+    const look = p.groups.find((x) => x.id === part.groupId);
+    const have = look?.frameSwaps?.[partKey(part)] ?? {};
+    const todo = Array.from({ length: clipFrames(part) }, (_, f) => f).filter((f) => !have[f]);
+    // Six at a time.
+    let next = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(6, todo.length) }, async () => {
+        while (next < todo.length) await swapFrame(part, todo[next++]);
+      }),
+    );
+  }
+
+  // Swapped frames become a new take of the part: exactly the real frames, no filler.
+  async function takeFromFrames(part: Part) {
+    const look = p.groups.find((x) => x.id === part.groupId);
+    if (!look || !srcUrl) return;
+    const have = look.frameSwaps?.[partKey(part)] ?? {};
+    const n = clipFrames(part);
+    const missing = Array.from({ length: n }, (_, f) => f).filter((f) => !have[f]);
+    if (missing.length && !confirm(`${missing.length} of ${n} frames aren't swapped; they'll show the original. Make the take anyway?`)) return;
+    setTask("swaptake", { label: "Building the take from swapped frames", pct: 0 });
+    try {
+      const frames: Blob[] = [];
+      for (let f = 0; f < n; f++) {
+        if (have[f]) frames.push(await fetch(have[f]).then((r) => r.blob()));
+        else {
+          const [still] = await grabFrames(srcUrl, [clipFrameSource(part, f) ?? 0], p.width);
+          frames.push(await (await fetch(still)).blob());
+        }
+        setTask("swaptake", { label: "Collecting frames", pct: (f + 1) / n / 2 });
+      }
+      const video = await imagesToVideo(frames, { w: p.width, h: p.height }, fpsExpr(p.fps), (r) =>
+        setTask("swaptake", { label: "Encoding the take", pct: 0.5 + r / 2 }),
+      );
+      const mockUp = process.env.NODE_ENV !== "production" ? (window as unknown as { __mockUpload?: (b: Blob) => Promise<string> }).__mockUpload : undefined;
+      const url = mockUp ? await mockUp(video) : await netRetry("Uploading the take", () => fal.storage.upload(video));
+      const take: Part = {
+        ...part,
+        id: uid(),
+        rerollOf: part.rerollOf ?? part.id,
+        status: "done",
+        resultUrl: url,
+        renderedAt: Date.now(),
+        clipLength: part.duration,
+        pad: [],
+        measuredOffsets: part.pieces.map((x) => x.offset),
+        calibrated: true,
+        linedUp: true,
+        edgesV: 2,
+        edges: undefined,
+        error: undefined,
+        requestId: undefined,
+        live: undefined,
+        trims: undefined,
+        rejected: undefined,
+        reviewed: undefined,
+        unused: undefined,
+        deleted: undefined,
+        issues: undefined,
+      };
+      update((x) => ({ ...x, parts: [...x.parts, take] }));
+      setInspecting(null);
+      flash("Frame-swap take added under its part · Review it, then Validate");
+    } catch (e) {
+      setError(`Frame-swap take: ${describe(e)}`);
+    } finally {
+      setTask("swaptake", null);
     }
   }
 
@@ -2115,6 +2264,20 @@ export default function Chapters() {
           padFrom={inspecting.part.duration}
           title={`${p.groups.find((g) => g.id === inspecting.part.groupId)?.name ?? ""} · ${inspecting.part.pieces.length} pieces`}
           onClose={() => setInspecting(null)}
+          swap={(() => {
+            const part = inspecting.part;
+            const look = p.groups.find((g) => g.id === part.groupId);
+            return {
+              frames: look?.frameSwaps?.[partKey(part)] ?? {},
+              busy: new Set([...swapping].filter((k) => k.startsWith(part.id + ":")).map((k) => +k.split(":")[1])),
+              price: FRAME_SWAP.usdPerFrame,
+              model: FRAME_SWAP.name,
+              building: !!tasks.swaptake,
+              onSwap: (f: number) => void swapFrame(part, f),
+              onSwapAll: () => void swapAllFrames(part),
+              onMakeTake: () => void takeFromFrames(part),
+            };
+          })()}
           onDrop={(drops) => {
             const part = inspecting.part;
             setInspecting(null);
