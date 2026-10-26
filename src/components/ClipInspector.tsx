@@ -41,6 +41,8 @@ export function ClipInspector({
     images: string[]; // what image 1, 2, 3… are
     people: { index: number; label: string; thumb?: string; on: boolean }[];
     onTogglePerson: (index: number) => void;
+    region: { x: number; y: number; w: number; h: number } | null; // only this box is edited (0-1 of the frame)
+    onRegion: (r: { x: number; y: number; w: number; h: number } | null) => void;
     mode: "swap" | "edit"; // edit: fix the frame only (no photos); swap: put people in
     onMode: (m: "swap" | "edit") => void;
     useAsInput: boolean; // the part renders from these frames
@@ -71,6 +73,8 @@ export function ClipInspector({
   const [showSwapped, setShowSwapped] = useState(true);
   // Frames picked for a batch fix: click, shift-click for a range, cmd/ctrl-click to toggle.
   const [picked, setPicked] = useState<Set<number>>(new Set());
+  const [drawing, setDrawing] = useState(false);
+  const [drag, setDrag] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
   const [anchor, setAnchor] = useState<number | null>(null);
   const pick = (f: number, e: { shiftKey: boolean; metaKey: boolean; ctrlKey: boolean }) => {
     setSel(f);
@@ -191,6 +195,45 @@ export function ClipInspector({
             {swap && showSwapped && swap.frames[sel] && (
               <span className="absolute left-3 top-3 text-[11px] bg-black/60 rounded-full px-2 py-0.5">Swapped frame</span>
             )}
+            {swap && (drawing || swap.region) && (() => {
+              const r = drag
+                ? { x: Math.min(drag.x0, drag.x1), y: Math.min(drag.y0, drag.y1), w: Math.abs(drag.x1 - drag.x0), h: Math.abs(drag.y1 - drag.y0) }
+                : swap.region;
+              const at = (e: React.PointerEvent<HTMLDivElement>) => {
+                const b = e.currentTarget.getBoundingClientRect();
+                return { x: Math.min(1, Math.max(0, (e.clientX - b.left) / b.width)), y: Math.min(1, Math.max(0, (e.clientY - b.top) / b.height)) };
+              };
+              return (
+                <div
+                  className={`absolute inset-0 rounded-2xl ${drawing ? "cursor-crosshair bg-black/20" : "pointer-events-none"}`}
+                  onPointerDown={(e) => {
+                    if (!drawing) return;
+                    e.currentTarget.setPointerCapture(e.pointerId);
+                    const a = at(e);
+                    setDrag({ x0: a.x, y0: a.y, x1: a.x, y1: a.y });
+                  }}
+                  onPointerMove={(e) => drag && setDrag({ ...drag, x1: at(e).x, y1: at(e).y })}
+                  onPointerUp={() => {
+                    if (drag) {
+                      const box = { x: Math.min(drag.x0, drag.x1), y: Math.min(drag.y0, drag.y1), w: Math.abs(drag.x1 - drag.x0), h: Math.abs(drag.y1 - drag.y0) };
+                      if (box.w > 0.02 && box.h > 0.02) swap.onRegion(box);
+                    }
+                    setDrag(null);
+                    setDrawing(false);
+                  }}
+                >
+                  {r && (
+                    <div
+                      className="absolute ring-2 ring-[#7dd3fc] bg-[#7dd3fc]/10 rounded-sm"
+                      style={{ left: `${r.x * 100}%`, top: `${r.y * 100}%`, width: `${r.w * 100}%`, height: `${r.h * 100}%` }}
+                    />
+                  )}
+                  {drawing && !drag && (
+                    <span className="absolute left-1/2 top-3 -translate-x-1/2 text-[12px] bg-black/70 rounded-full px-3 py-1">Drag a box around the area to change</span>
+                  )}
+                </div>
+              );
+            })()}
           </div>
           <div className="glass rounded-2xl p-4 space-y-2 text-[13px] tabular-nums">
             <div className="flex justify-between"><span className="text-muted">Clip frame</span><span>{sel} / {Math.max(0, count - 1)}</span></div>
@@ -270,6 +313,17 @@ export function ClipInspector({
                       <span className="text-muted">
                         {done}/{real.length} done{running ? ` · ${running} running` : ""}
                       </span>
+                    </div>
+                    <div className="flex items-center gap-2 text-[12px]">
+                      <span className="flex-1 text-muted">
+                        {swap.region ? "Only the blue box changes; the rest stays identical" : "Whole frame (or draw a box to change only an area)"}
+                      </span>
+                      <button className={`btn h-7 px-2.5 text-[11px] ${drawing ? "btn-on" : ""}`} onClick={() => setDrawing((d) => !d)}>
+                        {drawing ? "Drawing…" : swap.region ? "Redraw box" : "Draw box"}
+                      </button>
+                      {swap.region && (
+                        <button className="btn h-7 px-2.5 text-[11px]" onClick={() => swap.onRegion(null)}>Clear</button>
+                      )}
                     </div>
                     {Object.keys(swap.errors).length > 0 && (
                       <p className="text-[11px] text-[#fca5a5]">{Object.keys(swap.errors).length} frame{Object.keys(swap.errors).length === 1 ? "" : "s"} failed (red dot). Click one to see why.</p>

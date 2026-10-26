@@ -1239,6 +1239,8 @@ export default function Chapters() {
   function swapDefaultPrompt(part: Part) {
     const look = p.groups.find((x) => x.id === part.groupId);
     if (!look) return "";
+    if (swapModeOf(part) === "edit" && look.swapRegion?.[partKey(part)])
+      return "This is a close crop of a frame from a music video. Change only the hand gesture: a hand showing the middle finger becomes an open palm with the fingers together, in a casual brush-off wave. If no hand shows the middle finger, change nothing. Keep the skin tone, sleeve, motion blur, lighting, colors and everything else in this image exactly as it is, at the same size and position.";
     if (swapModeOf(part) === "edit")
       return "Edit this frame from a music video. Change only the hand gesture of the young man closest to the camera: any raised hand becomes an open palm with the fingers together, in a casual brush-off wave. If no hand is raised, change nothing. Keep his face, hair, clothes and body, everyone else, the framing, motion blur, focus, lens flares, haze, lighting and colors exactly as they are.";
     const g = groupForPart(look, part);
@@ -1293,24 +1295,29 @@ export default function Chapters() {
       const stillBlob = await (await fetch(still)).blob();
       // Dev only: a test hook stands in for the model so the flow can be checked without paid calls.
       const mock = process.env.NODE_ENV !== "production" ? (window as unknown as { __mockSwap?: (b: Blob) => Promise<string> }).__mockSwap : undefined;
-      const frameUrl = mock ? "" : await uploadOnce(`frame:${partKey(part)}:${f}`, stillBlob, `frame-${f}.jpg`);
+      const region = look.swapRegion?.[partKey(part)];
+      const box = region ? regionBox(p.width, p.height, region) : null;
+      const sendBlob = box ? await cropBlob(stillBlob, box) : stillBlob;
+      const frameUrl = mock ? "" : await uploadOnce(`frame:${partKey(part)}:${f}:${box ? `${box.x},${box.y},${box.w},${box.h}` : "full"}`, sendBlob, `frame-${f}.jpg`);
       const refUrls = mock ? [] : await Promise.all(refs.map((r) => uploadOnce(`ref:${r.name}:${r.blob.size}`, r.blob, r.name)));
       const prompt = swapPromptFor(part, f);
       const ratios: [string, number][] = [["16:9", 16 / 9], ["4:3", 4 / 3], ["1:1", 1], ["3:4", 3 / 4], ["9:16", 9 / 16], ["21:9", 21 / 9]];
       const ratio = ratios.reduce((a, b) => (Math.abs(b[1] - p.width / p.height) < Math.abs(a[1] - p.width / p.height) ? b : a))[0];
-      const res = mock ? { data: { images: [{ url: await mock(stillBlob) }] } } : await fal.subscribe(FRAME_SWAP.id, {
+      const res = mock ? { data: { images: [{ url: await mock(sendBlob) }] } } : await fal.subscribe(FRAME_SWAP.id, {
         input: {
           prompt,
           image_urls: [frameUrl, ...refUrls],
           num_images: 1,
           resolution: "1K",
-          aspect_ratio: ratio,
+          aspect_ratio: box ? box.ratio : ratio,
           output_format: "jpeg",
           seed: 4242, // same seed for every frame keeps them closer to each other
         },
       });
-      const url = (res.data as { images?: { url?: string }[] })?.images?.[0]?.url;
-      if (!url) throw new Error("No image came back");
+      const out = (res.data as { images?: { url?: string }[] })?.images?.[0]?.url;
+      if (!out) throw new Error("No image came back");
+      // Region: paste the edited box back into the untouched frame.
+      const url = box ? await pasteBack(stillBlob, (await fetch(out).then((r) => r.blob())) as Blob, box) : out;
       const key = partKey(part);
       update((x) => ({
         ...x,
@@ -2364,6 +2371,14 @@ export default function Chapters() {
               model: FRAME_SWAP.name,
               building: !!tasks.swaptake,
               onSwap: (f: number) => void swapFrame(part, f),
+              region: look?.swapRegion?.[partKey(part)] ?? null,
+              onRegion: (r: { x: number; y: number; w: number; h: number } | null) => {
+                if (!look) return;
+                const m = { ...(look.swapRegion ?? {}) };
+                if (r) m[partKey(part)] = r;
+                else delete m[partKey(part)];
+                patchGroup(look.id, { swapRegion: m });
+              },
               mode: swapModeOf(part),
               onMode: (m: "swap" | "edit") => look && patchGroup(look.id, { swapMode: { ...(look.swapMode ?? {}), [partKey(part)]: m } }),
               useAsInput: !!look?.swapInput?.[partKey(part)],
@@ -2478,6 +2493,59 @@ async function cropDataUrl(src: string, box: number[], size = 240): Promise<stri
   c.height = Math.max(1, Math.round(sh * k));
   c.getContext("2d")!.drawImage(img, sx, sy, sw, sh, 0, 0, c.width, c.height);
   return c.toDataURL("image/jpeg", 0.85);
+}
+
+// Region editing: cut a box (plus margin, widened to an aspect the image model offers)
+// out of a frame, and paste the edited box back with soft edges.
+const RATIOS: [string, number][] = [["1:1", 1], ["5:4", 5 / 4], ["4:5", 4 / 5], ["4:3", 4 / 3], ["3:4", 3 / 4], ["3:2", 3 / 2], ["2:3", 2 / 3], ["16:9", 16 / 9], ["9:16", 9 / 16], ["21:9", 21 / 9]];
+function regionBox(W: number, H: number, r: { x: number; y: number; w: number; h: number }) {
+  const m = 0.12; // margin around the drawn box so the edit blends in
+  let w = r.w * W * (1 + 2 * m);
+  let h = r.h * H * (1 + 2 * m);
+  const cx = (r.x + r.w / 2) * W;
+  const cy = (r.y + r.h / 2) * H;
+  const [name, ar] = RATIOS.reduce((a, b) => (Math.abs(Math.log(b[1] / (w / h))) < Math.abs(Math.log(a[1] / (w / h))) ? b : a));
+  if (w / h < ar) w = h * ar;
+  else h = w / ar;
+  w = Math.min(w, W);
+  h = Math.min(h, H);
+  const x = Math.round(Math.max(0, Math.min(W - w, cx - w / 2)));
+  const y = Math.round(Math.max(0, Math.min(H - h, cy - h / 2)));
+  return { x, y, w: Math.round(w), h: Math.round(h), ratio: name };
+}
+async function cropBlob(frame: Blob, b: { x: number; y: number; w: number; h: number }) {
+  const bmp = await createImageBitmap(frame);
+  const c = document.createElement("canvas");
+  c.width = b.w;
+  c.height = b.h;
+  c.getContext("2d")!.drawImage(bmp, b.x, b.y, b.w, b.h, 0, 0, b.w, b.h);
+  return new Promise<Blob>((res) => c.toBlob((x) => res(x!), "image/jpeg", 0.95));
+}
+async function pasteBack(frame: Blob, edited: Blob, b: { x: number; y: number; w: number; h: number }) {
+  const [base, patch] = await Promise.all([createImageBitmap(frame), createImageBitmap(edited)]);
+  const c = document.createElement("canvas");
+  c.width = base.width;
+  c.height = base.height;
+  const ctx = c.getContext("2d")!;
+  ctx.drawImage(base, 0, 0);
+  // Feathered patch: the edit fades out over the margin, so no seam shows.
+  const feather = Math.max(4, Math.round(Math.min(b.w, b.h) * 0.08));
+  const t = document.createElement("canvas");
+  t.width = b.w;
+  t.height = b.h;
+  const tc = t.getContext("2d")!;
+  tc.drawImage(patch, 0, 0, b.w, b.h);
+  const mask = document.createElement("canvas");
+  mask.width = b.w;
+  mask.height = b.h;
+  const mc = mask.getContext("2d")!;
+  mc.filter = `blur(${feather / 2}px)`;
+  mc.fillStyle = "#fff";
+  mc.fillRect(feather, feather, b.w - 2 * feather, b.h - 2 * feather);
+  tc.globalCompositeOperation = "destination-in";
+  tc.drawImage(mask, 0, 0);
+  ctx.drawImage(t, b.x, b.y);
+  return c.toDataURL("image/jpeg", 0.93);
 }
 
 // Full-size stills at given source times, for Claude to look at.
