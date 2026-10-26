@@ -546,3 +546,40 @@ h2 {
     display: none;
   }
 }
+.landing .example {
+  border: 1px solid var(--glass-line);
+  box-shadow: 0 50px 140px -60px rgba(0, 0, 0, 0.95);
+}
+.landing .example-sound,
+.landing .example-play {
+  position: absolute;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  color: var(--text);
+  background: rgba(14, 13, 12, 0.5);
+  border: 1px solid rgba(255, 244, 228, 0.16);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  transition: background-color 0.2s, transform 0.2s;
+}
+.landing .example-sound {
+  right: 16px;
+  bottom: 16px;
+  width: 40px;
+  height: 40px;
+}
+.landing .example-play {
+  left: 50%;
+  top: 50%;
+  width: 64px;
+  height: 64px;
+  transform: translate(-50%, -50%);
+}
+.landing .example-sound:hover {
+  background: rgba(14, 13, 12, 0.72);
+  transform: scale(1.05);
+}
+.landing .example-play:hover {
+  background: rgba(14, 13, 12, 0.72);
+}

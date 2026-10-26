@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { ExampleVideo } from "@/components/landing/ExampleVideo";
 import { Recast } from "@/components/landing/Recast";
 import { PRICES } from "@/components/landing/pricing";
 
@@ -93,6 +94,13 @@ export default function Landing() {
             </div>
 
             <Recast />
+          </section>
+
+          <section className="pb-24">
+            <ExampleVideo src="/brand/example.mp4" poster="/brand/example.jpg" />
+            <p className="mt-4 text-[14px] text-[var(--faint)]">
+              An example. Every shot was recast on its own, then laid back on the original timeline under the original sound.
+            </p>
           </section>
 
           <section className="grid gap-12 border-t border-[var(--hair)] py-20 md:grid-cols-[220px_minmax(0,1fr)] md:gap-16">
