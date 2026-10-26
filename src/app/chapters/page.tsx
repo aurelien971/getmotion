@@ -1971,6 +1971,7 @@ export default function Chapters() {
             onDeleteTake={deleteTake}
             onDeletePart={deletePart}
             onCancel={cancelPart}
+            onRestoreTake={(id) => patchPart(id, { status: "done", error: undefined, live: undefined, progress: undefined })}
             onValidate={validateParts}
             onRestorePart={restorePart}
             onRestoreTakes={restoreTakes}
@@ -2916,6 +2917,7 @@ function RenderStep(props: {
   onDeleteTake: (shot: { start: number; end: number }, partId: string, j: number) => void;
   onDeletePart: (partId: string) => void;
   onCancel: (part: Part) => void;
+  onRestoreTake: (partId: string) => void;
   onRestorePart: (partId: string) => void;
   onRestoreTakes: (partId: string) => void;
   onAttach: (partId: string) => void;
@@ -3417,6 +3419,7 @@ function RenderStep(props: {
                   onSkip={() => props.onAccept(g.id, pt.pieces.map(({ start, end }) => ({ start, end })))}
                   onValidate={() => props.onValidate([pt])}
                   onCancel={() => props.onCancel(pt)}
+                  onRestore={() => props.onRestoreTake(pt.id)}
                   rerolling={p.parts.some((x) => x.rerollOf === pt.id && (x.status === "building" || x.status === "uploading" || x.status === "rendering"))}
                   shotThumbs={pt.pieces.map((pc) => ({ start: pc.start, end: pc.end, thumb: p.shots.find((sh) => sh.id === pc.shotId)?.thumb }))}
                   people={(() => {
@@ -4141,7 +4144,9 @@ function PartRow({
   onCancel,
   rerolling,
   take = 0,
+  onRestore,
 }: {
+  onRestore: () => void;
   take?: number; // 2, 3… for re-rolls listed under their part
   rerolling: boolean;
   onCancel: () => void;
@@ -4242,6 +4247,11 @@ function PartRow({
       >
         {writing ? "Studying scenes…" : scenePrompt ? `Prompt ✓${scenePrompt.warnings.length ? ` · ${scenePrompt.warnings.length} ⚠` : ""}` : "Write prompt"}
       </button>
+      {part.status === "failed" && part.resultUrl && (
+        <button className="btn btn-on" onClick={onRestore} title="This part already had a finished render before it failed; bring that take back">
+          Restore last take
+        </button>
+      )}
       {(part.status === "idle" || part.status === "failed") && (
         <button className="btn" onClick={onSkip} title="Don't render this: count it as done and keep the original footage here">
           Keep original
