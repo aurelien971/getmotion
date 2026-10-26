@@ -2191,7 +2191,7 @@ export default function Chapters() {
       {taskList.length > 0 && <div className="sweep fixed top-0 left-0 right-0 h-px z-50 overflow-hidden" />}
 
       <header className="flex items-center gap-6 px-6 h-16 border-b border-hair">
-        <Link href="/" className="flex items-center shrink-0">
+        <Link href="/chapters" className="flex items-center shrink-0">
           <Image src="/logo.png" alt="getmotion.art" width={1700} height={290} priority className="h-[20px] w-auto" />
         </Link>
         <nav className="flex items-center gap-1 overflow-x-auto">
@@ -2241,7 +2241,7 @@ export default function Chapters() {
             />
           </label>
         )}
-        <Link href="/" className="btn h-8 px-3 text-[12px]">Single clip</Link>
+        <Link href="/studio" className="btn h-8 px-3 text-[12px]">Single clip</Link>
         {p.source && (
           <button className="btn h-8 px-3 text-[12px] text-muted" onClick={newProject}>
             New project

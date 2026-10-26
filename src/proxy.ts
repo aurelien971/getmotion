@@ -1,9 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 
-// Private engine: HTTP basic auth on everything when APP_PASSWORD is set (Next 16 proxy).
+// The landing page is public; the engine (studio, chapters, APIs) sits behind HTTP basic
+// auth when APP_PASSWORD is set (Next 16 proxy).
+const PUBLIC = (path: string) => path === "/" || path.startsWith("/brand/") || path === "/icon.png";
+
 export function proxy(req: NextRequest) {
   const password = process.env.APP_PASSWORD;
-  if (!password) return NextResponse.next();
+  if (!password || PUBLIC(req.nextUrl.pathname)) return NextResponse.next();
 
   const header = req.headers.get("authorization") ?? "";
   const [scheme, encoded] = header.split(" ");

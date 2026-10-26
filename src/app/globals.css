@@ -281,3 +281,268 @@ h2 {
     transition: none !important;
   }
 }
+
+/* ---- Landing page ---------------------------------------------------------
+   Warm stone, one light source, one glass surface (the tool). Scoped to .landing
+   so the studio keeps its own look. */
+.landing {
+  --bg: #0e0d0c;
+  --text: #ece7df;
+  --muted: #b3ada4;
+  --faint: #8c867d;
+  --hair: rgba(236, 231, 223, 0.1);
+  --glass: rgba(255, 248, 238, 0.055);
+  --glass-line: rgba(255, 244, 228, 0.12);
+  background:
+    radial-gradient(1100px 700px at 12% -10%, rgba(255, 242, 222, 0.07), transparent 60%),
+    var(--bg);
+  color: var(--text);
+  font-family: var(--font-onest), system-ui, sans-serif;
+  font-size: 16px;
+  letter-spacing: -0.006em;
+}
+.landing .font-display {
+  font-family: var(--font-display), var(--font-onest), sans-serif;
+  font-weight: 500;
+}
+/* The chrome M sits on black; screen blending lets the black fall away on the stone. */
+.landing .mark {
+  mix-blend-mode: screen;
+  user-select: none;
+}
+.landing .navlink {
+  padding: 8px 12px;
+  border-radius: 10px;
+  color: var(--muted);
+  transition: color 0.2s, background-color 0.2s;
+}
+.landing .navlink:hover {
+  color: var(--text);
+  background: rgba(255, 248, 238, 0.06);
+}
+.landing :focus-visible {
+  outline: 1.5px solid var(--text);
+  outline-offset: 3px;
+  border-radius: 12px;
+}
+
+.landing .glass-panel {
+  background: var(--glass);
+  border: 1px solid var(--glass-line);
+  backdrop-filter: blur(28px) saturate(1.15);
+  -webkit-backdrop-filter: blur(28px) saturate(1.15);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 250, 242, 0.08),
+    0 40px 120px -50px rgba(0, 0, 0, 0.9);
+}
+.landing .field-quiet {
+  width: 100%;
+  height: 50px;
+  padding: 0 16px;
+  border-radius: 14px;
+  background: rgba(10, 9, 8, 0.55);
+  border: 1px solid var(--hair);
+  color: var(--text);
+  font-size: 15px;
+  transition: border-color 0.2s, background-color 0.2s;
+}
+.landing .field-quiet::placeholder {
+  color: var(--faint);
+}
+.landing .field-quiet:hover {
+  border-color: rgba(236, 231, 223, 0.18);
+}
+.landing .field-quiet:focus {
+  outline: none;
+  border-color: rgba(236, 231, 223, 0.45);
+  background: rgba(10, 9, 8, 0.7);
+}
+.landing .drop-quiet {
+  display: flex;
+  align-items: center;
+  height: 64px;
+  padding: 0 16px;
+  border-radius: 14px;
+  border: 1px dashed rgba(236, 231, 223, 0.2);
+  background: rgba(10, 9, 8, 0.4);
+  font-size: 15px;
+  text-align: left;
+  transition: border-color 0.2s, background-color 0.2s;
+}
+.landing .drop-quiet:hover,
+.landing .drop-quiet.is-over {
+  border-color: rgba(236, 231, 223, 0.45);
+  background: rgba(10, 9, 8, 0.6);
+}
+.landing .seg-quiet {
+  display: inline-flex;
+  padding: 3px;
+  border-radius: 12px;
+  background: rgba(10, 9, 8, 0.5);
+  border: 1px solid var(--hair);
+}
+.landing .seg-quiet button {
+  height: 30px;
+  padding: 0 14px;
+  border-radius: 9px;
+  font-size: 13px;
+  color: var(--muted);
+  transition: color 0.2s, background-color 0.2s;
+}
+.landing .seg-quiet button.on {
+  background: rgba(255, 248, 238, 0.1);
+  color: var(--text);
+}
+.landing .photo-tile {
+  border: 1px solid var(--hair);
+}
+.landing .photo-remove {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  background: rgba(14, 13, 12, 0.75);
+  color: var(--text);
+  backdrop-filter: blur(8px);
+}
+.landing .photo-add {
+  display: grid;
+  place-items: center;
+  border: 1px dashed rgba(236, 231, 223, 0.22);
+  color: var(--muted);
+  transition: border-color 0.2s, color 0.2s, background-color 0.2s;
+}
+.landing .photo-add:hover,
+.landing .photos-over .photo-add {
+  border-color: rgba(236, 231, 223, 0.5);
+  color: var(--text);
+  background: rgba(10, 9, 8, 0.4);
+}
+.landing .btn-solid {
+  height: 54px;
+  border-radius: 16px;
+  background: var(--text);
+  color: #141210;
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 54px;
+  transition: transform 0.2s ease, background-color 0.2s;
+}
+.landing .btn-solid:hover:not([disabled]) {
+  background: #fffaf2;
+  transform: translateY(-1px);
+}
+.landing .btn-solid:active:not([disabled]) {
+  transform: translateY(0);
+}
+.landing .btn-solid[aria-disabled="true"] {
+  background: rgba(236, 231, 223, 0.55);
+}
+.landing .btn-solid[disabled] {
+  background: rgba(236, 231, 223, 0.3);
+  color: rgba(20, 18, 16, 0.8);
+  cursor: not-allowed;
+}
+.landing .faq summary::-webkit-details-marker {
+  display: none;
+}
+.landing .faq-mark::before,
+.landing .faq-mark::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1.3px;
+  background: var(--muted);
+  transition: transform 0.25s ease;
+}
+.landing .faq-mark::after {
+  transform: rotate(90deg);
+}
+.landing .faq[open] .faq-mark::after {
+  transform: rotate(0deg);
+}
+.landing .paywall {
+  margin: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+}
+.landing .paywall::backdrop {
+  background: rgba(8, 7, 6, 0.62);
+  backdrop-filter: blur(6px);
+}
+.landing .option-quiet {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 16px;
+  border-radius: 16px;
+  border: 1px solid var(--hair);
+  cursor: pointer;
+  transition: border-color 0.2s, background-color 0.2s;
+}
+.landing .option-quiet:hover {
+  border-color: rgba(236, 231, 223, 0.22);
+}
+.landing .option-quiet.is-on {
+  border-color: rgba(236, 231, 223, 0.6);
+  background: rgba(255, 248, 238, 0.05);
+}
+.landing .close-quiet {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  color: var(--muted);
+  transition: color 0.2s, background-color 0.2s;
+}
+.landing .close-quiet:hover {
+  color: var(--text);
+  background: rgba(255, 248, 238, 0.06);
+}
+@media (prefers-reduced-motion: reduce) {
+  .landing * {
+    transition: none !important;
+  }
+}
+/* A slow band of light across the chrome M, clipped to the letter itself (m-mask.png is
+   the logo's brightness as alpha, so the black around it never lights up). */
+.landing .sheen {
+  position: relative;
+}
+.landing .sheen::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(105deg, transparent 40%, rgba(255, 252, 245, 0.8) 50%, transparent 60%) no-repeat;
+  background-size: 250% 100%;
+  background-position: 130% 0;
+  mix-blend-mode: screen;
+  -webkit-mask: url(/brand/m-mask.png) center / contain no-repeat;
+  mask: url(/brand/m-mask.png) center / contain no-repeat;
+  animation: sheen 9s cubic-bezier(0.45, 0, 0.25, 1) 1.2s infinite;
+}
+@keyframes sheen {
+  0% {
+    background-position: 130% 0;
+  }
+  32%,
+  100% {
+    background-position: -30% 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .landing .sheen::after {
+    animation: none;
+    display: none;
+  }
+}
