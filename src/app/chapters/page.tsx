@@ -1329,10 +1329,25 @@ export default function Chapters() {
     }
   }
 
-  async function swapAllFrames(part: Part) {
+  // Drop fixes: those frames go back to the original.
+  function removeFrameFixes(part: Part, frames: number[]) {
+    const key = partKey(part);
+    update((x) => ({
+      ...x,
+      groups: x.groups.map((gg) => {
+        if (gg.id !== part.groupId || !gg.frameSwaps?.[key]) return gg;
+        const m = { ...gg.frameSwaps[key] };
+        for (const f of frames) delete m[f];
+        return { ...gg, frameSwaps: { ...gg.frameSwaps, [key]: m } };
+      }),
+    }));
+  }
+
+  async function swapAllFrames(part: Part, only?: number[]) {
     const look = p.groups.find((x) => x.id === part.groupId);
     const have = look?.frameSwaps?.[partKey(part)] ?? {};
-    const todo = Array.from({ length: clipFrames(part) }, (_, f) => f).filter((f) => !have[f]);
+    // A chosen set is (re)done as asked; "all" skips frames already done.
+    const todo = only ?? Array.from({ length: clipFrames(part) }, (_, f) => f).filter((f) => !have[f]);
     // Six at a time.
     let next = 0;
     await Promise.all(
@@ -2375,6 +2390,8 @@ export default function Chapters() {
                 patchGroup(look.id, { partPeople: { ...(look.partPeople ?? {}), [key]: next } });
               },
               onSwapAll: () => void swapAllFrames(part),
+              onSwapMany: (fs: number[]) => void swapAllFrames(part, fs),
+              onRemove: (fs: number[]) => removeFrameFixes(part, fs),
               onMakeTake: () => void takeFromFrames(part),
             };
           })()}

@@ -29,6 +29,8 @@ export function ClipInspector({
     building: boolean;
     onSwap: (f: number) => void;
     onSwapAll: () => void;
+    onSwapMany: (frames: number[]) => void;
+    onRemove: (frames: number[]) => void;
     onMakeTake: () => void;
     promptFor: (f: number) => string; // what will be sent for that frame
     allPrompt: string;
@@ -67,6 +69,27 @@ export function ClipInspector({
   const [sel, setSel] = useState(0);
   const [marked, setMarked] = useState<Set<number>>(new Set());
   const [showSwapped, setShowSwapped] = useState(true);
+  // Frames picked for a batch fix: click, shift-click for a range, cmd/ctrl-click to toggle.
+  const [picked, setPicked] = useState<Set<number>>(new Set());
+  const [anchor, setAnchor] = useState<number | null>(null);
+  const pick = (f: number, e: { shiftKey: boolean; metaKey: boolean; ctrlKey: boolean }) => {
+    setSel(f);
+    if (e.shiftKey && anchor !== null) {
+      const [a, b] = anchor < f ? [anchor, f] : [f, anchor];
+      setPicked(new Set(Array.from({ length: b - a + 1 }, (_, k) => a + k)));
+    } else if (e.metaKey || e.ctrlKey) {
+      setPicked((x) => {
+        const n = new Set(x);
+        if (n.has(f)) n.delete(f);
+        else n.add(f);
+        return n;
+      });
+      setAnchor(f);
+    } else {
+      setPicked(new Set());
+      setAnchor(f);
+    }
+  };
   const toggleMark = (f: number) =>
     setMarked((m) => {
       const n = new Set(m);
@@ -257,6 +280,29 @@ export function ClipInspector({
                         {swap.busy.has(sel) ? "Working…" : swap.frames[sel] ? `Redo frame ${sel}` : `${verb} frame ${sel}`}
                       </button>
                     )}
+                    {(() => {
+                      const chosen = [...picked].filter((f) => info(f).piece >= 0).sort((a, b) => a - b);
+                      const targets = chosen.length ? chosen : cur.piece >= 0 ? [sel] : [];
+                      const fixedIn = targets.filter((f) => swap.frames[f]);
+                      return (
+                        <>
+                          {chosen.length > 0 && (
+                            <div className="flex items-center gap-2">
+                              <button className="btn btn-on flex-1" disabled={running > 0} onClick={() => swap.onSwapMany(chosen)}>
+                                {verb} {chosen.length} selected · ~${(chosen.length * swap.price).toFixed(2)}
+                              </button>
+                              <button className="btn" onClick={() => setPicked(new Set())}>Clear</button>
+                            </div>
+                          )}
+                          {fixedIn.length > 0 && (
+                            <button className="btn w-full" onClick={() => swap.onRemove(fixedIn)}>
+                              Remove fix from {chosen.length ? `${fixedIn.length} selected` : `frame ${sel}`} (back to original)
+                            </button>
+                          )}
+                          {!chosen.length && <p className="text-faint text-[11px]">Shift-click a frame to select a range, ⌘-click to add one.</p>}
+                        </>
+                      );
+                    })()}
                     {left > 0 && (
                       <button className="btn btn-on w-full" disabled={running > 0} onClick={swap.onSwapAll}>
                         {running ? `${running} running…` : `${verb} all ${left} frame${left === 1 ? "" : "s"} · ~$${(left * swap.price).toFixed(2)}`}
@@ -369,8 +415,8 @@ export function ClipInspector({
                 {gp.frames.map((f) => (
                   <button
                     key={f}
-                    onClick={() => setSel(f)}
-                    className={`relative w-[88px] aspect-video rounded overflow-hidden bg-white/[0.04] ${f === sel ? "ring-2 ring-white" : "ring-1 ring-white/10 hover:ring-white/40"}`}
+                    onClick={(e) => pick(f, e)}
+                    className={`relative w-[88px] aspect-video rounded overflow-hidden bg-white/[0.04] ${f === sel ? "ring-2 ring-white" : picked.has(f) ? "ring-2 ring-[#7dd3fc]" : "ring-1 ring-white/10 hover:ring-white/40"}`}
                     title={`Clip frame ${f}`}
                   >
                     {(swap && showSwapped && swap.frames[f] ? swap.frames[f] : thumbs[f]) && (
