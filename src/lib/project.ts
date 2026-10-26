@@ -167,6 +167,7 @@ export type Part = {
   status: PartStatus;
   progress?: number;
   live?: string; // provider status while rendering
+  rerollOf?: string; // the finished part this re-roll is a new take of
   issuesVerified?: boolean; // issues confirmed on the original (flares dropped, counts from the real cut)
   submittedAt?: number;
   endpoint?: string;

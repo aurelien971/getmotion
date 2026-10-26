@@ -1384,34 +1384,56 @@ export default function Chapters() {
     }
   }
 
+  // Parts being started right now (clicks land before state updates): never start one twice.
+  const starting = useRef(new Set<string>());
   async function renderParts(ids: string[]) {
     setError(null);
     const waits: Promise<void>[] = [];
     for (const id of ids) {
-      let part = p.parts.find((x) => x.id === id);
+      let part = partsRef.current.find((x) => x.id === id) ?? p.parts.find((x) => x.id === id);
       if (!part) continue;
-      // Re-rolling a finished part renders a copy, so the existing take stays saved.
-      if (part.status === "done") {
-        const copy: Part = {
-          ...part,
-          id: uid(),
-          status: "idle",
-          resultUrl: undefined,
-          requestId: undefined,
-          renderedAt: undefined,
-          measuredOffsets: undefined,
-          calibrated: false,
-          trims: undefined,
-          rejected: undefined,
-          reviewed: undefined,
-          unused: undefined,
-          issues: undefined,
-        };
-        update((x) => ({ ...x, parts: [...x.parts, copy] }));
-        part = copy;
+      const busy = (x: Part) => x.status === "building" || x.status === "uploading" || x.status === "rendering";
+      if (starting.current.has(id) || busy(part)) continue;
+      // One re-roll at a time per render: a copy of it still running blocks another.
+      if (part.status === "done" && partsRef.current.some((x) => x.rerollOf === id && busy(x))) continue;
+      starting.current.add(id);
+      try {
+        // Re-rolling a finished part renders a copy, so the existing take stays saved.
+        if (part.status === "done") {
+          const copy: Part = {
+            ...part,
+            id: uid(),
+            rerollOf: part.id,
+            status: "building",
+            progress: 0,
+            resultUrl: undefined,
+            requestId: undefined,
+            renderedAt: undefined,
+            submittedAt: undefined,
+            live: undefined,
+            error: undefined,
+            measuredOffsets: undefined,
+            calibrated: false,
+            linedUp: false,
+            edgesV: undefined,
+            edges: undefined,
+            trims: undefined,
+            rejected: undefined,
+            reviewed: undefined,
+            unused: undefined,
+            deleted: undefined,
+            issues: undefined,
+          };
+          update((x) => ({ ...x, parts: [...x.parts, copy] }));
+          partsRef.current = [...partsRef.current, copy];
+          part = copy;
+        }
+        const job = await startPart(part);
+        // The result belongs to the part that was sent (the copy when re-rolling), never the original.
+        if (job) waits.push(waitPart(part.id, job));
+      } finally {
+        starting.current.delete(id);
       }
-      const job = await startPart(part);
-      if (job) waits.push(waitPart(id, job));
     }
     await Promise.all(waits);
   }
@@ -3382,6 +3404,7 @@ function RenderStep(props: {
                   onSkip={() => props.onAccept(g.id, pt.pieces.map(({ start, end }) => ({ start, end })))}
                   onValidate={() => props.onValidate([pt])}
                   onCancel={() => props.onCancel(pt)}
+                  rerolling={p.parts.some((x) => x.rerollOf === pt.id && (x.status === "building" || x.status === "uploading" || x.status === "rendering"))}
                   shotThumbs={pt.pieces.map((pc) => ({ start: pc.start, end: pc.end, thumb: p.shots.find((sh) => sh.id === pc.shotId)?.thumb }))}
                   people={(() => {
                     const on = partPeople(g, pt);
@@ -4103,7 +4126,9 @@ function PartRow({
   onSkip,
   onValidate,
   onCancel,
+  rerolling,
 }: {
+  rerolling: boolean;
   onCancel: () => void;
   onSkip: () => void;
   onValidate: () => void;
@@ -4236,8 +4261,8 @@ function PartRow({
         );
       })()}
       <button className="btn" onClick={() => setOpen((o) => !o)}>{open ? "Hide" : part.status === "done" ? "Review" : "Preview"}</button>
-      <button className={`btn ${part.status === "idle" ? "btn-on" : ""}`} disabled={busy || !canRender || outdated} onClick={onRender}>
-        {outdated ? "Superseded" : part.status === "done" || part.status === "failed" ? "Re-roll" : "Render"}
+      <button className={`btn ${part.status === "idle" ? "btn-on" : ""}`} disabled={busy || rerolling || !canRender || outdated} onClick={onRender}>
+        {outdated ? "Superseded" : rerolling ? "Re-rolling…" : part.status === "done" || part.status === "failed" ? "Re-roll" : "Render"}
       </button>
       </div>
       {people.length > 0 && part.status !== "done" && (() => {
