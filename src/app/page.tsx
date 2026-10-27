@@ -1,7 +1,10 @@
 import Link from "next/link";
+import { CreditStore } from "@/components/landing/CreditStore";
+import { Portfolio } from "@/components/landing/Portfolio";
 import { ExampleVideo } from "@/components/landing/ExampleVideo";
+import { EXAMPLES } from "@/components/landing/examples";
 import { Recast } from "@/components/landing/Recast";
-import { PRICES } from "@/components/landing/pricing";
+import { PACKS } from "@/components/landing/pricing";
 
 // Public landing page. One quiet surface: the chrome M, a few honest sentences, and the
 // tool itself. Everything else is plain type on warm stone.
@@ -37,7 +40,7 @@ const STEPS = [
 const FAQ = [
   {
     q: "How long can the video be?",
-    a: "One video covers up to 30 seconds of footage. Longer videos use one credit for every 30 seconds.",
+    a: "Any length. Every second we render uses one credit, and quick cuts use more because each shot is rendered on its own. You see the exact count before anything renders.",
   },
   {
     q: "Which links work?",
@@ -53,7 +56,7 @@ const FAQ = [
   },
   {
     q: "What if a render fails?",
-    a: "A failed render doesn’t use your video or a credit.",
+    a: "A failed render gives its credits back.",
   },
 ];
 
@@ -68,39 +71,46 @@ export default function Landing() {
             <span className="font-display text-[17px] tracking-[-0.01em]">getmotion</span>
           </Link>
           <nav className="flex items-center gap-1 text-[14px]">
+            <a href="#examples" className="navlink">Examples</a>
             <a href="#how" className="navlink">How it works</a>
             <a href="#pricing" className="navlink">Pricing</a>
           </nav>
         </header>
 
         <main>
-          <section className="grid items-start gap-8 pt-4 pb-20 sm:gap-10 sm:pt-10 sm:pb-24 lg:grid-cols-[minmax(0,1fr)_minmax(0,520px)] lg:gap-16 lg:pt-16 lg:pb-32">
-            <div className="max-w-[560px] lg:pt-6">
-              <div className="sheen -ml-4 h-[132px] w-[132px] sm:-ml-6 sm:h-[260px] sm:w-[260px]">
+          <section className="grid items-center gap-10 pt-4 pb-20 sm:pt-8 sm:pb-24 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.05fr)] lg:gap-14 lg:pt-10">
+            <div className="max-w-[540px]">
+              <div className="sheen -ml-4 h-[120px] w-[120px] sm:-ml-5 sm:h-[180px] sm:w-[180px]">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img src="/brand/m.jpg" alt="getmotion" width={300} height={300} className="mark h-full w-full" />
               </div>
-              <h1 className="font-display mt-1 text-[40px] leading-[1.03] tracking-[-0.035em] sm:mt-2 sm:text-[60px]">
+              <h1 className="font-display mt-1 text-[40px] leading-[1.03] tracking-[-0.035em] sm:text-[56px]">
                 Put someone new in any video.
               </h1>
-              <p className="mt-6 max-w-[470px] text-[17px] leading-[1.6] text-[var(--muted)]">
+              <p className="mt-5 max-w-[470px] text-[17px] leading-[1.6] text-[var(--muted)]">
                 Paste a link, add a few photos of who goes in, and get the same scene back with them in it. Same moves,
                 same camera, same light, and the sound exactly as it was.
               </p>
-              <p className="mt-8 text-[14px] text-[var(--faint)]">
-                From <span className="tabular-nums text-[var(--text)]">${PRICES.single.toFixed(2)}</span> a video. You only pay when you
-                generate.
+              <div className="mt-8">
+                <Recast />
+              </div>
+              <p className="mt-4 text-[14px] text-[var(--faint)]">
+                Credits from <span className="text-[var(--text)]">${PACKS[0].price}</span>. Sign in with Google or Apple.
               </p>
             </div>
 
-            <Recast />
+            <div>
+              <ExampleVideo src={EXAMPLES[0].result} poster={EXAMPLES[0].poster} />
+              <p className="mt-3 text-[13px] text-[var(--faint)]">A result. Every shot recast, the original sound kept.</p>
+            </div>
           </section>
 
-          <section className="pb-24">
-            <ExampleVideo src="/brand/example.mp4" poster="/brand/example.jpg" />
-            <p className="mt-4 text-[14px] text-[var(--faint)]">
-              An example. Every shot was recast on its own, then laid back on the original timeline under the original sound.
-            </p>
+          <section id="examples" className="border-t border-[var(--hair)] py-20">
+            <div className="mb-10 flex flex-wrap items-baseline justify-between gap-3">
+              <h2 className="font-display text-[26px] leading-tight tracking-[-0.02em]">Examples</h2>
+              <p className="text-[14px] text-[var(--faint)]">What went in, and what came out.</p>
+            </div>
+            <Portfolio />
           </section>
 
           <section className="grid gap-12 border-t border-[var(--hair)] py-20 md:grid-cols-[220px_minmax(0,1fr)] md:gap-16">
@@ -148,32 +158,10 @@ export default function Landing() {
 
           <section id="pricing" className="grid gap-12 border-t border-[var(--hair)] py-24 md:grid-cols-[220px_minmax(0,1fr)] md:gap-16">
             <div>
-              <h2 className="font-display text-[26px] leading-tight tracking-[-0.02em]">Pricing</h2>
-              <p className="mt-3 text-[14px] leading-relaxed text-[var(--muted)]">One video is up to 30 seconds of footage.</p>
+              <h2 className="font-display text-[26px] leading-tight tracking-[-0.02em]">Credits</h2>
+              <p className="mt-3 text-[14px] leading-relaxed text-[var(--muted)]">Buy once, use them whenever. No subscription.</p>
             </div>
-            <div className="grid gap-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.25fr)]">
-              <div>
-                <p className="text-[13px] text-[var(--faint)]">One video</p>
-                <p className="font-display mt-2 text-[48px] leading-none tracking-[-0.03em]">${PRICES.single.toFixed(2)}</p>
-                <p className="mt-4 max-w-[300px] text-[15px] leading-relaxed text-[var(--muted)]">
-                  Pay when you press Generate. Nothing to sign up for first.
-                </p>
-              </div>
-              <div>
-                <p className="text-[13px] text-[var(--faint)]">Credits, for more than one</p>
-                <table className="mt-3 w-full text-[16px]">
-                  <tbody className="tabular-nums">
-                    {PRICES.packs.map((p) => (
-                      <tr key={p.credits} className="border-b border-[var(--hair)] last:border-0">
-                        <td className="py-3.5">{p.credits} videos</td>
-                        <td className="py-3.5 text-right">${p.price}</td>
-                        <td className="w-[130px] py-3.5 text-right text-[14px] text-[var(--faint)]">${(p.price / p.credits).toFixed(2)} each</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
+            <CreditStore />
           </section>
 
           <section className="grid gap-12 border-t border-[var(--hair)] py-24 md:grid-cols-[220px_minmax(0,1fr)] md:gap-16">
