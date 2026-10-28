@@ -67,7 +67,7 @@ export default function Landing() {
             <img src="/brand/m-alpha.png" alt="" width={34} height={34} className="h-[34px] w-[34px]" />
             <span className="font-display text-[17px] tracking-[-0.01em]">getmotion</span>
           </Link>
-          <nav className="flex items-center gap-1 text-[14px]">
+          <nav className="hero-nav flex items-center gap-1 text-[14px]">
             <a href="#examples" className="navlink">Examples</a>
             <a href="#how" className="navlink hidden sm:block">How it works</a>
             <a href="#pricing" className="navlink">Pricing</a>

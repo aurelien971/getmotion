@@ -30,12 +30,15 @@ export function Hero() {
         if (f) setFile(f);
       }}
     >
-      <div className="absolute inset-0">
+      {/* The gradient photo is the background; the liquid is drawn on black and screen-
+          blended, so the black drops out and only the shape lights up over it. */}
+      <div className="hero-bg absolute inset-0" aria-hidden />
+      <div className="absolute inset-0 mix-blend-screen">
         {/* Originkit's preview look, passed explicitly: the component falls back to other
             values (size 560, glow 60) when these props are left out. */}
         <OneGlossyLiquid
-          background="#0e0d0c"
-          size={391}
+          background="#000000"
+          size={240}
           glow={0}
           lobes={5}
           wobble={50}
@@ -46,14 +49,14 @@ export function Hero() {
         />
       </div>
 
-      <div className="pointer-events-none absolute inset-x-0 bottom-[calc(45%+var(--r)+30px)] px-5 text-center">
-        <h1 className="font-display text-[34px] leading-[1.05] tracking-[-0.03em] sm:text-[52px]">Put someone new in any video.</h1>
-        <p className="hero-sub mx-auto mt-3 max-w-[460px] text-[15px] leading-relaxed text-[var(--muted)] sm:text-[16px]">
+      <div className="pointer-events-none absolute inset-x-0 z-[1] bottom-[calc(45%+var(--r)+40px)] px-5 text-center">
+        <h1 className="hero-text font-display text-[34px] leading-[1.05] tracking-[-0.03em] sm:text-[52px]">Put someone new in any video.</h1>
+        <p className="hero-text hero-sub mx-auto mt-3 max-w-[460px] text-[15px] leading-relaxed sm:text-[16px]">
           Same moves, same camera, same light. The sound stays exactly as it was.
         </p>
       </div>
 
-      <div className="absolute inset-x-0 top-[calc(55%+var(--r)-34px)] mx-auto w-[min(640px,calc(100%-32px))]">
+      <div className="absolute inset-x-0 z-[1] top-[calc(55%+var(--r)+40px)] mx-auto w-[min(640px,calc(100%-32px))]">
         <Recast file={file} onFile={setFile} />
       </div>
 

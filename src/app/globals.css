@@ -712,7 +712,20 @@ h2 {
 /* Hero: radius of the liquid shape as the component draws it (size 391, fit to 71% of
    the shorter side over 560), so the headline and bar sit just above and on its edge. */
 .landing .hero {
-  --r: min(195px, 24.8vw, 24.8svh);
+  /* size 240: radius 120 px, scaled down when the shorter side is under ~790 px */
+  --r: min(120px, 15.2vw, 15.2svh);
+}
+.landing .hero-bg {
+  background: url(/brand/hero-bg.webp) center / cover no-repeat;
+}
+/* The hero fades into the page so the sections below start on the usual stone. */
+.landing .hero::after {
+  content: "";
+  position: absolute;
+  inset: auto 0 0 0;
+  height: 22%;
+  background: linear-gradient(to bottom, transparent, var(--bg));
+  pointer-events: none;
 }
 .landing .search-bar {
   background: rgba(20, 18, 16, 0.42);
@@ -783,4 +796,21 @@ h2 {
   .landing .hero-sub {
     display: none;
   }
+}
+
+/* Text over the gradient photo: near-white with a soft warm shadow for contrast. */
+.landing .hero-text {
+  color: #fff8f0;
+  text-shadow: 0 1px 18px rgba(70, 22, 10, 0.35);
+}
+.landing .hero-sub,
+.landing p.hero-text {
+  color: rgba(255, 248, 240, 0.88);
+}
+.landing .hero-nav .navlink {
+  color: rgba(255, 248, 240, 0.88);
+}
+.landing .hero-nav .navlink:hover {
+  color: #fff;
+  background: rgba(255, 248, 240, 0.12);
 }

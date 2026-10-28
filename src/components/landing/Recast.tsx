@@ -79,7 +79,7 @@ export function Recast({ file, onFile }: { file: File | null; onFile: (f: File |
           </svg>
         </button>
       </form>
-      <p className="mt-3 min-h-5 text-center text-[13px] text-[var(--faint)]">
+      <p className="hero-text mt-3 min-h-5 text-center text-[13px]">
         {!file && link && !source
           ? "That doesn’t look like a link yet."
           : source
