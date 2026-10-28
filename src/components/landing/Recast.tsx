@@ -21,13 +21,15 @@ function sourceOf(link: string): string | null {
   return "Link";
 }
 
-// The first step, on the page itself: a link and Next. Next asks the visitor to sign in;
-// photos, who to replace and the exact credit count come after.
-export function Recast() {
+// The search-bar step on the hero: paste a link or drop a video (the hero passes drops
+// in), then → asks the visitor to sign in. Photos, who to replace and the exact credit
+// count come after.
+export function Recast({ file, onFile }: { file: File | null; onFile: (f: File | null) => void }) {
   const [link, setLink] = useState("");
   const [tried, setTried] = useState(false);
   const dialog = useRef<HTMLDialogElement>(null);
-  const source = sourceOf(link);
+  const picker = useRef<HTMLInputElement>(null);
+  const source = file ? "Video file" : sourceOf(link);
 
   const next = () => {
     setTried(true);
@@ -35,40 +37,56 @@ export function Recast() {
   };
 
   return (
-    <div className="glass-panel rounded-[24px] p-3 sm:p-3.5">
-      <label htmlFor="video-link" className="sr-only">
-        Video link
-      </label>
+    <div>
       <form
-        className="flex flex-col gap-2.5 sm:flex-row"
+        className="search-bar flex items-center gap-1.5 rounded-[26px] p-2 pl-2.5"
         onSubmit={(e) => {
           e.preventDefault();
           next();
         }}
       >
-        <input
-          id="video-link"
-          type="url"
-          inputMode="url"
-          autoComplete="off"
-          placeholder="Paste a YouTube, TikTok or Instagram link"
-          value={link}
-          onChange={(e) => setLink(e.target.value)}
-          className="field-quiet flex-1"
-        />
-        <button type="submit" className="btn-solid px-7 sm:w-auto" aria-disabled={!source}>
-          {source && <span className="ready-dot" aria-hidden />}
-          Next
+        <button type="button" onClick={() => picker.current?.click()} className="bar-icon" aria-label="Choose a video file">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden>
+            <path d="M8 2.5v11M2.5 8h11" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+          </svg>
+        </button>
+        <input ref={picker} type="file" accept="video/*" className="hidden" onChange={(e) => onFile(e.target.files?.[0] ?? null)} />
+        <label htmlFor="video-link" className="sr-only">
+          Video link
+        </label>
+        {file ? (
+          <span className="flex min-w-0 flex-1 items-center gap-2 px-1.5 text-[15px]">
+            <span className="truncate">{file.name}</span>
+            <button type="button" onClick={() => onFile(null)} className="shrink-0 text-[13px] text-[var(--faint)] hover:text-[var(--text)]">
+              Remove
+            </button>
+          </span>
+        ) : (
+          <input
+            id="video-link"
+            type="url"
+            inputMode="url"
+            autoComplete="off"
+            placeholder="Paste a link or drop a video"
+            value={link}
+            onChange={(e) => setLink(e.target.value)}
+            className="bar-input min-w-0 flex-1"
+          />
+        )}
+        <button type="submit" className={`bar-go ${source ? "is-ready" : ""}`} aria-label="Next" aria-disabled={!source}>
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden>
+            <path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+          </svg>
         </button>
       </form>
-      <p className="mt-2.5 min-h-5 px-1.5 text-[13px] text-[var(--faint)]">
-        {link && !source
+      <p className="mt-3 min-h-5 text-center text-[13px] text-[var(--faint)]">
+        {!file && link && !source
           ? "That doesn’t look like a link yet."
           : source
             ? `${source} · next, you’ll add photos of who goes in`
             : tried
-              ? "Paste a link first."
-              : "You see the exact credits before anything renders."}
+              ? "Paste a link or drop a video first."
+              : "YouTube, TikTok, Instagram, or a file. You see the exact credits before anything renders."}
       </p>
 
       <SignIn ref={dialog} source={source ?? ""} />
