@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { getApp, getApps, initializeApp } from "firebase/app";
+import { getStorage, ref, uploadBytesResumable } from "firebase/storage";
 import { GoogleAuthProvider, OAuthProvider, getAuth, onAuthStateChanged, signInWithPopup, signOut, type User } from "firebase/auth";
 
 // The web config is public by design; access is controlled by Firebase Auth's
@@ -15,7 +16,8 @@ const config = {
   appId: "1:479490240979:web:806602f10b8b75e50bff26",
 };
 
-const auth = () => getAuth(getApps().length ? getApp() : initializeApp(config));
+const app = () => (getApps().length ? getApp() : initializeApp(config));
+const auth = () => getAuth(app());
 
 export type Provider = "google" | "apple";
 
@@ -44,3 +46,22 @@ export function authMessage(e: unknown): string | null {
   if (code === "auth/account-exists-with-different-credential") return "You already signed in another way with this email. Use that one.";
   return "Sign-in didn’t go through. Try again.";
 }
+
+// Authorization header for our own APIs, from the signed-in visitor's ID token.
+export async function authHeader(): Promise<Record<string, string>> {
+  const u = auth().currentUser;
+  return u ? { Authorization: `Bearer ${await u.getIdToken()}` } : {};
+}
+
+// Uploads into the visitor's own folder (storage.rules allow nothing else), with progress.
+export function upload(path: string, data: Blob, onBytes: (sent: number) => void) {
+  return new Promise<string>((res, rej) => {
+    const task = uploadBytesResumable(ref(getStorage(app()), path), data, { contentType: data.type });
+    task.on("state_changed", (s) => onBytes(s.bytesTransferred), rej, () => res(path));
+  });
+}
+
+// For tests on localhost only: sign in with a custom token minted by the Admin SDK.
+if (typeof window !== "undefined" && location.hostname === "localhost")
+  (window as unknown as { __signInWithToken: (t: string) => Promise<unknown> }).__signInWithToken = async (t: string) =>
+    (await import("firebase/auth")).signInWithCustomToken(auth(), t);

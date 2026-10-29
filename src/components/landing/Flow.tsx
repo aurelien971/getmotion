@@ -3,20 +3,20 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { checkPhoto, readVideo, type Person, type PhotoCheck, type Progress, type Reading } from "@/lib/cast";
 import { useUser } from "@/lib/firebase";
-import { MIN_RENDER, PACKS } from "./pricing";
+import { MIN_RENDER, priceFor, renderSeconds } from "./pricing";
+import { Pay } from "./Pay";
 import { openSignIn } from "./SignIn";
 
 // After a video is dropped: read it in the browser, let the visitor pick who to replace,
 // add photos of who goes in, and see exactly what it takes. Sign-in only at the end.
 
 type Photo = { id: string; file: File; url: string; check?: PhotoCheck };
-const PER_SECOND = PACKS[0].price / PACKS[0].credits;
 
 export function Flow({ file, onClose }: { file: File; onClose: () => void }) {
   const [progress, setProgress] = useState<Progress>({ stage: "cuts", ratio: 0, label: "Opening the video" });
   const [reading, setReading] = useState<Reading | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [step, setStep] = useState<"read" | "pick" | "photos" | "summary">("read");
+  const [step, setStep] = useState<"read" | "pick" | "photos" | "summary" | "pay">("read");
   const [chosen, setChosen] = useState<string[]>([]);
   const [photos, setPhotos] = useState<Record<string, Photo[]>>({});
   const [current, setCurrent] = useState<string | null>(null);
@@ -121,8 +121,10 @@ export function Flow({ file, onClose }: { file: File; onClose: () => void }) {
           setPhotos={setPhotos}
           footer={<Footer back="Back" onBack={() => setStep("pick")} next="Next" disabled={!ready} onNext={() => setStep("summary")} />}
         />
+      ) : step === "summary" ? (
+        <Summary reading={reading!} people={picked} photos={photos} onBack={() => setStep("photos")} onPay={() => setStep("pay")} />
       ) : (
-        <Summary reading={reading!} people={picked} photos={photos} onBack={() => setStep("photos")} />
+        <Pay file={file} reading={reading!} people={picked} photos={photos} onBack={() => setStep("summary")} />
       )}
     </div>
   );
@@ -241,14 +243,14 @@ function Photos({
   );
 }
 
-function Summary({ reading, people, photos, onBack }: { reading: Reading; people: Person[]; photos: Record<string, Photo[]>; onBack: () => void }) {
+function Summary({ reading, people, photos, onBack, onPay }: { reading: Reading; people: Person[]; photos: Record<string, Photo[]>; onBack: () => void; onPay: () => void }) {
   const user = useUser();
   const { shots, onScreen, render } = useMemo(() => {
     const set = [...new Set(people.flatMap((p) => p.shots))].sort((a, b) => a - b);
     const lens = set.map((s) => reading.shots[s].end - reading.shots[s].start);
-    return { shots: set.length, onScreen: lens.reduce((a, b) => a + b, 0), render: Math.ceil(lens.reduce((a, b) => a + Math.max(MIN_RENDER, b), 0)) };
+    return { shots: set.length, onScreen: lens.reduce((a, b) => a + b, 0), render: renderSeconds(lens) };
   }, [reading, people]);
-  const price = Math.max(PACKS[0].price, Math.ceil(render * PER_SECOND));
+  const price = priceFor(render);
   const rows: [string, string][] = [
     ["Shots to recast", `${shots} of ${reading.shots.length}`],
     ["On screen", `${Math.round(onScreen)} s`],
@@ -288,9 +290,9 @@ function Summary({ reading, people, photos, onBack }: { reading: Reading; people
       <Footer
         back="Back"
         onBack={onBack}
-        next={user ? "Checkout opens soon" : "Sign in to continue"}
-        disabled={!!user}
-        onNext={() => openSignIn()}
+        next={user ? `Pay $${price}` : "Sign in to continue"}
+        disabled={user === undefined}
+        onNext={() => (user ? onPay() : openSignIn())}
       />
     </>
   );

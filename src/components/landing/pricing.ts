@@ -27,3 +27,9 @@ export const CHECKOUT: Record<string, string> = {
   150: process.env.NEXT_PUBLIC_CHECKOUT_150 ?? "",
   500: process.env.NEXT_PUBLIC_CHECKOUT_500 ?? "",
 };
+
+// What one video costs: every rendered second at the smallest pack's rate, never less than
+// that pack. Used by the summary and, with the same numbers, by the checkout API.
+export const PER_SECOND = PACKS[0].price / PACKS[0].credits;
+export const renderSeconds = (shotLengths: number[]) => Math.ceil(shotLengths.reduce((a, b) => a + Math.max(MIN_RENDER, b), 0));
+export const priceFor = (render: number) => Math.max(PACKS[0].price, Math.ceil(render * PER_SECOND));

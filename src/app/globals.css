@@ -924,3 +924,9 @@ h2 {
   color: #fff;
   background: rgba(20, 18, 16, 0.6);
 }
+/* Stripe's embedded checkout is a light page; give it a calm white card inside the glass. */
+.landing .checkout-frame {
+  background: #fff;
+  max-height: calc(100svh - 220px);
+  overflow-y: auto;
+}

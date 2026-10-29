@@ -1,0 +1,15 @@
+rules_version = '2';
+// Each visitor uploads only into their own folder: one video (up to 2 GB) and images (up to 20 MB).
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /users/{uid}/orders/{order}/{file=**} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow create, update: if request.auth != null && request.auth.uid == uid
+        && ((request.resource.contentType.matches('video/.*') && request.resource.size < 2 * 1024 * 1024 * 1024)
+          || (request.resource.contentType.matches('image/.*') && request.resource.size < 20 * 1024 * 1024));
+    }
+    match /{all=**} {
+      allow read, write: if false;
+    }
+  }
+}
