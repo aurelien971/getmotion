@@ -7,12 +7,12 @@ import { GoogleAuthProvider, OAuthProvider, getAuth, onAuthStateChanged, signInW
 // The web config is public by design; access is controlled by Firebase Auth's
 // authorized domains and security rules, not by hiding these values.
 const config = {
-  apiKey: "AIzaSyCXFuIeCPEOqXF-4piVacmzYkHFb92Xwpg",
-  authDomain: "getmotion-art.firebaseapp.com",
-  projectId: "getmotion-art",
-  storageBucket: "getmotion-art.firebasestorage.app",
-  messagingSenderId: "828412556254",
-  appId: "1:828412556254:web:2544fa1b4fec680561634f",
+  apiKey: "AIzaSyCQvRg4otQTZ_rY_hFYPk5uV4kNWfFWWWc",
+  authDomain: "getmotion-5c2a2.firebaseapp.com",
+  projectId: "getmotion-5c2a2",
+  storageBucket: "getmotion-5c2a2.firebasestorage.app",
+  messagingSenderId: "479490240979",
+  appId: "1:479490240979:web:806602f10b8b75e50bff26",
 };
 
 const auth = () => getAuth(getApps().length ? getApp() : initializeApp(config));
