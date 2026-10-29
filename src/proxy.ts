@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 // The landing page is public; the engine (studio, chapters, APIs) sits behind HTTP basic
 // auth when APP_PASSWORD is set (Next 16 proxy).
-const PUBLIC = (path: string) => path === "/" || path.startsWith("/brand/") || path === "/icon.png" || path === "/apple-icon.png";
+const PUBLIC = (path: string) => path === "/" || path.startsWith("/brand/") || path.startsWith("/models/") || path === "/icon.png" || path === "/apple-icon.png";
 
 export function proxy(req: NextRequest) {
   const password = process.env.APP_PASSWORD;
