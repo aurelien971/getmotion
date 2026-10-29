@@ -1,6 +1,6 @@
 import Link from "next/link";
-import { CreditStore } from "@/components/landing/CreditStore";
 import { Portfolio } from "@/components/landing/Portfolio";
+import { AccountButton, SignIn } from "@/components/landing/SignIn";
 import { Hero } from "@/components/landing/Hero";
 
 // Public landing page. One quiet surface: the chrome M, a few honest sentences, and the
@@ -37,7 +37,7 @@ const STEPS = [
 const FAQ = [
   {
     q: "How long can the video be?",
-    a: "Any length. Every second we render uses one credit, and quick cuts use more because each shot is rendered on its own. You see the exact count before anything renders.",
+    a: "Any length. Long or short. Each shot is rendered on its own and laid back on the original timeline.",
   },
   {
     q: "Which links work?",
@@ -53,7 +53,7 @@ const FAQ = [
   },
   {
     q: "What if a render fails?",
-    a: "A failed render gives its credits back.",
+    a: "You never pay for a failed render. It’s retried or refunded.",
   },
 ];
 
@@ -70,7 +70,7 @@ export default function Landing() {
           <nav className="hero-nav flex items-center gap-1 text-[14px]">
             <a href="#examples" className="navlink">Examples</a>
             <a href="#how" className="navlink hidden sm:block">How it works</a>
-            <a href="#pricing" className="navlink">Pricing</a>
+            <AccountButton />
           </nav>
         </div>
       </header>
@@ -130,14 +130,6 @@ export default function Landing() {
             </ol>
           </section>
 
-          <section id="pricing" className="grid gap-12 border-t border-[var(--hair)] py-24 md:grid-cols-[220px_minmax(0,1fr)] md:gap-16">
-            <div>
-              <h2 className="font-display text-[26px] leading-tight tracking-[-0.02em]">Credits</h2>
-              <p className="mt-3 text-[14px] leading-relaxed text-[var(--muted)]">Buy once, use them whenever. No subscription.</p>
-            </div>
-            <CreditStore />
-          </section>
-
           <section className="grid gap-12 border-t border-[var(--hair)] py-24 md:grid-cols-[220px_minmax(0,1fr)] md:gap-16">
             <h2 className="font-display text-[26px] leading-tight tracking-[-0.02em]">Questions</h2>
             <div className="max-w-[680px] divide-y divide-[var(--hair)]">
@@ -159,6 +151,7 @@ export default function Landing() {
           <a href="mailto:hello@getmotion.art" className="hover:text-[var(--text)]">hello@getmotion.art</a>
         </footer>
       </div>
+      <SignIn />
     </div>
   );
 }

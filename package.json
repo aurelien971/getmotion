@@ -13,6 +13,7 @@
     "@fal-ai/client": "^1.10.1",
     "@fal-ai/server-proxy": "^1.2.1",
     "@ffmpeg/util": "^0.12.2",
+    "firebase": "^13.1.0",
     "jszip": "^3.10.2",
     "next": "^16.4.3",
     "react": "^19.3.1",
