@@ -40,8 +40,8 @@ const FAQ = [
     a: "Any length. Long or short. Each shot is rendered on its own and laid back on the original timeline.",
   },
   {
-    q: "Which links work?",
-    a: "YouTube, TikTok, Instagram, Vimeo, X, or a direct link to an MP4 or MOV file. You can also upload the file itself.",
+    q: "Can I paste a YouTube or TikTok link?",
+    a: "Not yet. Download the video and drop the file in: MP4 works everywhere, MOV works in Safari. It’s read on your device, and nothing is uploaded until you check out.",
   },
   {
     q: "What photos work best?",

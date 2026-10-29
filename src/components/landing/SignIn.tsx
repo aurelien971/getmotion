@@ -63,7 +63,7 @@ export function SignIn() {
         {user ? (
           <>
             <p className="mt-6 text-[15px] leading-relaxed">
-              {source ? "Next you add photos of who goes in. That step opens very soon, and we’ll keep your link for it." : "Paste a link or drop a video on the page to start."}
+              Checkout opens very soon. Your video and photos stay on this page until then, nothing is uploaded.
             </p>
             <div className="mt-5 flex items-center justify-between gap-3">
               <button type="button" className="btn-solid px-6" onClick={() => ref.current?.close()}>

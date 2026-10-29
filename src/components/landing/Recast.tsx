@@ -1,7 +1,6 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { openSignIn } from "./SignIn";
 
 // Where a pasted link comes from, for a calm confirmation under the field.
 function sourceOf(link: string): string | null {
@@ -22,17 +21,18 @@ function sourceOf(link: string): string | null {
   return "Link";
 }
 
-// The search-bar step on the hero: paste a link or drop a video (the hero passes drops
-// in), then → asks the visitor to sign in. Photos and who to replace come after.
+// The search bar on the hero: drop or choose a video (the hero passes drops in) and the
+// flow starts reading it. A pasted link gets an honest note until links can be fetched.
 export function Recast({ file, onFile }: { file: File | null; onFile: (f: File | null) => void }) {
   const [link, setLink] = useState("");
   const [tried, setTried] = useState(false);
   const picker = useRef<HTMLInputElement>(null);
   const source = file ? "Video file" : sourceOf(link);
 
+  // Links can't be fetched yet, so say so plainly instead of pretending.
   const next = () => {
     setTried(true);
-    if (source) openSignIn(file ? "video" : `${source} link`);
+    if (!link) picker.current?.click();
   };
 
   return (
@@ -66,7 +66,7 @@ export function Recast({ file, onFile }: { file: File | null; onFile: (f: File |
             type="url"
             inputMode="url"
             autoComplete="off"
-            placeholder="Paste a link or drop a video"
+            placeholder="Drop a video, or click + to choose one"
             value={link}
             onChange={(e) => setLink(e.target.value)}
             className="bar-input min-w-0 flex-1"
@@ -79,13 +79,11 @@ export function Recast({ file, onFile }: { file: File | null; onFile: (f: File |
         </button>
       </form>
       <p className="hero-text mt-3 min-h-5 text-center text-[13px]">
-        {!file && link && !source
-          ? "That doesn’t look like a link yet."
-          : source
-            ? `${source} · next, you’ll add photos of who goes in`
-            : tried
-              ? "Paste a link or drop a video first."
-              : "YouTube, TikTok, Instagram, or a video file."}
+        {link && tried
+          ? `We can’t pull videos from ${source && source !== "Link" ? source : "links"} yet. Download it and drop the file here.`
+          : link && !source
+            ? "That doesn’t look like a link yet."
+            : "Drop a video file. It’s read on your device, nothing is uploaded."}
       </p>
     </div>
   );
